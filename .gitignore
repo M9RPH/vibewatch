@@ -1,0 +1,71 @@
+# =========================
+# Vibewatch
+# =========================
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Script-local secrets
+scripts/.env
+
+# Runtime data
+data/*
+!data/.gitkeep
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Generated backups / snapshots
+backups/
+snapshots/
+data/backups/
+data/snapshots/
+
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Logs
+*.log
+*.jsonl
+logs/
+data/logs/
+
+# Go build artifacts
+/vibewatch
+/bin/
+dist/
+*.exe
+*.test
+*.out
+
+# Go coverage
+coverage.out
+coverage.html
+
+# Frontend dependencies / build output
+node_modules/
+web/node_modules/
+web/dist/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

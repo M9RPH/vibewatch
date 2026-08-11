@@ -1,0 +1,55 @@
+x-vibewatch-image: &vibewatch-image
+  build:
+    context: .
+  image: "${WTUI_APP_IMAGE:-vibewatch:0.7.2.1}"
+
+services:
+  # Compatibility bridge for upgrades from the pre-Vibewatch Docker runtime
+  # names. It only removes legacy runtime containers/networks and never mounts
+  # /data, so persistent application state cannot be touched here.
+  vibewatch-runtime-migrate:
+    <<: *vibewatch-image
+    container_name: vibewatch-runtime-migrate
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        docker rm -f watchtower-ui watchtower-ui-self-updater >/dev/null 2>&1 || true
+        for c in $(docker ps -aq --filter 'name=^watchtower-ui-worker-'); do docker rm -f "$c" >/dev/null 2>&1 || true; done
+        docker network rm watchtower-ui-internal >/dev/null 2>&1 || true
+        exit 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+
+  vibewatch:
+    <<: *vibewatch-image
+    container_name: vibewatch
+    stop_grace_period: 30s
+    depends_on:
+      vibewatch-runtime-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - "${WTUI_PORT:-8085}:8080"
+    environment:
+      TZ: "${TZ:-Europe/Berlin}"
+      WTUI_ADMIN_PASSWORD: "${WTUI_ADMIN_PASSWORD:?Set WTUI_ADMIN_PASSWORD in .env}"
+      WTUI_SESSION_SECRET: "${WTUI_SESSION_SECRET:?Set WTUI_SESSION_SECRET in .env}"
+      WTUI_LOG_LEVEL: "${WTUI_LOG_LEVEL:-INFO}"
+      WTUI_WATCHTOWER_IMAGE: "${WTUI_WATCHTOWER_IMAGE:-nickfedor/watchtower:latest}"
+      WTUI_WORKER_NETWORK: "vibewatch-internal"
+      WTUI_APP_IMAGE: "${WTUI_APP_IMAGE:-}"
+      WTUI_CONTAINER_NAME: "vibewatch"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      # Legacy migration only; V0.4.8+ sends with each account's own App Token + User Key.
+      PUSHOVER_APP_TOKEN: "${PUSHOVER_APP_TOKEN:-}"
+    volumes:
+      - "${WTUI_DATA_PATH:-./data}:/data"
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - vibewatch-internal
+
+networks:
+  vibewatch-internal:
+    name: vibewatch-internal
+    driver: bridge
