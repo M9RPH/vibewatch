@@ -1,4 +1,4 @@
-# Vibewatch V0.7.2.1 Architecture
+# Vibewatch V0.8.2.1 Architecture
 
 ## Control plane
 
@@ -129,7 +129,7 @@ Workers are physically hosted on the Vibewatch controller Docker daemon even whe
 
 ## Container recovery snapshots
 
-Vibewatch stores configuration-only recovery snapshots below `/data/backups/containers/`. A backup unit is either a detected Compose/Swarm stack or one standalone container/service on one Docker host. Each unit retains the Owner-configured number of newest snapshots (1–20, default 3). Lowering the setting removes oldest excess snapshots immediately.
+Vibewatch stores runtime/configuration recovery snapshots below `/data/backups/containers/`. A backup unit is either a detected Compose/Swarm stack or one standalone container/service on one Docker host. Each unit retains the Owner-configured number of newest snapshots (1–20, default 3). Lowering the setting removes oldest excess snapshots immediately and expires any V0.8.0 full restore points linked to the removed snapshot.
 
 A snapshot ZIP contains:
 
@@ -141,11 +141,11 @@ A snapshot ZIP contains:
 
 Volume contents are deliberately excluded. Runtime environment values are included for disaster recovery, so the files are created with restrictive filesystem permissions and download APIs are restricted to Admin/Owner roles.
 
-Manual and automated update jobs create a snapshot before invoking Watchtower. Snapshot failure blocks the update so the recovery guarantee cannot silently be bypassed.
+Manual and automated update jobs create a snapshot before invoking Watchtower. For non-Swarm update targets V0.8.0 then commits the target container with `docker commit --pause=true` into an internal `vibewatch-restore/...` image and records a `restore_points` row that links the writable-layer image, original runtime/image metadata, attempted target digest and snapshot. Snapshot or writable-layer capture failure blocks a non-Swarm update so the full-container recovery guarantee cannot silently be bypassed. Swarm targets remain configuration-only and therefore do not create a one-click full restore image.
 
 ## Docker volume maintenance
 
-Volume inventory is host-level administration and is restricted to Admin/Owner roles. Bulk cleanup invokes Docker's default anonymous-only volume prune. Named volumes are never bulk-pruned and can only be removed one at a time after Vibewatch verifies that no existing container references the volume. Bind mounts are outside Docker's volume lifecycle and are never deleted by Vibewatch.
+Volume inventory is host-level administration and is restricted to Admin/Owner roles. Vibewatch does not use a blanket volume prune: anonymous/named cleanup candidates are verified individually so retained rollback volumes, unknown-reference volumes and in-use volumes can be excluded. Retained snapshot references protect a volume from Vibewatch deletion. Bind mounts are outside Docker's volume lifecycle and are never deleted by Vibewatch.
 
 
 ## Docker event storage (V0.5.2)
@@ -153,9 +153,33 @@ Volume inventory is host-level administration and is restricted to Admin/Owner r
 Docker events are diagnostic, write-heavy data and are deliberately isolated from `vibewatch.db`. The event watcher appends meaningful records to `/data/logs/docker-events.jsonl`, filters `exec_create`, `exec_start` and `exec_die`, and retains at most 5,000 records. On upgrade, Vibewatch can recover the known V0.5.0/V0.5.1 event-only SQLite corruption by verifying every core table before rebuilding a clean primary database; broader corruption is never automatically modified.
 
 
-## Update history and rollback (V0.6.0)
+## Recovery Compose namespace normalization (V0.8.2)
 
-Update execution records a durable per-container history row after the job finishes. A successful update references the recovery snapshot created immediately before Watchtower was invoked. While that snapshot still exists, authorized users may request a manual rollback for Compose/standalone containers. Vibewatch creates another safety snapshot before rollback, restores the previous immutable/local image and saved runtime configuration, verifies the container can be queried again, then records the rollback itself as another history row. One-click Swarm rollback and automatic health-based rollback are intentionally not performed in V0.6.0.
+Recovery snapshots are generated while all containers in the host inventory are still available. For any captured `HostConfig.NetworkMode=container:<ref>`, the snapshot writer resolves `<ref>` against the host inventory before serializing `compose.yaml`. If source and target are services from the same Compose project and the target service is part of the reconstructed unit, the durable form is `network_mode: service:<target-service>`. Otherwise the durable form is `network_mode: container:<target-container-name>`. A hexadecimal runtime ID that cannot be resolved is rejected and aborts snapshot creation; ephemeral IDs are never intentionally persisted as recovery configuration.
+
+Namespace-sharing services suppress hostname/domainname, published ports, DNS and extra-host fields in the reconstructed Compose because those options conflict with Docker container-network mode. Independently, a hostname that is simply the container's Docker-generated own ID prefix is treated as runtime metadata and omitted, while an explicit non-runtime hostname is retained. Snapshot metadata schema version 2 identifies artifacts created with these normalization rules. Internal low-level rollback still restores from retained inspect data and explicitly rebinds dependents to the restored parent ID; the normalized Compose file is the portable/manual recovery representation.
+
+## Network namespace dependency transactions (V0.8.1)
+
+Before a manual or automated update becomes destructive, the controller inspects every container on that Docker host and builds the direct `NETWORK_NAMESPACE` dependency set for the target. A dependency exists when a dependent container's Engine-level `HostConfig.NetworkMode` resolves to `container:<target-id>`. Compose `network_mode: service:<service>` is therefore handled through Docker's actual runtime relationship rather than application-specific names or Compose-file parsing. The scan is fail-closed: Vibewatch does not recreate a parent when it cannot establish a complete host-level dependency view.
+
+The update transaction records source/target IDs, source name, prior running state, original network mode and Compose project/service metadata. The normal parent recovery snapshot is reused when it already contains a dependent; a dependent from another backup unit receives a transaction snapshot. Cross-unit dependency snapshots are pinned while the parent Restore Point is active, so independent retention cannot invalidate only one leg of a rollback transaction. When the parent Restore Point expires, transaction-only dependency snapshots are removed with it.
+
+After Watchtower returns successfully, Vibewatch verifies the parent using the existing running/health logic. If the parent ID changed, each dependent is removed and recreated from its captured runtime configuration with `--network container:<new-parent-id>`. Docker options incompatible with container network mode (hostname/domain, published ports and DNS/extra-host flags) are omitted during reconstruction. A dependent that was stopped before the update remains stopped; a previously running dependent is started and verified. These operations emit dependency audit/job events and are not recorded as independent image updates.
+
+If dependent recreation fails, the parent update transaction is failed and the existing automatic full-restore path is eligible. Full rollback uses the inverse lifecycle: stop all known namespace dependents, restore and verify the parent, then recreate the retained dependent configurations against the restored parent ID. The rollback path also rescans the live parent before destructive work so a namespace dependent added after the Restore Point was created is preserved/rebound rather than accidentally orphaned. Config Drift baselines are refreshed after successful dependent recreation.
+
+The first dependency implementation is intentionally limited to direct network-namespace lifecycle coupling. It does not infer arbitrary `depends_on`, database/application ordering, filesystem semantics or other service dependencies. Docker volume and bind content semantics are unchanged.
+
+## Update history and full restore points (V0.8.0)
+
+Every update still records durable per-container history, now with an optional `restore_point_id`. For a normal Compose/standalone update, the pre-update recovery snapshot is paired with a committed container writable-layer image. The internal restore image is protected from Vibewatch image cleanup while its restore point remains retained. Retention expiry marks the linked restore point expired and untags the internal restore image. Pre-V0.8.0 history remains compatible with the legacy image/config rollback path.
+
+A full rollback recreates the target from the captured low-level runtime configuration and committed writable layer. The committed image is retagged to the original image reference when safe so future Watchtower checks continue following the original registry/tag instead of an internal Vibewatch tag. Before a destructive manual/full rollback Vibewatch creates a temporary committed safety image of the current container and uses it for best-effort recovery if restoration itself fails. The temporary image is removed after the attempt and is not counted against retained restore-point slots.
+
+Automatic rollback is deliberately conservative. After an update, Vibewatch rolls back only when Docker provides a concrete failure signal: the container is missing/stopped/restarting, or an explicit Docker healthcheck reports `unhealthy`. A container without a healthcheck must remain running for a short stability window, but Vibewatch does not infer application-level correctness. A successful rollback refreshes Config Drift baseline state and snoozes the currently available remote update digest so an Auto Update policy cannot immediately reinstall the failed version.
+
+Docker volumes and bind mounts are not included by `docker commit`. Their references are retained/protected where applicable, but their contents are not rolled back. Application/database migrations that modify persistent data therefore require a separate data-aware backup. Docker Swarm remains configuration-only for one-click recovery.
 
 ## Configuration drift (V0.6.1)
 

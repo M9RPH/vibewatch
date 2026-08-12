@@ -95,3 +95,138 @@ func TestConfigDriftBaselineDoesNotPersistEnvironmentOrLabelValues(t *testing.T)
 		t.Fatalf("baseline should retain setting keys for change reporting: %s", text)
 	}
 }
+
+func TestRollbackCreateArgsPreservesMultiEntrypointAndCommonResourceSettings(t *testing.T) {
+	var c inspectContainer
+	c.Name = "/app"
+	c.Config.Entrypoint = []string{"/usr/bin/tini", "--"}
+	c.Config.Cmd = []string{"/app/server", "--serve"}
+	c.Config.Tty = true
+	c.Config.OpenStdin = true
+	c.HostConfig.Memory = 512 * 1024 * 1024
+	c.HostConfig.NanoCpus = 1500000000
+	c.HostConfig.CpuShares = 768
+	c.HostConfig.CpusetCpus = "0-1"
+	c.HostConfig.GroupAdd = []string{"44"}
+	c.HostConfig.Sysctls = map[string]string{"net.core.somaxconn": "1024"}
+	c.HostConfig.NetworkMode = "bridge"
+	args, _, err := createArgsFromInspect(c, "restore:image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--tty", "--interactive", "--memory 536870912", "--cpus 1.5", "--cpu-shares 768", "--cpuset-cpus 0-1", "--group-add 44", "--sysctl net.core.somaxconn=1024", "--entrypoint /usr/bin/tini", "restore:image -- /app/server --serve"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("rollback args missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestRollbackCreateArgsRejectsUnsupportedDeviceRequests(t *testing.T) {
+	var c inspectContainer
+	if err := json.Unmarshal([]byte(`{"Name":"/app","HostConfig":{"DeviceRequests":[{"Driver":"custom-accelerator","Count":1,"Capabilities":[["compute"]]}]}}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := createArgsFromInspect(c, "restore:image"); err == nil || !strings.Contains(err.Error(), "unsupported Docker device request") {
+		t.Fatalf("expected unsupported device request error, got %v", err)
+	}
+}
+
+func TestNetworkNamespaceCreateArgsAvoidConflictingDockerFlags(t *testing.T) {
+	var c inspectContainer
+	c.Name = "/xteve"
+	c.Config.Hostname = "old-hostname"
+	c.Config.Domainname = "example.test"
+	c.Config.Image = "example/xteve:latest"
+	c.HostConfig.NetworkMode = "container:old-parent-id"
+	c.HostConfig.DNS = []string{"1.1.1.1"}
+	c.HostConfig.DNSSearch = []string{"example.test"}
+	c.HostConfig.DNSOptions = []string{"ndots:1"}
+	c.HostConfig.ExtraHosts = []string{"demo:127.0.0.1"}
+	c.HostConfig.PortBindings = map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}{"8080/tcp": {{HostPort: "8080"}}}
+	args, extras, err := createArgsFromInspect(c, "example/xteve:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--network container:old-parent-id") {
+		t.Fatalf("container namespace network mode missing: %s", joined)
+	}
+	for _, forbidden := range []string{"--hostname", "--domainname", "--publish", "--publish-all", "--dns ", "--dns-search", "--dns-option", "--add-host"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("container network mode includes conflicting flag %q: %s", forbidden, joined)
+		}
+	}
+	if len(extras) != 0 {
+		t.Fatalf("container namespace recreation should not attach extra networks: %v", extras)
+	}
+}
+
+func TestContainerNamespaceReferenceMatching(t *testing.T) {
+	var target inspectContainer
+	target.ID = "c08aafa7263a2cd2df1c2792b6da20194420cff1fe172d653d5c5887599691b3"
+	target.Name = "/gluetun"
+	for _, ref := range []string{target.ID, target.ID[:12], "gluetun"} {
+		if !sameContainerIdentity(ref, target) {
+			t.Fatalf("expected %q to resolve to target", ref)
+		}
+	}
+	if sameContainerIdentity("other", target) {
+		t.Fatal("unrelated container reference matched target")
+	}
+	if ref, ok := containerNamespaceRef("container:" + target.ID); !ok || ref != target.ID {
+		t.Fatalf("network namespace ref parse failed: %q %t", ref, ok)
+	}
+	if _, ok := containerNamespaceRef("bridge"); ok {
+		t.Fatal("bridge incorrectly classified as container namespace dependency")
+	}
+}
+
+func TestMergeNetworkNamespaceDependenciesRetainedStateWins(t *testing.T) {
+	retained := []networkNamespaceDependencyRuntime{{networkNamespaceDependency: networkNamespaceDependency{SourceContainer: "xteve", WasRunning: false, SnapshotID: "old-snapshot"}}}
+	current := []networkNamespaceDependencyRuntime{
+		{networkNamespaceDependency: networkNamespaceDependency{SourceContainer: "xteve", WasRunning: true, SnapshotID: "current"}},
+		{networkNamespaceDependency: networkNamespaceDependency{SourceContainer: "sabnzbd", WasRunning: true}},
+	}
+	got := mergeDependencyRuntimes(retained, current)
+	if len(got) != 2 {
+		t.Fatalf("expected two unique dependents, got %#v", got)
+	}
+	byName := map[string]networkNamespaceDependencyRuntime{}
+	for _, dep := range got {
+		byName[dep.SourceContainer] = dep
+	}
+	if byName["xteve"].WasRunning || byName["xteve"].SnapshotID != "old-snapshot" {
+		t.Fatalf("retained rollback state did not win for xteve: %#v", byName["xteve"])
+	}
+	if !byName["sabnzbd"].WasRunning {
+		t.Fatalf("current-only dependent was not retained: %#v", byName["sabnzbd"])
+	}
+}
+
+func TestNetworkNamespaceDependencyPersistenceRoundTrip(t *testing.T) {
+	deps := []networkNamespaceDependencyRuntime{{networkNamespaceDependency: networkNamespaceDependency{
+		Type:                networkNamespaceDependencyType,
+		SourceContainer:     "xteve",
+		SourceContainerID:   "dependent-id",
+		TargetContainer:     "gluetun",
+		TargetContainerID:   "parent-id",
+		RequiresRecreate:    true,
+		WasRunning:          true,
+		OriginalNetworkMode: "container:parent-id",
+		SnapshotID:          "snapshot-1",
+		ComposeProject:      "vpn-stack",
+		ComposeService:      "xteve",
+	}}}
+	text := dependencyRecordsJSON(deps)
+	var rows []networkNamespaceDependency
+	if err := json.Unmarshal([]byte(text), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SourceContainer != "xteve" || rows[0].SnapshotID != "snapshot-1" || !rows[0].WasRunning {
+		t.Fatalf("unexpected persisted dependency payload: %s", text)
+	}
+}

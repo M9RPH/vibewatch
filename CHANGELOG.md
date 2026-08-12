@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.8.2.1
+
+- Cosmetic consistency pass across all table-based views: table headers now align with their underlying cell content instead of inheriting the browser's centered `th` default; explicitly right-aligned action columns remain right aligned.
+- Unified the remaining Dashboard inventory and History job tables with the shared Vibewatch table styling while retaining purpose-specific widths/compact density where appropriate.
+- Renamed the UI section **Container Backups** to **Container Configs** and **Rollback** to **Container Rollback**. Internal `/api/container-backups` endpoints and persisted data structures remain unchanged for compatibility.
+- Reordered the sidebar to **Containers → Container Configs → Container Rollback** and revised both pages' explanatory text so configuration snapshots and full writable-layer restore points are clearly separated.
+- Fixed recovery-slot labeling: `Oldest` now follows the actually oldest retained snapshot instead of being tied to the third retention slot; empty retention capacity is labeled as an available/free slot.
+- Dashboard host **Inventory** and **Cleanup** groups are now stacked vertically for a calmer, easier-to-scan host layout. Their internal object/action tiles remain responsive grids.
+- No API, Docker update/rollback behavior or database migration changes.
+
+## 0.8.2
+
+- Fixed recovery Compose generation for containers that share another container's network namespace. Runtime `container:<id>` references are now resolved while the parent still exists and normalized to stable `service:<compose-service>` references when both services belong to the same reconstructed Compose project.
+- For namespace parents outside the reconstructed Compose unit, snapshots use the stable Docker container name (`container:<name>`) instead of persisting the parent's ephemeral container ID. Unresolvable ID-based namespace references now fail snapshot creation closed rather than producing a misleading restore artifact.
+- Recovery Compose no longer writes `hostname`/`domainname`, published ports, DNS or extra-host settings for `container:`/`service:` namespace-sharing containers, avoiding Docker's `conflicting options: hostname and the network mode` class of recreate failures.
+- Docker-generated default hostnames that merely mirror a container's own runtime ID are no longer persisted for ordinary containers; explicitly configured hostnames remain preserved.
+- Bumped recovery snapshot metadata schema to version 2 and added regression tests for Compose `service:` reconstruction, stable external `container:<name>` fallback and unresolved stale-ID rejection.
+- No database migration is required; V0.8.1 data directories and existing retained snapshots remain readable. Newly created V0.8.2 snapshots use the corrected reconstruction semantics.
+
+## 0.8.1
+
+- Added generic **Docker network-namespace dependency detection** for containers whose runtime `HostConfig.NetworkMode` resolves to `container:<parent-id>` (including Compose `network_mode: service:<service>` at Engine level). Detection is performed before the update while the old parent ID still exists.
+- Parent updates now capture all direct namespace dependents, preserve their prior running/stopped state and recovery configuration, verify the recreated parent first, then **recreate** each dependent against the new parent container ID. A simple restart is never used for namespace rebinding.
+- Dependency handling is part of the shared update service, so it applies equally to manual and automation-driven updates. Multiple dependents are processed sequentially and dependency recreates are logged as dependency operations rather than independent image updates.
+- A failed dependent recreate now fails the overall update transaction and enters the existing full Restore Point automatic-rollback path. Full rollback stops namespace dependents before restoring the parent, verifies the parent, then recreates dependents against the restored parent namespace.
+- Restore Points persist the dependency relationship and retained dependent snapshot IDs. Cross-stack dependency snapshots are pinned while their parent Restore Point is retained, preventing another backup unit's retention cycle from silently degrading the transaction; they are removed when the parent Restore Point expires.
+- Added structured audit events `dependency.detected`, `dependency.recreate.started`, `dependency.recreate.success` and `dependency.recreate.failed`, plus dependency count/status/details in Update History and dependency protection details on the Rollback page.
+- Dependency recreation validates the captured runtime configuration before allowing the parent update, preserves stopped dependents as stopped, and refreshes Config Drift baselines after successful recreation.
+- Added additive SQLite fields for dependency transaction metadata; existing V0.8.0 data directories remain compatible.
+
+## 0.8.0
+
+- Added retention-managed **full container restore points** for non-Swarm updates. Vibewatch now pairs the existing pre-update runtime/config snapshot with a paused `docker commit` capture of the target container writable layer.
+- Added a dedicated **Rollback** page with per-restore-point host/container/version/image metadata, protection status, mounted-volume/bind warnings, restore history/status and one-click full rollback.
+- Added a direct **Rollback** action to the Containers table and linked V0.8.0 Update History rows to their full restore point. Pre-V0.8.0 history keeps the legacy image/config rollback path.
+- Added conservative **automatic failed-update rollback** when the replaced target is missing, stopped, restarting or explicitly unhealthy. Containers without a Docker healthcheck receive a short running-state stability observation without application-specific health guessing.
+- Added a temporary **pre-rollback safety image** during full restore so a failed destructive restore can best-effort reconstruct the state that existed immediately before rollback.
+- After successful manual/automatic rollback Vibewatch now **snoozes the currently available remote digest**, preventing Auto Update from immediately reinstalling the failed image; a newer digest clears the snooze through the existing digest-bound logic.
+- Restore images are protected from Vibewatch image cleanup while retained. When the linked recovery snapshot expires, the restore point is marked expired and its internal image tag is removed. Existing image/volume/network rollback protection remains retention-aware.
+- Added explicit UI/documentation that **Docker volume and bind-mount contents are not included** in full-container restore images. Swarm remains configuration-only for one-click rollback.
+- Added additive SQLite `restore_points` persistence plus `update_history.restore_point_id`, migration/round-trip tests, and selection logic that prefers the newest usable full restore point over a newer degraded record.
+- Narrowed the worker-operation lock to the actual Watchtower update call, avoiding nested read-lock acquisition during post-update checks/automatic rollback while still keeping worker maintenance mutually exclusive with active Watchtower operations.
+
 ## 0.7.2.1
 
 - Dashboard host inventory tiles now place their `Open` action directly below the object count, preventing overlap with the Images / Volumes / Networks counters on narrow cards.

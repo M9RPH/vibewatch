@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/watchtower-ui/watchtower-ui/internal/dockercli"
 )
 
 type rollbackEndpointSettings struct {
@@ -122,16 +123,82 @@ func appendSortedArgs(args []string, flag string, values []string) []string {
 	return args
 }
 
+func appendSortedMapArgs(args []string, flag string, values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		args = append(args, flag, k+"="+values[k])
+	}
+	return args
+}
+
+func dockerLinkArg(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	parts := strings.SplitN(v, ":", 2)
+	if len(parts) != 2 {
+		return strings.TrimPrefix(v, "/")
+	}
+	source := strings.Trim(strings.TrimSpace(parts[0]), "/")
+	aliasPath := strings.Trim(strings.TrimSpace(parts[1]), "/")
+	aliasParts := strings.Split(aliasPath, "/")
+	alias := aliasParts[len(aliasParts)-1]
+	if source == "" {
+		return ""
+	}
+	if alias == "" || alias == source {
+		return source
+	}
+	return source + ":" + alias
+}
+
+func deviceRequestGPUArg(driver string, count int64, ids []string, capabilities [][]string, options map[string]string) (string, error) {
+	hasGPU := false
+	for _, group := range capabilities {
+		for _, cap := range group {
+			if strings.EqualFold(strings.TrimSpace(cap), "gpu") {
+				hasGPU = true
+			}
+		}
+	}
+	driver = strings.ToLower(strings.TrimSpace(driver))
+	if !hasGPU || (driver != "" && driver != "nvidia") {
+		return "", fmt.Errorf("rollback cannot safely recreate unsupported Docker device request driver=%q capabilities=%v", driver, capabilities)
+	}
+	if len(options) > 0 {
+		return "", fmt.Errorf("rollback cannot safely recreate GPU device request options %v", options)
+	}
+	if len(ids) > 0 {
+		xs := append([]string(nil), ids...)
+		sort.Strings(xs)
+		return "device=" + strings.Join(xs, ","), nil
+	}
+	if count > 0 {
+		return strconv.FormatInt(count, 10), nil
+	}
+	return "all", nil
+}
+
 func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []string, error) {
 	name := strings.TrimPrefix(c.Name, "/")
 	if name == "" {
 		return nil, nil, fmt.Errorf("snapshot container name is empty")
 	}
 	args := []string{"create", "--name", name}
-	if c.Config.Hostname != "" {
+	containerNetworkMode := strings.HasPrefix(strings.TrimSpace(c.HostConfig.NetworkMode), "container:")
+	if c.Config.Hostname != "" && !containerNetworkMode {
 		args = append(args, "--hostname", c.Config.Hostname)
 	}
-	if c.Config.Domainname != "" {
+	if c.Config.Domainname != "" && !containerNetworkMode {
 		args = append(args, "--domainname", c.Config.Domainname)
 	}
 	if c.Config.User != "" {
@@ -139,6 +206,18 @@ func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []
 	}
 	if c.Config.WorkingDir != "" {
 		args = append(args, "--workdir", c.Config.WorkingDir)
+	}
+	if c.Config.Tty {
+		args = append(args, "--tty")
+	}
+	if c.Config.OpenStdin {
+		args = append(args, "--interactive")
+	}
+	if strings.TrimSpace(c.Config.StopSignal) != "" {
+		args = append(args, "--stop-signal", c.Config.StopSignal)
+	}
+	if c.Config.StopTimeout != nil && *c.Config.StopTimeout >= 0 {
+		args = append(args, "--stop-timeout", strconv.Itoa(*c.Config.StopTimeout))
 	}
 	rp := strings.TrimSpace(c.HostConfig.RestartPolicy.Name)
 	if rp != "" && rp != "no" {
@@ -153,6 +232,60 @@ func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []
 	if c.HostConfig.ReadonlyRootfs {
 		args = append(args, "--read-only")
 	}
+	if c.HostConfig.AutoRemove {
+		args = append(args, "--rm")
+	}
+	if c.HostConfig.Init != nil && *c.HostConfig.Init {
+		args = append(args, "--init")
+	}
+	for _, pair := range []struct {
+		flag  string
+		value string
+	}{
+		{"--ipc", c.HostConfig.IpcMode},
+		{"--pid", c.HostConfig.PidMode},
+		{"--uts", c.HostConfig.UTSMode},
+		{"--cgroupns", c.HostConfig.CgroupnsMode},
+		{"--userns", c.HostConfig.UsernsMode},
+		{"--cgroup-parent", c.HostConfig.CgroupParent},
+	} {
+		if strings.TrimSpace(pair.value) != "" {
+			args = append(args, pair.flag, pair.value)
+		}
+	}
+	if runtime := strings.TrimSpace(c.HostConfig.Runtime); runtime != "" && runtime != "runc" {
+		args = append(args, "--runtime", runtime)
+	}
+	if c.HostConfig.Memory > 0 {
+		args = append(args, "--memory", strconv.FormatInt(c.HostConfig.Memory, 10))
+	}
+	if c.HostConfig.MemoryReservation > 0 {
+		args = append(args, "--memory-reservation", strconv.FormatInt(c.HostConfig.MemoryReservation, 10))
+	}
+	if c.HostConfig.MemorySwap != 0 {
+		args = append(args, "--memory-swap", strconv.FormatInt(c.HostConfig.MemorySwap, 10))
+	}
+	if c.HostConfig.NanoCpus > 0 {
+		args = append(args, "--cpus", strconv.FormatFloat(float64(c.HostConfig.NanoCpus)/1_000_000_000, 'f', -1, 64))
+	}
+	if c.HostConfig.CpuShares > 0 {
+		args = append(args, "--cpu-shares", strconv.FormatInt(c.HostConfig.CpuShares, 10))
+	}
+	if strings.TrimSpace(c.HostConfig.CpusetCpus) != "" {
+		args = append(args, "--cpuset-cpus", c.HostConfig.CpusetCpus)
+	}
+	if strings.TrimSpace(c.HostConfig.CpusetMems) != "" {
+		args = append(args, "--cpuset-mems", c.HostConfig.CpusetMems)
+	}
+	if c.HostConfig.PidsLimit != nil {
+		args = append(args, "--pids-limit", strconv.FormatInt(*c.HostConfig.PidsLimit, 10))
+	}
+	if c.HostConfig.OomKillDisable != nil && *c.HostConfig.OomKillDisable {
+		args = append(args, "--oom-kill-disable")
+	}
+	if c.HostConfig.OomScoreAdj != 0 {
+		args = append(args, "--oom-score-adj", strconv.Itoa(c.HostConfig.OomScoreAdj))
+	}
 	for _, v := range c.Config.Env {
 		args = append(args, "--env", v)
 	}
@@ -161,19 +294,24 @@ func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []
 		labels = append(labels, k+"="+v)
 	}
 	args = appendSortedArgs(args, "--label", labels)
-	ports := []string{}
-	for cp, bindings := range c.HostConfig.PortBindings {
-		for _, p := range bindings {
-			host := p.HostPort
-			if p.HostIP != "" && p.HostIP != "0.0.0.0" && p.HostIP != "::" {
-				host = p.HostIP + ":" + host
-			}
-			if host != "" {
-				ports = append(ports, host+":"+cp)
+	if !containerNetworkMode {
+		ports := []string{}
+		for cp, bindings := range c.HostConfig.PortBindings {
+			for _, p := range bindings {
+				host := p.HostPort
+				if p.HostIP != "" && p.HostIP != "0.0.0.0" && p.HostIP != "::" {
+					host = p.HostIP + ":" + host
+				}
+				if host != "" {
+					ports = append(ports, host+":"+cp)
+				}
 			}
 		}
+		args = appendSortedArgs(args, "--publish", ports)
+		if c.HostConfig.PublishAllPorts {
+			args = append(args, "--publish-all")
+		}
 	}
-	args = appendSortedArgs(args, "--publish", ports)
 	for _, m := range c.Mounts {
 		if m.Type != "bind" && m.Type != "volume" {
 			continue
@@ -203,10 +341,46 @@ func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []
 	}
 	args = appendSortedArgs(args, "--cap-add", c.HostConfig.CapAdd)
 	args = appendSortedArgs(args, "--cap-drop", c.HostConfig.CapDrop)
-	args = appendSortedArgs(args, "--dns", c.HostConfig.DNS)
-	args = appendSortedArgs(args, "--dns-search", c.HostConfig.DNSSearch)
-	args = appendSortedArgs(args, "--add-host", c.HostConfig.ExtraHosts)
+	args = appendSortedArgs(args, "--group-add", c.HostConfig.GroupAdd)
+	for _, link := range c.HostConfig.Links {
+		if v := dockerLinkArg(link); v != "" {
+			args = append(args, "--link", v)
+		}
+	}
+	args = appendSortedArgs(args, "--volumes-from", c.HostConfig.VolumesFrom)
+	if !containerNetworkMode {
+		args = appendSortedArgs(args, "--dns", c.HostConfig.DNS)
+		args = appendSortedArgs(args, "--dns-search", c.HostConfig.DNSSearch)
+		args = appendSortedArgs(args, "--dns-option", c.HostConfig.DNSOptions)
+		args = appendSortedArgs(args, "--add-host", c.HostConfig.ExtraHosts)
+	}
 	args = appendSortedArgs(args, "--security-opt", c.HostConfig.SecurityOpt)
+	args = appendSortedMapArgs(args, "--sysctl", c.HostConfig.Sysctls)
+	if typ := strings.TrimSpace(c.HostConfig.LogConfig.Type); typ != "" {
+		args = append(args, "--log-driver", typ)
+		args = appendSortedMapArgs(args, "--log-opt", c.HostConfig.LogConfig.Config)
+	}
+	ulimits := append([]struct {
+		Name string `json:"Name"`
+		Hard int64  `json:"Hard"`
+		Soft int64  `json:"Soft"`
+	}(nil), c.HostConfig.Ulimits...)
+	sort.Slice(ulimits, func(i, j int) bool { return ulimits[i].Name < ulimits[j].Name })
+	for _, u := range ulimits {
+		if strings.TrimSpace(u.Name) != "" {
+			args = append(args, "--ulimit", fmt.Sprintf("%s=%d:%d", u.Name, u.Soft, u.Hard))
+		}
+	}
+	if len(c.HostConfig.DeviceRequests) > 1 {
+		return nil, nil, fmt.Errorf("rollback cannot safely recreate %d Docker device requests", len(c.HostConfig.DeviceRequests))
+	}
+	for _, request := range c.HostConfig.DeviceRequests {
+		gpu, e := deviceRequestGPUArg(request.Driver, request.Count, request.DeviceIDs, request.Capabilities, request.Options)
+		if e != nil {
+			return nil, nil, e
+		}
+		args = append(args, "--gpus", gpu)
+	}
 	for _, d := range c.HostConfig.Devices {
 		v := d.PathOnHost + ":" + d.PathInContainer
 		if d.CgroupPermissions != "" {
@@ -246,14 +420,18 @@ func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []
 			args = append(args, "--ip6", ep.IPAMConfig.IPv6Address)
 		}
 	}
-	if len(c.Config.Entrypoint) > 1 {
-		return nil, nil, fmt.Errorf("rollback cannot safely recreate multi-element entrypoint for %s", name)
-	}
-	if len(c.Config.Entrypoint) == 1 {
+	cmd := append([]string(nil), c.Config.Cmd...)
+	if len(c.Config.Entrypoint) >= 1 {
 		args = append(args, "--entrypoint", c.Config.Entrypoint[0])
+		// docker create exposes --entrypoint as one executable string. Preserve
+		// effective argv for a multi-element Docker Entrypoint by moving the
+		// remaining entrypoint elements in front of Cmd.
+		if len(c.Config.Entrypoint) > 1 {
+			cmd = append(append([]string(nil), c.Config.Entrypoint[1:]...), cmd...)
+		}
 	}
 	args = append(args, targetImage)
-	args = append(args, c.Config.Cmd...)
+	args = append(args, cmd...)
 	extras := []string{}
 	for _, n := range networks {
 		if n != firstNetwork && n != "bridge" && n != "host" && n != "none" {
@@ -263,9 +441,31 @@ func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []
 	return args, extras, nil
 }
 
-func (a *App) restoreContainerRuntime(ctx context.Context, endpoint string, c inspectContainer, targetImage string) error {
+func (a *App) prepareRuntimeRestoreRef(ctx context.Context, endpoint, sourceImage, originalRef string) string {
+	sourceImage = strings.TrimSpace(sourceImage)
+	originalRef = strings.TrimSpace(originalRef)
+	if sourceImage == "" || originalRef == "" || strings.HasPrefix(originalRef, "sha256:") || strings.Contains(originalRef, "@sha256:") {
+		return sourceImage
+	}
+	if _, err := a.Docker.Run(ctx, endpoint, "image", "tag", sourceImage, originalRef); err == nil {
+		return originalRef
+	}
+	return sourceImage
+}
+
+func (a *App) recreateContainerRuntime(ctx context.Context, endpoint string, c inspectContainer, targetImage string, start bool, networkModeOverride string) error {
 	name := strings.TrimPrefix(c.Name, "/")
-	args, extraNetworks, err := createArgsFromInspect(c, targetImage)
+	createSpec := c
+	if strings.TrimSpace(networkModeOverride) != "" {
+		createSpec.HostConfig.NetworkMode = strings.TrimSpace(networkModeOverride)
+		// A container that joins another container's namespace cannot also be
+		// connected to ordinary Docker networks. Clear stale inspect network
+		// attachments so the recreation is driven solely by --network container:.
+		if strings.HasPrefix(createSpec.HostConfig.NetworkMode, "container:") {
+			createSpec.NetworkSettings.Networks = map[string]json.RawMessage{}
+		}
+	}
+	args, extraNetworks, err := createArgsFromInspect(createSpec, targetImage)
 	if err != nil {
 		return err
 	}
@@ -275,7 +475,7 @@ func (a *App) restoreContainerRuntime(ctx context.Context, endpoint string, c in
 	}
 	for _, n := range extraNetworks {
 		connectArgs := []string{"network", "connect"}
-		ep := rollbackEndpoint(c.NetworkSettings.Networks[n])
+		ep := rollbackEndpoint(createSpec.NetworkSettings.Networks[n])
 		aliases := append([]string(nil), ep.Aliases...)
 		sort.Strings(aliases)
 		for _, alias := range aliases {
@@ -295,10 +495,16 @@ func (a *App) restoreContainerRuntime(ctx context.Context, endpoint string, c in
 			return fmt.Errorf("connect network %s: %w", n, e)
 		}
 	}
-	if _, err = a.Docker.Run(ctx, endpoint, "start", name); err != nil {
-		return err
+	if start {
+		if _, err = a.Docker.Run(ctx, endpoint, "start", name); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (a *App) restoreContainerRuntime(ctx context.Context, endpoint string, c inspectContainer, targetImage string) error {
+	return a.recreateContainerRuntime(ctx, endpoint, c, targetImage, true, "")
 }
 
 func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) {
@@ -373,6 +579,7 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 	if swarmService != "" {
 		_, err = a.Docker.Run(ctx, h.Endpoint, "service", "update", "--image", target, "--detach=true", swarmService)
 	} else {
+		target = a.prepareRuntimeRestoreRef(ctx, h.Endpoint, target, old.Config.Image)
 		err = a.restoreContainerRuntime(ctx, h.Endpoint, old, target)
 		if err != nil {
 			// Best-effort recovery to the state that existed immediately before
@@ -396,6 +603,9 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 	a.jobProgress(ctx, jobID, 82, "Verifying restored container")
 	time.Sleep(1200 * time.Millisecond)
 	_, _, _ = a.check(ctx, hist.HostID, hist.ContainerName, "post-rollback")
+	if snoozed := a.snoozeLatestAfterRollback(ctx, hist.HostID, hist.ContainerName, hist.ToDigest); snoozed != "" {
+		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "rollback", "Update digest snoozed after rollback: "+snoozed)
+	}
 	if err := a.captureCurrentConfigDriftBaseline(ctx, hist.HostID, hist.ContainerName, "post-rollback"); err != nil {
 		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "config-drift", "Could not refresh post-rollback drift baseline: "+err.Error())
 		a.Logger.Warn("post-rollback config drift baseline refresh failed", "host_id", hist.HostID, "container", hist.ContainerName, "error", err)
@@ -407,25 +617,299 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 	_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: hist.HostID, ContainerName: hist.ContainerName, Action: "rollback", Trigger: "manual", Actor: actor, Status: "success", FromVersion: currentVersion.Installed, ToVersion: afterVersion.Installed, FromImageRef: currentContainer.Image, ToImageRef: after.Image, FromDigest: currentContainer.ImageID, ToDigest: after.ImageID, SnapshotID: hist.SnapshotID, DurationMS: time.Since(started).Milliseconds()})
 }
 
+func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor, trigger string) error {
+	ctx := a.ctx
+	started := time.Now()
+	_ = a.Store.StartJob(ctx, jobID)
+	a.jobProgress(ctx, jobID, 8, "Loading restore point")
+	h, err := a.Store.Host(ctx, rp.HostID)
+	if err != nil {
+		a.failJob(jobID, err)
+		return err
+	}
+	path, _, err := a.findSnapshotByID(rp.HostID, rp.SnapshotID, rp.ContainerName)
+	if err != nil {
+		_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "expired", err.Error())
+		a.failJob(jobID, err)
+		return err
+	}
+	if !bool(rp.WritableLayer) || strings.TrimSpace(rp.ImageRef) == "" {
+		err = fmt.Errorf("restore point does not contain a writable-layer container image")
+		a.failJob(jobID, err)
+		return err
+	}
+	if !a.Docker.ImageExists(ctx, h.Endpoint, rp.ImageRef) {
+		err = fmt.Errorf("restore image is no longer available on Docker host")
+		_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+		a.failJob(jobID, err)
+		return err
+	}
+	raw, err := snapshotZipEntry(path, "container-inspect.json")
+	if err != nil {
+		a.failJob(jobID, err)
+		return err
+	}
+	old, err := findInspectForContainer(raw, rp.ContainerName)
+	if err != nil {
+		a.failJob(jobID, err)
+		return err
+	}
+	if strings.TrimSpace(old.Config.Labels["com.docker.swarm.service.name"]) != "" || strings.EqualFold(rp.StackType, "swarm") {
+		err = fmt.Errorf("full restore points are not enabled for Docker Swarm services")
+		a.failJob(jobID, err)
+		return err
+	}
+
+	rollbackDeps, depErr := a.persistedDependencyRuntimes(rp)
+	if depErr != nil {
+		err = fmt.Errorf("rollback dependency context is incomplete: %w", depErr)
+		_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+		a.failJob(jobID, err)
+		return err
+	}
+
+	// Re-scan the live parent before any destructive rollback step. This catches
+	// namespace dependents added after the restore point was created. Retained
+	// pre-update configs win for original dependents; current-only dependents are
+	// preserved exactly as they are now and rebound to the restored parent.
+	currentDependencyCtx := []networkNamespaceDependencyRuntime{}
+	if _, liveDeps, scanErr := a.discoverNetworkNamespaceDependents(ctx, rp.HostID, rp.ContainerName); scanErr == nil {
+		currentDependencyCtx = liveDeps
+	} else if _, inspectErr := a.inspectOne(ctx, rp.HostID, rp.ContainerName); inspectErr == nil {
+		err = fmt.Errorf("rollback blocked because current network namespace dependencies could not be scanned safely: %w", scanErr)
+		a.failJob(jobID, err)
+		return err
+	} else {
+		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "dependency", "Current parent container is unavailable; using retained dependency transaction only")
+	}
+	rollbackExecutionDeps := mergeDependencyRuntimes(rollbackDeps, currentDependencyCtx)
+	if len(rollbackExecutionDeps) > 0 {
+		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "dependency", fmt.Sprintf("Rollback transaction includes %d network namespace dependent(s): %s", len(rollbackExecutionDeps), dependencyNames(rollbackExecutionDeps)))
+	}
+
+	// Capture the state immediately before rollback as an in-memory config plus a
+	// temporary committed image. This is not retained as another restore point;
+	// it exists only so a failed rollback can put the current container back.
+	var current inspectContainer
+	var currentContainer dockercli.Container
+	var currentVersion db.VersionInfo
+	safetyRef := ""
+	if cur, inspectErr := a.inspectOne(ctx, rp.HostID, rp.ContainerName); inspectErr == nil {
+		current = cur
+		currentContainer, currentVersion = a.currentContainerState(ctx, rp.HostID, rp.ContainerName)
+		a.jobProgress(ctx, jobID, 20, "Creating rollback safety image")
+		safetyRef = restoreImageRef(rp.HostID, rp.ContainerName, "safety-"+time.Now().UTC().Format("20060102T150405.000000000Z"))
+		safetyCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		_, safetyErr := a.Docker.Run(safetyCtx, h.Endpoint, "commit", "--pause=true", rp.ContainerName, safetyRef)
+		cancel()
+		if safetyErr != nil {
+			safetyRef = ""
+			_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Temporary safety image could not be created: "+safetyErr.Error())
+		}
+	} else {
+		currentContainer, currentVersion = a.currentContainerState(ctx, rp.HostID, rp.ContainerName)
+		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Current container is missing or cannot be inspected; restoring directly from restore point")
+	}
+	if safetyRef != "" {
+		defer func() { _, _ = a.Docker.Run(context.Background(), h.Endpoint, "image", "rm", safetyRef) }()
+	}
+	recoverSafety := func() error {
+		if safetyRef == "" || strings.TrimSpace(current.Name) == "" {
+			return fmt.Errorf("no pre-rollback safety image is available")
+		}
+		// Any dependent rebound during a partial rollback must be stopped before
+		// the safety parent is recreated, otherwise it would again retain a stale
+		// network namespace reference.
+		stopDependentsBestEffort(context.Background(), a, h.Endpoint, rollbackExecutionDeps)
+		fallback := a.prepareRuntimeRestoreRef(context.Background(), h.Endpoint, safetyRef, current.Config.Image)
+		if fallbackErr := a.restoreContainerRuntime(context.Background(), h.Endpoint, current, fallback); fallbackErr != nil {
+			return fallbackErr
+		}
+		if len(currentDependencyCtx) > 0 {
+			parent, inspectErr := a.inspectOne(context.Background(), rp.HostID, rp.ContainerName)
+			if inspectErr != nil {
+				return fmt.Errorf("safety parent restored but could not be inspected for dependent rebinding: %w", inspectErr)
+			}
+			if depRestoreErr := a.recreateNetworkNamespaceDependents(context.Background(), jobID, rp.HostID, rp.ContainerName, parent.ID, currentDependencyCtx); depRestoreErr != nil {
+				return fmt.Errorf("safety parent restored but dependent rebinding failed: %w", depRestoreErr)
+			}
+		}
+		return nil
+	}
+
+	if len(rollbackExecutionDeps) > 0 {
+		a.jobProgress(ctx, jobID, 38, "Stopping network namespace dependents")
+		stopDependentsBestEffort(ctx, a, h.Endpoint, rollbackExecutionDeps)
+	}
+
+	a.jobProgress(ctx, jobID, 48, "Restoring container filesystem and configuration")
+	target := a.prepareRuntimeRestoreRef(ctx, h.Endpoint, rp.ImageRef, old.Config.Image)
+	err = a.restoreContainerRuntime(ctx, h.Endpoint, old, target)
+	if err != nil && safetyRef != "" && strings.TrimSpace(current.Name) != "" {
+		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Restore failed; attempting safety recovery of the pre-rollback container and its namespace dependents")
+		originalErr := err
+		if fallbackErr := recoverSafety(); fallbackErr != nil {
+			err = fmt.Errorf("restore failed: %v; safety recovery also failed: %v", originalErr, fallbackErr)
+		} else {
+			err = fmt.Errorf("restore failed: %v; pre-rollback runtime was recovered", originalErr)
+		}
+	}
+	if err != nil {
+		a.jobProgress(ctx, jobID, 100, "Rollback failed")
+		_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+		_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+		_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: rp.HostID, ContainerName: rp.ContainerName, Action: "rollback", Trigger: trigger, Actor: actor, Status: "failed", FromVersion: currentVersion.Installed, ToVersion: rp.FromVersion, FromImageRef: currentContainer.Image, ToImageRef: rp.OriginalImageRef, FromDigest: currentContainer.ImageID, ToDigest: rp.OriginalImageID, SnapshotID: rp.SnapshotID, RestorePointID: rp.ID, DurationMS: time.Since(started).Milliseconds(), Error: err.Error(), DependencyCount: len(rollbackExecutionDeps), DependencyStatus: func() string {
+			if len(rollbackExecutionDeps) > 0 {
+				return "not_restored"
+			}
+			return "none"
+		}(), DependencyDetails: dependencyNames(rollbackExecutionDeps)})
+		return err
+	}
+
+	a.jobProgress(ctx, jobID, 72, "Verifying restored parent container")
+	if verifyErr := a.verifyUpdatedContainer(ctx, rp.HostID, rp.ContainerName); verifyErr != nil {
+		err = fmt.Errorf("restored container verification failed: %w", verifyErr)
+		if safetyRef != "" && strings.TrimSpace(current.Name) != "" {
+			_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Restored parent failed verification; attempting pre-rollback safety recovery")
+			if fallbackErr := recoverSafety(); fallbackErr != nil {
+				err = fmt.Errorf("%v; safety recovery also failed: %v", err, fallbackErr)
+			} else {
+				err = fmt.Errorf("%v; pre-rollback runtime was recovered", err)
+			}
+		}
+		a.jobProgress(ctx, jobID, 100, "Rollback verification failed")
+		_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+		_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+		return err
+	}
+	if len(rollbackExecutionDeps) > 0 {
+		parentAfter, inspectErr := a.inspectOne(ctx, rp.HostID, rp.ContainerName)
+		if inspectErr != nil {
+			err = fmt.Errorf("restored parent could not be inspected for dependency recreation: %w", inspectErr)
+			a.jobProgress(ctx, jobID, 100, "Rollback dependency restore failed")
+			_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+			_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+			return err
+		}
+		if depRestoreErr := a.recreateNetworkNamespaceDependents(ctx, jobID, rp.HostID, rp.ContainerName, parentAfter.ID, rollbackExecutionDeps); depRestoreErr != nil {
+			err = fmt.Errorf("parent rollback completed but dependent recreation failed: %w", depRestoreErr)
+			if safetyRef != "" && strings.TrimSpace(current.Name) != "" {
+				_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Dependent restore failed; attempting recovery of the complete pre-rollback runtime")
+				if fallbackErr := recoverSafety(); fallbackErr != nil {
+					err = fmt.Errorf("%v; safety recovery also failed: %v", err, fallbackErr)
+				} else {
+					err = fmt.Errorf("%v; pre-rollback runtime was recovered", err)
+				}
+			}
+			a.jobProgress(ctx, jobID, 100, "Rollback dependency restore failed")
+			_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+			_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+			_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: rp.HostID, ContainerName: rp.ContainerName, Action: "rollback", Trigger: trigger, Actor: actor, Status: "failed", FromVersion: currentVersion.Installed, ToVersion: rp.FromVersion, FromImageRef: currentContainer.Image, ToImageRef: rp.OriginalImageRef, FromDigest: currentContainer.ImageID, ToDigest: rp.OriginalImageID, SnapshotID: rp.SnapshotID, RestorePointID: rp.ID, DurationMS: time.Since(started).Milliseconds(), Error: err.Error(), DependencyCount: len(rollbackExecutionDeps), DependencyStatus: "failed", DependencyDetails: dependencyNames(rollbackExecutionDeps)})
+			return err
+		}
+	}
+	_, _, _ = a.check(ctx, rp.HostID, rp.ContainerName, "post-rollback")
+	if snoozed := a.snoozeLatestAfterRollback(ctx, rp.HostID, rp.ContainerName, rp.TargetDigest); snoozed != "" {
+		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "rollback", "Update digest snoozed after rollback: "+snoozed)
+	}
+	if err := a.captureCurrentConfigDriftBaseline(ctx, rp.HostID, rp.ContainerName, "post-rollback"); err != nil {
+		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "config-drift", "Could not refresh post-rollback drift baseline: "+err.Error())
+	}
+	after, afterVersion := a.currentContainerState(ctx, rp.HostID, rp.ContainerName)
+	_ = a.Store.MarkRestorePointRestored(ctx, rp.ID, "")
+	a.jobProgress(ctx, jobID, 100, "Rollback completed")
+	_ = a.Store.FinishJob(ctx, jobID, "success", "", "")
+	_ = a.Store.Audit(ctx, actor, "rollback.success", rp.HostID, rp.ContainerName, fmt.Sprintf("restore_point=%d snapshot=%s trigger=%s", rp.ID, rp.SnapshotID, trigger))
+	_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: rp.HostID, ContainerName: rp.ContainerName, Action: "rollback", Trigger: trigger, Actor: actor, Status: "success", FromVersion: currentVersion.Installed, ToVersion: afterVersion.Installed, FromImageRef: currentContainer.Image, ToImageRef: after.Image, FromDigest: currentContainer.ImageID, ToDigest: after.ImageID, SnapshotID: rp.SnapshotID, RestorePointID: rp.ID, DurationMS: time.Since(started).Milliseconds(), DependencyCount: len(rollbackExecutionDeps), DependencyStatus: func() string {
+		if len(rollbackExecutionDeps) > 0 {
+			return "success"
+		}
+		return "none"
+	}(), DependencyDetails: dependencyNames(rollbackExecutionDeps)})
+	return nil
+}
+
 func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		HistoryID int64 `json:"history_id"`
+		HistoryID      int64 `json:"history_id"`
+		RestorePointID int64 `json:"restore_point_id"`
 	}
-	if json.NewDecoder(r.Body).Decode(&in) != nil || in.HistoryID <= 0 {
-		writeErr(w, 400, "history_id is required")
+	if json.NewDecoder(r.Body).Decode(&in) != nil || (in.HistoryID <= 0 && in.RestorePointID <= 0) {
+		writeErr(w, 400, "history_id or restore_point_id is required")
 		return
 	}
-	hist, err := a.Store.UpdateHistoryEntry(r.Context(), in.HistoryID)
-	if err != nil {
-		writeErr(w, 404, err.Error())
+
+	var rp db.RestorePoint
+	var hist db.UpdateHistory
+	var err error
+	if in.RestorePointID > 0 {
+		rp, err = a.Store.RestorePoint(r.Context(), in.RestorePointID)
+		if err != nil {
+			writeErr(w, 404, err.Error())
+			return
+		}
+	} else {
+		hist, err = a.Store.UpdateHistoryEntry(r.Context(), in.HistoryID)
+		if err != nil {
+			writeErr(w, 404, err.Error())
+			return
+		}
+		if hist.Action != "update" || hist.Status != "success" || hist.SnapshotID == "" {
+			writeErr(w, 409, "this history entry cannot be rolled back")
+			return
+		}
+		if hist.RestorePointID > 0 {
+			rp, err = a.Store.RestorePoint(r.Context(), hist.RestorePointID)
+			if err != nil {
+				writeErr(w, 409, "linked full restore point is unavailable: "+err.Error())
+				return
+			}
+		}
+	}
+
+	if rp.ID > 0 {
+		if !a.hostAllowed(r, rp.HostID) {
+			writeErr(w, 403, "host access denied")
+			return
+		}
+		if strings.EqualFold(rp.StackType, "swarm") || !bool(rp.WritableLayer) {
+			writeErr(w, 409, "this restore point is configuration-only; one-click full rollback is not available")
+			return
+		}
+		available, _ := a.restorePointAvailable(r.Context(), rp)
+		if !available {
+			writeErr(w, 409, "restore point is degraded, expired, or its writable-layer image is unavailable")
+			return
+		}
+		managed, _ := a.systemManagedContainer(rp.ContainerName)
+		if managed {
+			writeErr(w, 403, "system-managed containers cannot be rolled back here")
+			return
+		}
+		active, _ := a.Store.HasActiveJob(r.Context(), rp.HostID, rp.ContainerName)
+		if active {
+			writeErr(w, 409, "another operation is already running for this container")
+			return
+		}
+		id, err := a.Store.CreateJob(r.Context(), "rollback", "manual", rp.HostID, rp.ContainerName, "queued")
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		_ = a.Store.AddJobLog(r.Context(), id, "INFO", "app", fmt.Sprintf("full rollback queued from restore point #%d", rp.ID))
+		a.jobProgress(r.Context(), id, 5, "Queued")
+		actor := a.actor(r)
+		_ = a.Store.Audit(r.Context(), actor, "rollback.queue", rp.HostID, rp.ContainerName, fmt.Sprintf("restore_point=%d snapshot=%s", rp.ID, rp.SnapshotID))
+		go a.executeRestorePointRollback(id, rp, actor, "manual")
+		writeJSON(w, 202, map[string]any{"job_id": id, "restore_point_id": rp.ID})
 		return
 	}
+
+	// Compatibility path for update history created before full restore points
+	// existed. This restores configuration plus the original image only.
 	if !a.hostAllowed(r, hist.HostID) {
 		writeErr(w, 403, "host access denied")
-		return
-	}
-	if hist.Action != "update" || hist.Status != "success" || hist.SnapshotID == "" {
-		writeErr(w, 409, "this history entry cannot be rolled back")
 		return
 	}
 	if _, info, findErr := a.findSnapshotForHistory(hist); findErr != nil {
@@ -450,7 +934,7 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	_ = a.Store.AddJobLog(r.Context(), id, "INFO", "app", fmt.Sprintf("rollback queued from update history #%d", hist.ID))
+	_ = a.Store.AddJobLog(r.Context(), id, "INFO", "app", fmt.Sprintf("legacy config/image rollback queued from update history #%d", hist.ID))
 	a.jobProgress(r.Context(), id, 5, "Queued")
 	actor := a.actor(r)
 	_ = a.Store.Audit(r.Context(), actor, "rollback.queue", hist.HostID, hist.ContainerName, fmt.Sprintf("history_id=%d", hist.ID))

@@ -14,7 +14,7 @@ COPY internal/ ./internal/
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/vibewatch ./cmd/server
 
 FROM alpine:3.20
-ARG VIBEWATCH_VERSION=0.7.2.1
+ARG VIBEWATCH_VERSION=0.8.0
 LABEL org.opencontainers.image.title="Vibewatch" \
       org.opencontainers.image.version="$VIBEWATCH_VERSION" \
       org.opencontainers.image.description="Multi-host Docker update control powered by Watchtower"

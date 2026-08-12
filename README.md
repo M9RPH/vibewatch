@@ -1,6 +1,38 @@
-# Vibewatch V0.7.2.1
+# Vibewatch V0.8.2.1
 
 A central multi-host Docker update controller using the Nicholas Fedor Watchtower fork as an intentionally passive update worker.
+
+## V0.8.2.1 highlights
+
+- **Consistent tables:** all actual table views now use the shared Vibewatch table visual system. Header labels align with the content below them instead of inheriting the browser's centered table-header default; explicit action columns stay right aligned.
+- **Clearer recovery navigation:** the former **Container Backups** page is now **Container Configs**, while **Rollback** is now **Container Rollback**. The sidebar places Container Configs before Container Rollback and both pages explain their distinct recovery scope.
+- **Correct retention-slot labels:** `Oldest` follows the actually oldest retained config snapshot. Empty retention capacity is shown as a free/available slot instead of making an empty third slot look like the oldest snapshot.
+- **Cleaner host dashboard:** Inventory and Cleanup panels are stacked vertically inside each host card while their object/action tiles remain responsive grids.
+- **No behavior/schema change:** Docker update, rollback, backup APIs and persisted data remain compatible with V0.8.2.
+
+## V0.8.2 highlights
+
+- **Stable namespace recovery Compose:** runtime `network_mode: container:<ephemeral-id>` values are normalized during snapshot creation. Same-project Compose relationships are reconstructed as `network_mode: service:<service>`; external namespace relationships fall back to `container:<stable-container-name>`.
+- **No stale runtime hostnames:** namespace-sharing services no longer persist inherited/runtime hostnames or other Docker flags that conflict with container network mode. Docker-generated self-ID hostnames on ordinary containers are also omitted while explicit custom hostnames remain intact.
+- **Fail-closed recovery artifacts:** if an ID-based namespace parent cannot be resolved to a stable service/container reference, Vibewatch refuses to create the recovery snapshot instead of storing a Compose file that would already be stale after a recreate.
+- **No DB migration:** existing V0.8.1 data remains compatible; the correction applies to newly created recovery snapshots and Restore Points.
+
+## V0.8.1 highlights
+
+- **Network-namespace dependency transactions:** before updating a container, Vibewatch detects direct dependents using Docker Engine `HostConfig.NetworkMode=container:<id>`. This covers common Compose `network_mode: service:<name>` VPN/sidecar layouts without hard-coding Gluetun or any application name.
+- **Correct dependent recreation:** when the parent receives a new container ID, Vibewatch verifies it first and then recreates every detected dependent against the new namespace. Previously stopped dependents are recreated but remain stopped; running dependents are started and verified.
+- **Rollback integration:** dependency relationships and their retained runtime snapshots are stored with the full Restore Point. Rollback stops dependents first, restores and verifies the parent, then recreates them against the restored parent ID. A dependent failure makes the transaction fail instead of reporting a false successful parent update.
+- **Retention-safe transactions:** cross-stack dependent snapshots remain pinned for as long as the parent Restore Point is retained, even if the dependent backup unit would otherwise exceed its configured retention. Expiring the parent transaction removes its transaction-only dependency snapshots.
+- **Transparent history/audit:** Update History shows dependency count/status/names, the Container Rollback page shows retained namespace dependents, and structured audit/job events record detection and recreate start/success/failure.
+
+## V0.8.0 highlights
+
+- **Full container restore points:** before a non-Swarm container update, Vibewatch now combines the existing runtime/config recovery snapshot with a `docker commit --pause=true` capture of the container writable layer. The internal restore image is retention-managed and protected from Vibewatch image cleanup.
+- **Automatic failed-update rollback:** if Watchtower replaces/breaks the target and the resulting container is missing, stopped, restarting or explicitly `unhealthy`, Vibewatch can restore the captured pre-update container automatically. Containers without a Docker healthcheck receive a short running-state stability window; Vibewatch does not invent application-specific health.
+- **Digest-safe rollback:** after a successful manual or automatic rollback, the currently available remote digest is snoozed so an Auto Update policy cannot immediately reinstall the same bad image. A newer remote digest naturally clears the snooze through the existing digest-bound Snooze logic.
+- **Dedicated Container Rollback page:** retained restore points show host/container, original image/version, protection level, mounted-volume/bind references, restore status/history and one-click rollback availability. The Containers page also exposes a direct Rollback action to the latest retained usable full restore point.
+- **Retention as one recovery lifecycle:** when the linked recovery snapshot expires, the full restore point expires with it and Vibewatch untags its internal restore image. Original image, volume and network rollback protection continues to follow retained recovery artifacts.
+- **Honest mounted-data boundary:** container writable-layer data is captured, but contents of Docker volumes and bind mounts are not copied into the restore image. Persistent database migrations therefore still require an application/database/volume backup when data rollback is needed. Docker Swarm remains configuration-only for one-click recovery.
 
 ## V0.7.2.1 highlights
 
@@ -33,7 +65,7 @@ A central multi-host Docker update controller using the Nicholas Fedor Watchtowe
 - **Manual rollback:** a successful Compose/standalone update can be rolled back while its pre-update recovery snapshot is still retained. Vibewatch first creates a new safety snapshot, then restores the previous immutable/local image and saved runtime configuration. Rollback is manual only; no health-based automatic rollback is performed. One-click Swarm rollback remains disabled in this release.
 - **Config Drift Detection:** current Docker runtime configuration is compared with the latest recovery snapshot. Image reference, environment, command/entrypoint, ports, mounts, networks, restart policy, healthcheck, privileges/capabilities, DNS/devices and user labels are compared while volatile runtime fields and the immutable image ID are ignored.
 - **Private registry credentials:** Owner-only encrypted credentials can be stored for Docker Hub, GHCR or custom OCI registries so read-only manifest/digest/version metadata checks also work for private images. Secrets are AES-256-GCM encrypted and never returned by the API/support bundle.
-- **Container Backups – Download all:** Admin/Owner can download the currently retained recovery snapshots across permitted hosts as one archive. The existing limit of three snapshots per stack/standalone service remains unchanged.
+- **Container Configs – Download all:** Admin/Owner can download the currently retained recovery snapshots across permitted hosts as one archive. The existing limit of three snapshots per stack/standalone service remains unchanged.
 - **Dashboard attention summary:** the existing Dashboard now surfaces updates, unhealthy/restarting containers, offline hosts/workers, config drift, reclaimable images and unused anonymous volumes without introducing a second dashboard.
 - Docker Events remain isolated in bounded `/data/logs/docker-events.jsonl`, and the V0.5.2 event-corruption recovery remains active.
 
@@ -45,7 +77,7 @@ A central multi-host Docker update controller using the Nicholas Fedor Watchtowe
 | Auto Update | Watchtower digest check; queue install when changed | Yes | Yes |
 | Excluded | Read-only local/registry digest info only | Direct action blocked; Check All may refresh read-only info | Blocked until policy changes |
 
-The Watchtower workers themselves remain passive. V0.7.2.1 continues to start them with `WATCHTOWER_HTTP_API_PERIODIC_POLLS=false` and `WATCHTOWER_UPDATE_ON_START=false`. Updates are initiated only by Vibewatch manual actions, policy automation, worker maintenance, or the explicit Owner-only application self-update helper.
+The Watchtower workers themselves remain passive. V0.8.1 continues to start them with `WATCHTOWER_HTTP_API_PERIODIC_POLLS=false` and `WATCHTOWER_UPDATE_ON_START=false`. Updates are initiated only by Vibewatch manual actions, policy automation, worker maintenance, or the explicit Owner-only application self-update helper.
 
 ## Worker maintenance
 
@@ -183,15 +215,15 @@ docker compose up -d --build
 
 Open `http://SERVER:8085` (or `WTUI_PORT`). Login name for the Owner is `admin`. Initially the password is `WTUI_ADMIN_PASSWORD`; after changing it under Users → Managed accounts, the persistent Vibewatch password takes precedence.
 
-### Upgrade to V0.7.2.1
+### Upgrade to V0.8.2.1
 
-Copy the existing **entire `data/` directory** and `.env` into the V0.7.2.1 project directory, then run:
+Copy the existing **entire `data/` directory** and `.env` into the V0.8.2.1 project directory, then run:
 
 ```bash
 docker compose up -d --build
 ```
 
-V0.7.2.1 remains backward-compatible with the V0.7.2 data directory and requires no new SQLite migration. This release is UI-only and adjusts the Dashboard host inventory tile layout; runtime Docker inventory/cleanup semantics and persisted state remain unchanged. Existing hosts, users, groups, policies, automations, Pushover settings, recovery snapshots, Config Drift baselines and logs remain compatible. Once private registry credentials are configured, `/data/registry-credentials.key` is required together with `vibewatch.db`; do not migrate only the database file. Database backups created by Vibewatch also preserve a companion registry-key copy when one exists.
+V0.8.2.1 is backward-compatible with the V0.8.2/V0.8.1/V0.8.0 data directory (and therefore the earlier supported upgrade chain). No new SQLite migration is required for V0.8.2.1; existing hosts, users, groups, policies, automations, Pushover settings, recovery snapshots, Restore Points, Config Drift baselines and logs remain compatible. Existing pre-V0.8.0 history remains available through the legacy image/config rollback path while V0.8.x updates create full restore points. Keep the entire `/data` directory when upgrading. Once private registry credentials are configured, `/data/registry-credentials.key` is required together with `vibewatch.db`; do not migrate only the database file. Database backups created by Vibewatch also preserve a companion registry-key copy when one exists.
 
 ## Publishing later
 
@@ -200,6 +232,7 @@ The included GitHub Actions workflow builds `linux/amd64` and `linux/arm64` imag
 ## Current limitations
 
 - GitHub patch notes require a detectable/configured GitHub repository; non-GitHub projects can still use registry version information and Watchtower update detection.
-- Manual rollback is available for Compose/standalone containers only while the linked pre-update recovery snapshot is still retained and the previous image can be resolved locally or by an immutable repository digest. Swarm entries remain in history/backups but do not expose one-click rollback. Rollback restores container configuration, not application data inside volumes/databases.
-- Automatic rollback based on Docker health status is intentionally not enabled because many containers do not define a healthcheck.
+- Full-container rollback is available for Compose/standalone containers only while both the linked recovery snapshot and committed restore image remain retained. Swarm restore points remain configuration-only. Docker volume and bind-mount contents are not copied into the committed restore image, so application/database data migrations still need their own data backup.
+- Automatic rollback reacts only to concrete Docker runtime failure signals after an update: missing/stopped/restarting containers or an explicit `unhealthy` healthcheck. Containers without a healthcheck are observed for a short running-state stability window, but Vibewatch cannot determine whether an otherwise-running application is functionally correct; use manual rollback for that case.
+- Network-namespace dependency handling currently covers direct Docker Engine `container:<id>` relationships only. It deliberately does not attempt to infer every possible application, startup-order or data dependency. Recreating a dependent follows normal Docker recreate semantics: mounted volumes/binds persist, while application data written only to that dependent container's writable layer should not be treated as a persistent datastore.
 - The application self-update path only becomes meaningful once the controller itself is deployed from a registry image rather than a locally built tag.

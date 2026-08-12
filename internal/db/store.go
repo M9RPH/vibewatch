@@ -256,23 +256,58 @@ type NotificationDelivery struct {
 }
 
 type UpdateHistory struct {
-	ID            int64  `json:"id"`
-	TS            string `json:"ts"`
-	HostID        int64  `json:"host_id"`
-	ContainerName string `json:"container_name"`
-	Action        string `json:"action"`
-	Trigger       string `json:"trigger"`
-	Actor         string `json:"actor"`
-	Status        string `json:"status"`
-	FromVersion   string `json:"from_version"`
-	ToVersion     string `json:"to_version"`
-	FromImageRef  string `json:"from_image_ref"`
-	ToImageRef    string `json:"to_image_ref"`
-	FromDigest    string `json:"from_digest"`
-	ToDigest      string `json:"to_digest"`
-	SnapshotID    string `json:"snapshot_id"`
-	DurationMS    int64  `json:"duration_ms"`
-	Error         string `json:"error"`
+	ID                int64  `json:"id"`
+	TS                string `json:"ts"`
+	HostID            int64  `json:"host_id"`
+	ContainerName     string `json:"container_name"`
+	Action            string `json:"action"`
+	Trigger           string `json:"trigger"`
+	Actor             string `json:"actor"`
+	Status            string `json:"status"`
+	FromVersion       string `json:"from_version"`
+	ToVersion         string `json:"to_version"`
+	FromImageRef      string `json:"from_image_ref"`
+	ToImageRef        string `json:"to_image_ref"`
+	FromDigest        string `json:"from_digest"`
+	ToDigest          string `json:"to_digest"`
+	SnapshotID        string `json:"snapshot_id"`
+	RestorePointID    int64  `json:"restore_point_id"`
+	DurationMS        int64  `json:"duration_ms"`
+	Error             string `json:"error"`
+	DependencyCount   int    `json:"dependency_count"`
+	DependencyStatus  string `json:"dependency_status"`
+	DependencyDetails string `json:"dependency_details"`
+}
+
+type RestorePoint struct {
+	ID                  int64  `json:"id"`
+	CreatedAt           string `json:"created_at"`
+	UpdatedAt           string `json:"updated_at"`
+	HostID              int64  `json:"host_id"`
+	ContainerName       string `json:"container_name"`
+	SnapshotID          string `json:"snapshot_id"`
+	Reason              string `json:"reason"`
+	Trigger             string `json:"trigger"`
+	Status              string `json:"status"`
+	ImageRef            string `json:"image_ref"`
+	ImageID             string `json:"image_id"`
+	OriginalImageRef    string `json:"original_image_ref"`
+	OriginalImageID     string `json:"original_image_id"`
+	TargetDigest        string `json:"target_digest"`
+	FromVersion         string `json:"from_version"`
+	UnitKind            string `json:"unit_kind"`
+	UnitKey             string `json:"unit_key"`
+	StackType           string `json:"stack_type"`
+	WritableLayer       Bool   `json:"writable_layer"`
+	ConfigProtected     Bool   `json:"config_protected"`
+	VolumeDataProtected Bool   `json:"volume_data_protected"`
+	VolumeCount         int    `json:"volume_count"`
+	BindCount           int    `json:"bind_count"`
+	RestoreCount        int    `json:"restore_count"`
+	LastRestoredAt      string `json:"last_restored_at"`
+	LastError           string `json:"last_error"`
+	DependencyCount     int    `json:"dependency_count"`
+	DependenciesJSON    string `json:"-"`
 }
 
 type ConfigDriftState struct {
@@ -353,10 +388,11 @@ CREATE TABLE IF NOT EXISTS user_groups (user_id INTEGER NOT NULL, group_id INTEG
 CREATE TABLE IF NOT EXISTS notification_settings (user_id INTEGER PRIMARY KEY, pushover_app_token TEXT NOT NULL DEFAULT '', pushover_user_key TEXT NOT NULL DEFAULT '', notify_auto_updates INTEGER NOT NULL DEFAULT 1, notify_manual_available INTEGER NOT NULL DEFAULT 1, notify_manual_updates INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS notification_state (user_id INTEGER NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, event TEXT NOT NULL, fingerprint TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(user_id,host_id,container_name,event));
 CREATE TABLE IF NOT EXISTS notification_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, user_id INTEGER NOT NULL, username TEXT NOT NULL, host_id INTEGER NOT NULL DEFAULT 0, container_name TEXT NOT NULL DEFAULT '', event TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS update_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, action TEXT NOT NULL DEFAULT 'update', trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, from_version TEXT NOT NULL DEFAULT '', to_version TEXT NOT NULL DEFAULT '', from_image_ref TEXT NOT NULL DEFAULT '', to_image_ref TEXT NOT NULL DEFAULT '', from_digest TEXT NOT NULL DEFAULT '', to_digest TEXT NOT NULL DEFAULT '', snapshot_id TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS update_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, action TEXT NOT NULL DEFAULT 'update', trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, from_version TEXT NOT NULL DEFAULT '', to_version TEXT NOT NULL DEFAULT '', from_image_ref TEXT NOT NULL DEFAULT '', to_image_ref TEXT NOT NULL DEFAULT '', from_digest TEXT NOT NULL DEFAULT '', to_digest TEXT NOT NULL DEFAULT '', snapshot_id TEXT NOT NULL DEFAULT '', restore_point_id INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', dependency_count INTEGER NOT NULL DEFAULT 0, dependency_status TEXT NOT NULL DEFAULT '', dependency_details TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS restore_points (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, snapshot_id TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', trigger TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'ready', image_ref TEXT NOT NULL DEFAULT '', image_id TEXT NOT NULL DEFAULT '', original_image_ref TEXT NOT NULL DEFAULT '', original_image_id TEXT NOT NULL DEFAULT '', target_digest TEXT NOT NULL DEFAULT '', from_version TEXT NOT NULL DEFAULT '', unit_kind TEXT NOT NULL DEFAULT '', unit_key TEXT NOT NULL DEFAULT '', stack_type TEXT NOT NULL DEFAULT '', writable_layer INTEGER NOT NULL DEFAULT 0, config_protected INTEGER NOT NULL DEFAULT 1, volume_data_protected INTEGER NOT NULL DEFAULT 0, volume_count INTEGER NOT NULL DEFAULT 0, bind_count INTEGER NOT NULL DEFAULT 0, restore_count INTEGER NOT NULL DEFAULT 0, last_restored_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', dependency_count INTEGER NOT NULL DEFAULT 0, dependencies_json TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS config_drift_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'not_checked', details_json TEXT NOT NULL DEFAULT '[]', baseline_at TEXT NOT NULL DEFAULT '', baseline_json TEXT NOT NULL DEFAULT '', baseline_source TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
 CREATE TABLE IF NOT EXISTS registry_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, registry TEXT NOT NULL UNIQUE COLLATE NOCASE, username TEXT NOT NULL DEFAULT '', secret_enc TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(id DESC); CREATE INDEX IF NOT EXISTS idx_update_history_id ON update_history(id DESC); CREATE INDEX IF NOT EXISTS idx_update_history_container ON update_history(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_notification_deliveries_id ON notification_deliveries(id DESC); CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id,id); CREATE INDEX IF NOT EXISTS idx_group_members_host ON host_group_members(host_id); CREATE INDEX IF NOT EXISTS idx_user_hosts_host ON user_hosts(host_id);`
+CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(id DESC); CREATE INDEX IF NOT EXISTS idx_update_history_id ON update_history(id DESC); CREATE INDEX IF NOT EXISTS idx_restore_points_container ON restore_points(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_restore_points_snapshot ON restore_points(host_id,snapshot_id); CREATE INDEX IF NOT EXISTS idx_update_history_container ON update_history(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_notification_deliveries_id ON notification_deliveries(id DESC); CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id,id); CREATE INDEX IF NOT EXISTS idx_group_members_host ON host_group_members(host_id); CREATE INDEX IF NOT EXISTS idx_user_hosts_host ON user_hosts(host_id);`
 	if err := s.exec(ctx, schema); err != nil {
 		return err
 	}
@@ -374,6 +410,20 @@ CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(id DESC); CREATE INDEX IF NO
 		"ALTER TABLE container_cache ADD COLUMN first_detected_at TEXT NOT NULL DEFAULT '';",
 		"ALTER TABLE container_cache ADD COLUMN snoozed_digest TEXT NOT NULL DEFAULT '';",
 		"ALTER TABLE container_cache ADD COLUMN snoozed_at TEXT NOT NULL DEFAULT '';",
+	} {
+		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	if err := s.exec(ctx, "ALTER TABLE update_history ADD COLUMN restore_point_id INTEGER NOT NULL DEFAULT 0;"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE update_history ADD COLUMN dependency_count INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE update_history ADD COLUMN dependency_status TEXT NOT NULL DEFAULT '';",
+		"ALTER TABLE update_history ADD COLUMN dependency_details TEXT NOT NULL DEFAULT '';",
+		"ALTER TABLE restore_points ADD COLUMN dependency_count INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE restore_points ADD COLUMN dependencies_json TEXT NOT NULL DEFAULT '[]';",
 	} {
 		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			return err
@@ -474,7 +524,7 @@ var recoverableCoreTables = []string{
 	"hosts", "policies", "container_cache", "jobs", "job_logs", "schedules",
 	"audit_events", "settings", "version_cache", "automations", "host_groups",
 	"host_group_members", "users", "user_hosts", "user_groups",
-	"notification_settings", "notification_state", "notification_deliveries", "update_history", "config_drift_cache", "registry_credentials",
+	"notification_settings", "notification_state", "notification_deliveries", "update_history", "restore_points", "config_drift_cache", "registry_credentials",
 }
 
 // RepairDockerEventCorruption is a narrowly-scoped startup recovery for the
@@ -665,7 +715,7 @@ func (s *Store) RenameHost(ctx context.Context, id int64, name string) error {
 	return s.exec(ctx, fmt.Sprintf(`UPDATE hosts SET name=%s WHERE id=%d`, q(name), id))
 }
 func (s *Store) DeleteHost(ctx context.Context, id int64) error {
-	return s.exec(ctx, fmt.Sprintf(`DELETE FROM policies WHERE host_id=%d; DELETE FROM container_cache WHERE host_id=%d; DELETE FROM version_cache WHERE host_id=%d; DELETE FROM schedules WHERE host_id=%d; DELETE FROM host_group_members WHERE host_id=%d; DELETE FROM user_hosts WHERE host_id=%d; DELETE FROM automations WHERE target_type='host' AND target_id=%d; DELETE FROM notification_state WHERE host_id=%d; DELETE FROM config_drift_cache WHERE host_id=%d; DELETE FROM hosts WHERE id=%d;`, id, id, id, id, id, id, id, id, id, id))
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM policies WHERE host_id=%d; DELETE FROM container_cache WHERE host_id=%d; DELETE FROM version_cache WHERE host_id=%d; DELETE FROM schedules WHERE host_id=%d; DELETE FROM host_group_members WHERE host_id=%d; DELETE FROM user_hosts WHERE host_id=%d; DELETE FROM automations WHERE target_type='host' AND target_id=%d; DELETE FROM notification_state WHERE host_id=%d; DELETE FROM config_drift_cache WHERE host_id=%d; DELETE FROM restore_points WHERE host_id=%d; DELETE FROM hosts WHERE id=%d;`, id, id, id, id, id, id, id, id, id, id, id))
 }
 
 func (s *Store) Policy(ctx context.Context, hostID int64, name string) (Policy, error) {
@@ -757,8 +807,8 @@ func (s *Store) AddUpdateHistory(ctx context.Context, x UpdateHistory) (int64, e
 	if strings.TrimSpace(x.Status) == "" {
 		x.Status = "unknown"
 	}
-	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_history(ts,host_id,container_name,action,trigger,actor,status,from_version,to_version,from_image_ref,to_image_ref,from_digest,to_digest,snapshot_id,duration_ms,error) VALUES(%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%s); SELECT last_insert_rowid();`,
-		q(now()), x.HostID, q(x.ContainerName), q(x.Action), q(x.Trigger), q(x.Actor), q(x.Status), q(x.FromVersion), q(x.ToVersion), q(x.FromImageRef), q(x.ToImageRef), q(x.FromDigest), q(x.ToDigest), q(x.SnapshotID), x.DurationMS, q(x.Error)))
+	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_history(ts,host_id,container_name,action,trigger,actor,status,from_version,to_version,from_image_ref,to_image_ref,from_digest,to_digest,snapshot_id,restore_point_id,duration_ms,error,dependency_count,dependency_status,dependency_details) VALUES(%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%d,%s,%s); SELECT last_insert_rowid();`,
+		q(now()), x.HostID, q(x.ContainerName), q(x.Action), q(x.Trigger), q(x.Actor), q(x.Status), q(x.FromVersion), q(x.ToVersion), q(x.FromImageRef), q(x.ToImageRef), q(x.FromDigest), q(x.ToDigest), q(x.SnapshotID), x.RestorePointID, x.DurationMS, q(x.Error), x.DependencyCount, q(x.DependencyStatus), q(x.DependencyDetails)))
 	if err == nil {
 		_ = s.exec(ctx, `DELETE FROM update_history WHERE id NOT IN (SELECT id FROM update_history ORDER BY id DESC LIMIT 5000);`)
 	}
@@ -776,12 +826,12 @@ func (s *Store) UpdateHistory(ctx context.Context, limit int, hostID int64, cont
 		where = append(where, "container_name="+q(strings.TrimSpace(container)))
 	}
 	var x []UpdateHistory
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,ts,host_id,container_name,action,trigger,actor,status,from_version,to_version,from_image_ref,to_image_ref,from_digest,to_digest,snapshot_id,duration_ms,error FROM update_history WHERE %s ORDER BY id DESC LIMIT %d`, strings.Join(where, " AND "), limit), &x)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,ts,host_id,container_name,action,trigger,actor,status,from_version,to_version,from_image_ref,to_image_ref,from_digest,to_digest,snapshot_id,restore_point_id,duration_ms,error,dependency_count,dependency_status,dependency_details FROM update_history WHERE %s ORDER BY id DESC LIMIT %d`, strings.Join(where, " AND "), limit), &x)
 	return x, err
 }
 func (s *Store) UpdateHistoryEntry(ctx context.Context, id int64) (UpdateHistory, error) {
 	var x []UpdateHistory
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,ts,host_id,container_name,action,trigger,actor,status,from_version,to_version,from_image_ref,to_image_ref,from_digest,to_digest,snapshot_id,duration_ms,error FROM update_history WHERE id=%d LIMIT 1`, id), &x)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,ts,host_id,container_name,action,trigger,actor,status,from_version,to_version,from_image_ref,to_image_ref,from_digest,to_digest,snapshot_id,restore_point_id,duration_ms,error,dependency_count,dependency_status,dependency_details FROM update_history WHERE id=%d LIMIT 1`, id), &x)
 	if err != nil {
 		return UpdateHistory{}, err
 	}
@@ -789,6 +839,110 @@ func (s *Store) UpdateHistoryEntry(ctx context.Context, id int64) (UpdateHistory
 		return UpdateHistory{}, fmt.Errorf("update history entry %d not found", id)
 	}
 	return x[0], nil
+}
+
+func (s *Store) AddRestorePoint(ctx context.Context, x RestorePoint) (int64, error) {
+	if strings.TrimSpace(x.Status) == "" {
+		x.Status = "ready"
+	}
+	ts := now()
+	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO restore_points(created_at,updated_at,host_id,container_name,snapshot_id,reason,trigger,status,image_ref,image_id,original_image_ref,original_image_id,target_digest,from_version,unit_kind,unit_key,stack_type,writable_layer,config_protected,volume_data_protected,volume_count,bind_count,restore_count,last_restored_at,last_error,dependency_count,dependencies_json) VALUES(%s,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%s,%d,%s); SELECT last_insert_rowid();`,
+		q(ts), q(ts), x.HostID, q(x.ContainerName), q(x.SnapshotID), q(x.Reason), q(x.Trigger), q(x.Status), q(x.ImageRef), q(x.ImageID), q(x.OriginalImageRef), q(x.OriginalImageID), q(x.TargetDigest), q(x.FromVersion), q(x.UnitKind), q(x.UnitKey), q(x.StackType), b(x.WritableLayer), b(x.ConfigProtected), b(x.VolumeDataProtected), x.VolumeCount, x.BindCount, x.RestoreCount, q(x.LastRestoredAt), q(x.LastError), x.DependencyCount, q(x.DependenciesJSON)))
+	if err == nil {
+		_ = s.exec(ctx, `DELETE FROM restore_points WHERE id NOT IN (SELECT id FROM restore_points ORDER BY id DESC LIMIT 5000);`)
+	}
+	return id, err
+}
+
+func restorePointSelect() string {
+	return `id,created_at,updated_at,host_id,container_name,snapshot_id,reason,trigger,status,image_ref,image_id,original_image_ref,original_image_id,target_digest,from_version,unit_kind,unit_key,stack_type,writable_layer,config_protected,volume_data_protected,volume_count,bind_count,restore_count,last_restored_at,last_error,dependency_count,dependencies_json`
+}
+
+func (s *Store) RestorePoint(ctx context.Context, id int64) (RestorePoint, error) {
+	var xs []RestorePoint
+	err := s.query(ctx, fmt.Sprintf(`SELECT %s FROM restore_points WHERE id=%d LIMIT 1`, restorePointSelect(), id), &xs)
+	if err != nil {
+		return RestorePoint{}, err
+	}
+	if len(xs) == 0 {
+		return RestorePoint{}, fmt.Errorf("restore point %d not found", id)
+	}
+	return xs[0], nil
+}
+
+func (s *Store) RestorePoints(ctx context.Context, limit int, hostID int64, container string) ([]RestorePoint, error) {
+	if limit < 1 || limit > 2000 {
+		limit = 500
+	}
+	where := []string{"1=1"}
+	if hostID > 0 {
+		where = append(where, fmt.Sprintf("host_id=%d", hostID))
+	}
+	if strings.TrimSpace(container) != "" {
+		where = append(where, "container_name="+q(strings.TrimSpace(container)))
+	}
+	var xs []RestorePoint
+	err := s.query(ctx, fmt.Sprintf(`SELECT %s FROM restore_points WHERE %s ORDER BY id DESC LIMIT %d`, restorePointSelect(), strings.Join(where, " AND "), limit), &xs)
+	return xs, err
+}
+
+func (s *Store) LatestRestorePointsForHost(ctx context.Context, hostID int64) (map[string]RestorePoint, error) {
+	xs, err := s.RestorePoints(ctx, 2000, hostID, "")
+	if err != nil {
+		return nil, err
+	}
+	// Prefer the newest actually usable full-container restore point. A newer
+	// degraded/config-only row must not hide an older retained full restore
+	// point from the Containers page. If no full point exists, keep the newest
+	// non-expired row so the UI can still explain the protection state.
+	out := map[string]RestorePoint{}
+	fallback := map[string]RestorePoint{}
+	for _, x := range xs {
+		if x.Status == "expired" || x.Status == "failed" {
+			continue
+		}
+		if _, ok := fallback[x.ContainerName]; !ok {
+			fallback[x.ContainerName] = x
+		}
+		if _, ok := out[x.ContainerName]; ok {
+			continue
+		}
+		if bool(x.WritableLayer) && strings.TrimSpace(x.ImageRef) != "" && x.Status != "degraded" && x.Status != "config_only" {
+			out[x.ContainerName] = x
+		}
+	}
+	for name, x := range fallback {
+		if _, ok := out[name]; !ok {
+			out[name] = x
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) SetRestorePointStatus(ctx context.Context, id int64, status, lastError string) error {
+	return s.exec(ctx, fmt.Sprintf(`UPDATE restore_points SET status=%s,last_error=%s,updated_at=%s WHERE id=%d`, q(status), q(lastError), q(now()), id))
+}
+
+func (s *Store) MarkRestorePointRestored(ctx context.Context, id int64, lastError string) error {
+	status := "restored"
+	if strings.TrimSpace(lastError) != "" {
+		status = "degraded"
+	}
+	return s.exec(ctx, fmt.Sprintf(`UPDATE restore_points SET status=%s,restore_count=restore_count+1,last_restored_at=%s,last_error=%s,updated_at=%s WHERE id=%d`, q(status), q(now()), q(lastError), q(now()), id))
+}
+
+func (s *Store) ExpireRestorePointsBySnapshot(ctx context.Context, hostID int64, snapshotID string) ([]RestorePoint, error) {
+	var xs []RestorePoint
+	err := s.query(ctx, fmt.Sprintf(`SELECT %s FROM restore_points WHERE host_id=%d AND snapshot_id=%s AND status!='expired'`, restorePointSelect(), hostID, q(snapshotID)), &xs)
+	if err != nil {
+		return nil, err
+	}
+	if len(xs) > 0 {
+		if err := s.exec(ctx, fmt.Sprintf(`UPDATE restore_points SET status='expired',updated_at=%s WHERE host_id=%d AND snapshot_id=%s`, q(now()), hostID, q(snapshotID))); err != nil {
+			return nil, err
+		}
+	}
+	return xs, nil
 }
 
 func (s *Store) ConfigDrift(ctx context.Context, hostID int64, container string) (ConfigDriftState, error) {

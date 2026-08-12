@@ -268,6 +268,7 @@ button, input, select { font: inherit; }
 .wt-table thead th {
   position: static;
   height: 42px;
+  text-align: left;
   border-bottom: 1px solid var(--wt-border);
   background: var(--wt-table-head);
   padding: .65rem .75rem;
@@ -285,6 +286,7 @@ button, input, select { font: inherit; }
 .wt-table tbody tr:hover { background: var(--wt-surface-hover); }
 .wt-table tbody td {
   height: 72px;
+  text-align: left;
   border-bottom: 1px solid var(--wt-border-soft);
   padding: .7rem .75rem;
   vertical-align: middle;
@@ -293,6 +295,19 @@ button, input, select { font: inherit; }
 .wt-table tbody tr:last-child td { border-bottom: 0; }
 .wt-table tbody td:first-child { padding-left: 1rem; }
 .wt-table tbody td:last-child { padding-right: 1rem; }
+
+.wt-table thead th.text-right,
+.wt-table tbody td.text-right { text-align: right; }
+.wt-table.wt-table-compact { table-layout: auto; }
+.wt-table.wt-table-compact thead th { height: 38px; padding: .55rem .65rem; }
+.wt-table.wt-table-compact tbody td { height: auto; min-height: 0; padding: .55rem .65rem; vertical-align: middle; overflow: visible; }
+.wt-table.wt-table-image-inventory { min-width: 760px; }
+.wt-table.wt-table-volume-inventory { min-width: 980px; }
+.wt-table.wt-table-network-inventory { min-width: 860px; }
+.wt-table.wt-table-history-modal { min-width: 980px; }
+.wt-table.wt-table-rollback { min-width: 1180px; table-layout: auto; }
+.wt-table.wt-table-history { min-width: 1160px; table-layout: auto; }
+.wt-table.wt-table-jobs { min-width: 850px; table-layout: auto; }
 
 .wt-primary-line,
 .wt-stack-line { display: flex; min-width: 0; align-items: center; gap: .45rem; }
@@ -467,7 +482,7 @@ button, input, select { font: inherit; }
 }
 @keyframes wt-progress-sheen { to { transform: translateX(100%); } }
 
-/* V0.5.2 Container Backups table ----------------------------------------- */
+/* V0.8.2.1 Container Configs table ----------------------------------------- */
 .wt-backup-table {
   min-width: 1320px;
   table-layout: auto;
@@ -488,7 +503,7 @@ button, input, select { font: inherit; }
 .wt-backup-snapshots-cell { padding-top: .55rem !important; padding-bottom: .55rem !important; }
 .wt-backup-slot {
   display: grid;
-  grid-template-columns: 66px minmax(0,1fr) auto;
+  grid-template-columns: 82px minmax(0,1fr) auto;
   align-items: center;
   gap: .5rem;
   border: 1px solid var(--wt-border-soft);

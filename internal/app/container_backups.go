@@ -69,12 +69,17 @@ type inspectContainer struct {
 		Hostname    string            `json:"Hostname"`
 		Domainname  string            `json:"Domainname"`
 		User        string            `json:"User"`
+		Tty         bool              `json:"Tty"`
+		OpenStdin   bool              `json:"OpenStdin"`
+		StdinOnce   bool              `json:"StdinOnce"`
 		Env         []string          `json:"Env"`
 		Cmd         []string          `json:"Cmd"`
 		Entrypoint  []string          `json:"Entrypoint"`
 		Image       string            `json:"Image"`
 		Labels      map[string]string `json:"Labels"`
 		WorkingDir  string            `json:"WorkingDir"`
+		StopSignal  string            `json:"StopSignal"`
+		StopTimeout *int              `json:"StopTimeout"`
 		Healthcheck *struct {
 			Test        []string `json:"Test"`
 			Interval    int64    `json:"Interval"`
@@ -92,18 +97,59 @@ type inspectContainer struct {
 			HostIP   string `json:"HostIp"`
 			HostPort string `json:"HostPort"`
 		} `json:"PortBindings"`
-		Privileged     bool              `json:"Privileged"`
-		ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
-		NetworkMode    string            `json:"NetworkMode"`
-		CapAdd         []string          `json:"CapAdd"`
-		CapDrop        []string          `json:"CapDrop"`
-		DNS            []string          `json:"Dns"`
-		DNSSearch      []string          `json:"DnsSearch"`
-		ExtraHosts     []string          `json:"ExtraHosts"`
-		SecurityOpt    []string          `json:"SecurityOpt"`
-		Tmpfs          map[string]string `json:"Tmpfs"`
-		ShmSize        int64             `json:"ShmSize"`
-		Devices        []struct {
+		PublishAllPorts   bool              `json:"PublishAllPorts"`
+		Privileged        bool              `json:"Privileged"`
+		ReadonlyRootfs    bool              `json:"ReadonlyRootfs"`
+		AutoRemove        bool              `json:"AutoRemove"`
+		Init              *bool             `json:"Init"`
+		NetworkMode       string            `json:"NetworkMode"`
+		IpcMode           string            `json:"IpcMode"`
+		PidMode           string            `json:"PidMode"`
+		UTSMode           string            `json:"UTSMode"`
+		CgroupnsMode      string            `json:"CgroupnsMode"`
+		UsernsMode        string            `json:"UsernsMode"`
+		Runtime           string            `json:"Runtime"`
+		Memory            int64             `json:"Memory"`
+		MemoryReservation int64             `json:"MemoryReservation"`
+		MemorySwap        int64             `json:"MemorySwap"`
+		NanoCpus          int64             `json:"NanoCpus"`
+		CpuShares         int64             `json:"CpuShares"`
+		CpusetCpus        string            `json:"CpusetCpus"`
+		CpusetMems        string            `json:"CpusetMems"`
+		PidsLimit         *int64            `json:"PidsLimit"`
+		OomKillDisable    *bool             `json:"OomKillDisable"`
+		OomScoreAdj       int               `json:"OomScoreAdj"`
+		CapAdd            []string          `json:"CapAdd"`
+		CapDrop           []string          `json:"CapDrop"`
+		GroupAdd          []string          `json:"GroupAdd"`
+		Links             []string          `json:"Links"`
+		VolumesFrom       []string          `json:"VolumesFrom"`
+		DNS               []string          `json:"Dns"`
+		DNSSearch         []string          `json:"DnsSearch"`
+		DNSOptions        []string          `json:"DnsOptions"`
+		ExtraHosts        []string          `json:"ExtraHosts"`
+		SecurityOpt       []string          `json:"SecurityOpt"`
+		CgroupParent      string            `json:"CgroupParent"`
+		Sysctls           map[string]string `json:"Sysctls"`
+		Tmpfs             map[string]string `json:"Tmpfs"`
+		ShmSize           int64             `json:"ShmSize"`
+		LogConfig         struct {
+			Type   string            `json:"Type"`
+			Config map[string]string `json:"Config"`
+		} `json:"LogConfig"`
+		Ulimits []struct {
+			Name string `json:"Name"`
+			Hard int64  `json:"Hard"`
+			Soft int64  `json:"Soft"`
+		} `json:"Ulimits"`
+		DeviceRequests []struct {
+			Driver       string            `json:"Driver"`
+			Count        int64             `json:"Count"`
+			DeviceIDs    []string          `json:"DeviceIDs"`
+			Capabilities [][]string        `json:"Capabilities"`
+			Options      map[string]string `json:"Options"`
+		} `json:"DeviceRequests"`
+		Devices []struct {
 			PathOnHost        string `json:"PathOnHost"`
 			PathInContainer   string `json:"PathInContainer"`
 			CgroupPermissions string `json:"CgroupPermissions"`
@@ -122,6 +168,15 @@ type inspectContainer struct {
 		Networks map[string]json.RawMessage `json:"Networks"`
 	} `json:"NetworkSettings"`
 	Image string `json:"Image"`
+	State struct {
+		Status     string `json:"Status"`
+		Running    bool   `json:"Running"`
+		Restarting bool   `json:"Restarting"`
+		ExitCode   int    `json:"ExitCode"`
+		Health     *struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
+	} `json:"State"`
 }
 
 func (a *App) containerBackupRoot() string {
@@ -446,13 +501,16 @@ func (a *App) createContainerSnapshot(ctx context.Context, hostID int64, kind, k
 		}
 	}
 
-	compose := reconstructCompose(kind, key, selected, inspected)
+	compose, err := reconstructCompose(kind, key, cs, inspected)
+	if err != nil {
+		return ContainerBackupSnapshot{}, fmt.Errorf("reconstruct recovery compose: %w", err)
+	}
 	created := time.Now().UTC()
 	info := snapshotInfo{
-		SchemaVersion: 1, VibewatchVersion: a.Cfg.Version, CreatedAt: created.Format(time.RFC3339Nano), Reason: reason,
+		SchemaVersion: 2, VibewatchVersion: a.Cfg.Version, CreatedAt: created.Format(time.RFC3339Nano), Reason: reason,
 		HostID: hostID, HostName: h.Name, DockerEndpoint: h.Endpoint, UnitKind: kind, UnitKey: key, UnitName: unitName,
 		StackType: stackType, Containers: names, Source: "docker-runtime", ReconstructedCompose: true, ContainsSecrets: true,
-		Note: "compose.yaml is reconstructed from the active Docker runtime. It is a recovery configuration, not necessarily the original Compose/Portainer source. Runtime environment values may contain secrets. Volume data is not included.",
+		Note: "compose.yaml is reconstructed from the active Docker runtime. It is a recovery configuration, not necessarily the original Compose/Portainer source. Runtime-only network namespace container IDs are normalized to stable Compose service/container references when possible, and Docker-generated hostnames are omitted. Runtime environment values may contain secrets. Volume data is not included.",
 	}
 	infoBytes, _ := json.MarshalIndent(info, "", "  ")
 	volumeBytes, _ := json.MarshalIndent(volumeMeta, "", "  ")
@@ -565,10 +623,29 @@ func (a *App) enforceSnapshotRetention(dir string) {
 	if len(files) <= retention {
 		return
 	}
-	for _, old := range files[:len(files)-retention] {
+	excess := len(files) - retention
+	for _, old := range files {
+		if excess <= 0 {
+			break
+		}
 		path := filepath.Join(dir, old)
-		if err := os.Remove(path); err == nil && a.Logger != nil {
-			a.Logger.Info("container recovery snapshot removed by retention", "file", path, "retention", retention)
+		info, _, infoErr := readSnapshotInfo(path)
+		snapshotID := strings.TrimSuffix(old, filepath.Ext(old))
+		if infoErr == nil && a.dependencySnapshotPinned(context.Background(), info.HostID, snapshotID) {
+			// Cross-stack dependency snapshots are transaction-owned by the parent
+			// restore point. They may temporarily push this unit above its nominal
+			// retention count, but removing them early would silently degrade an
+			// otherwise retained rollback transaction.
+			continue
+		}
+		if err := os.Remove(path); err == nil {
+			excess--
+			if infoErr == nil {
+				a.expireRestorePointsForSnapshot(context.Background(), info.HostID, snapshotID)
+			}
+			if a.Logger != nil {
+				a.Logger.Info("container recovery snapshot removed by retention", "file", path, "retention", retention)
+			}
 		}
 	}
 }
@@ -668,6 +745,18 @@ func (a *App) rollbackProtectedDockerObjects(hostID int64) (map[string]bool, map
 		}
 		return nil
 	})
+	if a.Store != nil {
+		if points, e := a.Store.RestorePoints(context.Background(), 2000, hostID, ""); e == nil {
+			for _, rp := range points {
+				if rp.Status == "expired" || rp.Status == "failed" {
+					continue
+				}
+				if id := strings.TrimSpace(rp.ImageID); id != "" {
+					images[id] = true
+				}
+			}
+		}
+	}
 	return images, networks, volumes
 }
 
@@ -679,7 +768,80 @@ func yamlDuration(ns int64) string {
 	return time.Duration(ns).String()
 }
 
-func reconstructCompose(kind, key string, containers []dockercli.Container, inspected []inspectContainer) string {
+func looksLikeDockerContainerID(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if len(ref) < 12 || len(ref) > 64 {
+		return false
+	}
+	for _, r := range ref {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isRuntimeGeneratedHostname(c inspectContainer) bool {
+	hostname := strings.TrimSpace(c.Config.Hostname)
+	id := strings.TrimSpace(c.ID)
+	if hostname == "" || id == "" || len(hostname) < 12 {
+		return false
+	}
+	return hostname == id || strings.HasPrefix(id, hostname)
+}
+
+func resolveRecoveryNetworkMode(rawMode string, current inspectContainer, currentMeta dockercli.Container, allContainers []dockercli.Container, includedServices map[string]bool) (string, error) {
+	mode := strings.TrimSpace(rawMode)
+	ref, isContainerMode := containerNamespaceRef(mode)
+	if !isContainerMode {
+		return mode, nil
+	}
+
+	ref = strings.TrimPrefix(strings.TrimSpace(ref), "/")
+	var target *dockercli.Container
+	for i := range allContainers {
+		candidate := &allContainers[i]
+		id := strings.TrimSpace(candidate.ID)
+		name := strings.TrimPrefix(strings.TrimSpace(candidate.Name), "/")
+		if ref == name || ref == id || (len(ref) >= 12 && id != "" && strings.HasPrefix(id, ref)) {
+			target = candidate
+			break
+		}
+	}
+
+	if target == nil {
+		// A name is already a stable Docker reference and can be preserved even
+		// when the target is outside the snapshot. A runtime container ID is not
+		// stable enough for a recovery artifact and must never be baked in.
+		if !looksLikeDockerContainerID(ref) && ref != "" {
+			return "container:" + ref, nil
+		}
+		return "", fmt.Errorf("container %s shares a network namespace with runtime container %q, but the parent could not be resolved to a stable name/service", strings.TrimPrefix(current.Name, "/"), ref)
+	}
+
+	targetName := strings.TrimPrefix(strings.TrimSpace(target.Name), "/")
+	if targetName == "" {
+		return "", fmt.Errorf("container %s network namespace parent %q has no stable container name", strings.TrimPrefix(current.Name, "/"), ref)
+	}
+
+	// Compose network_mode: service:<service> is the preferred durable form,
+	// but only when source and target belong to the same Compose project and
+	// the target service is actually present in this reconstructed snapshot.
+	sourceProject := strings.TrimSpace(current.Config.Labels["com.docker.compose.project"])
+	if sourceProject == "" && currentMeta.StackType == "compose" {
+		sourceProject = strings.TrimSpace(currentMeta.StackName)
+	}
+	if sourceProject != "" && target.StackType == "compose" && strings.TrimSpace(target.StackName) == sourceProject {
+		targetService := strings.TrimSpace(target.StackService)
+		if targetService != "" && includedServices[targetService] {
+			return "service:" + targetService, nil
+		}
+	}
+
+	return "container:" + targetName, nil
+}
+
+func reconstructCompose(kind, key string, containers []dockercli.Container, inspected []inspectContainer) (string, error) {
 	metaByName := map[string]dockercli.Container{}
 	for _, c := range containers {
 		metaByName[c.Name] = c
@@ -707,6 +869,10 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 		services = append(services, serviceEntry{name: serviceName, ctr: ctr, meta: meta})
 	}
 	sort.Slice(services, func(i, j int) bool { return services[i].name < services[j].name })
+	includedServices := make(map[string]bool, len(services))
+	for _, service := range services {
+		includedServices[service.name] = true
+	}
 	namedVolumes := map[string]bool{}
 	networks := map[string]bool{}
 	var b strings.Builder
@@ -721,6 +887,12 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 	b.WriteString("services:\n")
 	for _, s := range services {
 		c := s.ctr
+		rawNetMode := strings.TrimSpace(c.HostConfig.NetworkMode)
+		containerNetworkMode := strings.HasPrefix(rawNetMode, "container:")
+		recoveryNetMode, netModeErr := resolveRecoveryNetworkMode(rawNetMode, c, s.meta, containers, includedServices)
+		if netModeErr != nil {
+			return "", netModeErr
+		}
 		b.WriteString("  ")
 		b.WriteString(yamlQuote(s.name))
 		b.WriteString(":\n")
@@ -738,12 +910,12 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 			b.WriteString(yamlQuote(strings.TrimPrefix(c.Name, "/")))
 			b.WriteString("\n")
 		}
-		if c.Config.Hostname != "" {
+		if c.Config.Hostname != "" && !containerNetworkMode && !isRuntimeGeneratedHostname(c) {
 			b.WriteString("    hostname: ")
 			b.WriteString(yamlQuote(c.Config.Hostname))
 			b.WriteString("\n")
 		}
-		if c.Config.Domainname != "" {
+		if c.Config.Domainname != "" && !containerNetworkMode {
 			b.WriteString("    domainname: ")
 			b.WriteString(yamlQuote(c.Config.Domainname))
 			b.WriteString("\n")
@@ -797,7 +969,7 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 				b.WriteString("\n")
 			}
 		}
-		if len(c.HostConfig.PortBindings) > 0 {
+		if len(c.HostConfig.PortBindings) > 0 && !containerNetworkMode {
 			keys := make([]string, 0, len(c.HostConfig.PortBindings))
 			for k := range c.HostConfig.PortBindings {
 				keys = append(keys, k)
@@ -890,10 +1062,9 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 				b.WriteString("\n")
 			}
 		}
-		netMode := strings.TrimSpace(c.HostConfig.NetworkMode)
-		if netMode == "host" || netMode == "none" || strings.HasPrefix(netMode, "container:") {
+		if recoveryNetMode == "host" || recoveryNetMode == "none" || strings.HasPrefix(recoveryNetMode, "container:") || strings.HasPrefix(recoveryNetMode, "service:") {
 			b.WriteString("    network_mode: ")
-			b.WriteString(yamlQuote(netMode))
+			b.WriteString(yamlQuote(recoveryNetMode))
 			b.WriteString("\n")
 		} else if len(c.NetworkSettings.Networks) > 0 {
 			ns := make([]string, 0, len(c.NetworkSettings.Networks))
@@ -945,7 +1116,7 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 				b.WriteString("\n")
 			}
 		}
-		if len(c.HostConfig.DNS) > 0 {
+		if len(c.HostConfig.DNS) > 0 && !containerNetworkMode {
 			b.WriteString("    dns:\n")
 			for _, v := range c.HostConfig.DNS {
 				b.WriteString("      - ")
@@ -953,7 +1124,7 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 				b.WriteString("\n")
 			}
 		}
-		if len(c.HostConfig.DNSSearch) > 0 {
+		if len(c.HostConfig.DNSSearch) > 0 && !containerNetworkMode {
 			b.WriteString("    dns_search:\n")
 			for _, v := range c.HostConfig.DNSSearch {
 				b.WriteString("      - ")
@@ -961,7 +1132,7 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 				b.WriteString("\n")
 			}
 		}
-		if len(c.HostConfig.ExtraHosts) > 0 {
+		if len(c.HostConfig.ExtraHosts) > 0 && !containerNetworkMode {
 			b.WriteString("    extra_hosts:\n")
 			for _, v := range c.HostConfig.ExtraHosts {
 				b.WriteString("      - ")
@@ -1053,7 +1224,7 @@ func reconstructCompose(kind, key string, containers []dockercli.Container, insp
 			b.WriteString("\n")
 		}
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func (a *App) handleContainerBackups(w http.ResponseWriter, r *http.Request) {

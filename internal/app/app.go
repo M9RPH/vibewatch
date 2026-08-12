@@ -71,12 +71,13 @@ type updateRequest struct {
 
 type ContainerView struct {
 	dockercli.Container
-	SystemManaged bool            `json:"system_managed"`
-	SystemRole    string          `json:"system_role,omitempty"`
-	Policy        db.Policy       `json:"policy"`
-	Cache         db.Cache        `json:"update"`
-	Version       db.VersionInfo  `json:"version"`
-	ConfigDrift   ConfigDriftView `json:"config_drift"`
+	SystemManaged bool             `json:"system_managed"`
+	SystemRole    string           `json:"system_role,omitempty"`
+	Policy        db.Policy        `json:"policy"`
+	Cache         db.Cache         `json:"update"`
+	Version       db.VersionInfo   `json:"version"`
+	ConfigDrift   ConfigDriftView  `json:"config_drift"`
+	RestorePoint  *db.RestorePoint `json:"restore_point,omitempty"`
 }
 
 type hostInput struct {
@@ -321,6 +322,7 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("POST /api/container-backups/snapshot", a.handleContainerBackupSnapshot)
 	protected.HandleFunc("GET /api/container-backups/download", a.handleContainerBackupDownload)
 	protected.HandleFunc("GET /api/update-history", a.handleUpdateHistory)
+	protected.HandleFunc("GET /api/restore-points", a.handleRestorePoints)
 	protected.HandleFunc("POST /api/rollback", a.handleRollback)
 	protected.HandleFunc("GET /api/system/registry-credentials", a.handleRegistryCredentials)
 	protected.HandleFunc("POST /api/system/registry-credentials", a.handleRegistryCredentials)
@@ -1163,6 +1165,7 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 		writeErr(w, 502, err.Error())
 		return
 	}
+	latestRestorePoints, _ := a.Store.LatestRestorePointsForHost(r.Context(), hostID)
 	views := make([]ContainerView, 0, len(cs))
 	for _, c := range cs {
 		p, _ := a.Store.Policy(r.Context(), hostID, c.Name)
@@ -1211,7 +1214,12 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 				a.refreshContainerDrift(ctx, hostID, cc)
 			}(c)
 		}
-		views = append(views, ContainerView{Container: c, SystemManaged: managed, SystemRole: role, Policy: p, Cache: cache, Version: v, ConfigDrift: drift})
+		var restorePoint *db.RestorePoint
+		if rp, ok := latestRestorePoints[c.Name]; ok {
+			copy := rp
+			restorePoint = &copy
+		}
+		views = append(views, ContainerView{Container: c, SystemManaged: managed, SystemRole: role, Policy: p, Cache: cache, Version: v, ConfigDrift: drift, RestorePoint: restorePoint})
 	}
 	writeJSON(w, 200, views)
 }
@@ -1486,24 +1494,92 @@ func (a *App) updateWorker() {
 	}
 }
 func (a *App) executeUpdate(req updateRequest) {
-	a.workerOpMu.RLock()
-	defer a.workerOpMu.RUnlock()
 	ctx := a.ctx
 	_ = a.Store.StartJob(ctx, req.JobID)
 	a.jobProgress(ctx, req.JobID, 10, "Starting update")
 	started := time.Now()
 	beforeContainer, beforeVersion := a.currentContainerState(ctx, req.HostID, req.Container)
+	beforeCache, _ := a.Store.Cache(ctx, req.HostID, req.Container)
 	historySnapshotID := ""
-	defer func() { a.recordUpdateHistory(req, beforeContainer, beforeVersion, historySnapshotID, started) }()
+	restorePointID := int64(0)
+	attemptedDigest := strings.TrimSpace(beforeCache.LatestDigest)
+	dependencyCount := 0
+	dependencyStatus := "none"
+	dependencyDetails := ""
+	var dependencyCtx []networkNamespaceDependencyRuntime
+	var targetBeforeInspect inspectContainer
+	defer func() {
+		a.recordUpdateHistory(req, beforeContainer, beforeVersion, historySnapshotID, restorePointID, attemptedDigest, started, dependencyCount, dependencyStatus, dependencyDetails)
+	}()
 	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "app", "update started")
-	a.jobProgress(ctx, req.JobID, 20, "Preparing update worker")
+
 	h, err := a.Store.Host(ctx, req.HostID)
 	if err != nil {
 		a.failJob(req.JobID, err)
 		a.notifyManualUpdateResult(req, "failed", err)
 		return
 	}
-	a.jobProgress(ctx, req.JobID, 25, "Creating recovery snapshot")
+	notifyAutomatic := func(status string, resultErr error) {
+		if !strings.HasPrefix(req.Trigger, "automation:") {
+			return
+		}
+		title := "Automatic update completed · " + req.Container
+		msg := h.Name + " · " + req.Container + " was updated successfully."
+		if status != "success" {
+			title = "Automatic update failed · " + req.Container
+			msg = h.Name + " · " + req.Container + " update failed."
+			if resultErr != nil && strings.TrimSpace(resultErr.Error()) != "" {
+				msg += " " + resultErr.Error()
+			}
+		}
+		go a.notifyHostUsers(req.HostID, "auto", req.Container, title, msg, "")
+	}
+
+	a.jobProgress(ctx, req.JobID, 14, "Resolving container dependencies")
+	targetBeforeInspect, dependencyCtx, err = a.discoverNetworkNamespaceDependents(ctx, req.HostID, req.Container)
+	if err != nil {
+		err = fmt.Errorf("network namespace dependency scan failed: %w", err)
+		a.failJob(req.JobID, err)
+		_ = a.Store.Audit(ctx, "system", "update.blocked-dependency-scan", req.HostID, req.Container, err.Error())
+		notifyAutomatic("failed", err)
+		a.notifyManualUpdateResult(req, "failed", err)
+		return
+	}
+	dependencyCount = len(dependencyCtx)
+	if dependencyCount > 0 {
+		dependencyStatus = "detected"
+		dependencyDetails = dependencyNames(dependencyCtx)
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "dependency", fmt.Sprintf("Detected %d network namespace dependent(s): %s", dependencyCount, dependencyDetails))
+		for _, dep := range dependencyCtx {
+			detail := fmt.Sprintf("type=%s parent=%s dependent=%s parent_id=%s dependent_id=%s was_running=%t", networkNamespaceDependencyType, req.Container, dep.SourceContainer, targetBeforeInspect.ID, dep.SourceContainerID, dep.WasRunning)
+			_ = a.Store.Audit(ctx, "system", "dependency.detected", req.HostID, dep.SourceContainer, detail)
+		}
+	}
+	finishFailed := func(raw []byte, failure error, allowAutoRollback bool, rp db.RestorePoint) {
+		if dependencyCount > 0 && (dependencyStatus == "detected" || dependencyStatus == "prepared") {
+			dependencyStatus = "not_run"
+		}
+		finalErr := failure
+		if allowAutoRollback && rp.ID > 0 {
+			attempted, rollbackErr := a.runAutomaticRollback(req, rp, failure)
+			if attempted {
+				if rollbackErr == nil {
+					finalErr = fmt.Errorf("%v; automatic rollback completed from restore point #%d", failure, rp.ID)
+					_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "rollback", fmt.Sprintf("Automatic rollback completed from restore point #%d", rp.ID))
+				} else {
+					finalErr = fmt.Errorf("%v; automatic rollback failed: %v", failure, rollbackErr)
+					_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "rollback", "Automatic rollback failed: "+rollbackErr.Error())
+				}
+			}
+		}
+		a.jobProgress(ctx, req.JobID, 100, "Update failed")
+		_ = a.Store.FinishJob(ctx, req.JobID, "failed", string(raw), finalErr.Error())
+		_ = a.Store.Audit(ctx, "system", "update.failed", req.HostID, req.Container, finalErr.Error())
+		notifyAutomatic("failed", finalErr)
+		a.notifyManualUpdateResult(req, "failed", finalErr)
+	}
+
+	a.jobProgress(ctx, req.JobID, 20, "Creating recovery snapshot")
 	snapshotReason := "before-update"
 	if req.Trigger == "manual" {
 		snapshotReason = "before-manual-update"
@@ -1520,75 +1596,126 @@ func (a *App) executeUpdate(req updateRequest) {
 		_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
 		_ = a.Store.Audit(ctx, "system", "update.blocked-backup", req.HostID, req.Container, err.Error())
 		a.Logger.Error("pre-update container recovery snapshot failed; update blocked", "host_id", req.HostID, "container", req.Container, "job_id", req.JobID, "error", snapshotErr)
-		if strings.HasPrefix(req.Trigger, "automation:") {
-			go a.notifyHostUsers(req.HostID, "auto", req.Container, "Automatic update blocked · "+req.Container, h.Name+" · recovery snapshot failed, so the update was not started: "+snapshotErr.Error(), "")
-		}
+		notifyAutomatic("failed", err)
 		a.notifyManualUpdateResult(req, "failed", err)
 		return
 	}
 	historySnapshotID = snap.ID
 	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "backup", "Recovery snapshot created: "+snap.Filename)
-	base, err := a.ensureWorker(ctx, h)
-	if err != nil {
-		a.failJob(req.JobID, err)
+	if dependencyCount > 0 {
+		a.jobProgress(ctx, req.JobID, 27, "Protecting dependent container configurations")
+		dependencyCtx, err = a.attachDependencySnapshots(ctx, req.HostID, snap, dependencyCtx)
+		if err != nil {
+			dependencyStatus = "snapshot_failed"
+			err = fmt.Errorf("pre-update dependency recovery snapshot failed: %w", err)
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "dependency", err.Error()+"; update blocked")
+			a.jobProgress(ctx, req.JobID, 100, "Update blocked: dependency backup failed")
+			_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
+			_ = a.Store.Audit(ctx, "system", "update.blocked-dependency-backup", req.HostID, req.Container, err.Error())
+			notifyAutomatic("failed", err)
+			a.notifyManualUpdateResult(req, "failed", err)
+			return
+		}
+		dependencyStatus = "prepared"
+	}
+
+	a.jobProgress(ctx, req.JobID, 31, "Capturing full container restore point")
+	restoreCtx, restoreCancel := context.WithTimeout(ctx, 10*time.Minute)
+	rp, restoreErr := a.createRestorePointForSnapshot(restoreCtx, req.HostID, req.Container, snap, snapshotReason, req.Trigger, dependencyCtx)
+	restoreCancel()
+	restorePointID = rp.ID
+	if restoreErr != nil {
+		err := fmt.Errorf("pre-update full restore point failed: %w", restoreErr)
+		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "rollback", err.Error()+"; update blocked")
+		a.jobProgress(ctx, req.JobID, 100, "Update blocked: restore point failed")
+		_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
+		_ = a.Store.Audit(ctx, "system", "update.blocked-restore-point", req.HostID, req.Container, err.Error())
+		notifyAutomatic("failed", err)
 		a.notifyManualUpdateResult(req, "failed", err)
 		return
 	}
-	a.jobProgress(ctx, req.JobID, 38, "Update engine working")
+	if rp.Status == "config_only" {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "rollback", "Docker Swarm target: configuration recovery snapshot retained, but writable-layer one-click rollback is not supported")
+	} else {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "rollback", fmt.Sprintf("Full restore point #%d ready · writable layer captured as %s", rp.ID, rp.ImageRef))
+	}
+
+	a.jobProgress(ctx, req.JobID, 40, "Preparing update worker")
+	// Only the actual Watchtower operation needs to hold the worker-operation
+	// read lock. Keeping it across snapshot/verification/rollback would force
+	// nested read-lock acquisition during post-update checks and could deadlock
+	// when worker maintenance is waiting for the write lock.
+	a.workerOpMu.RLock()
+	base, err := a.ensureWorker(ctx, h)
+	if err != nil {
+		a.workerOpMu.RUnlock()
+		finishFailed(nil, err, false, rp)
+		return
+	}
+	a.jobProgress(ctx, req.JobID, 50, "Update engine working")
 	res, raw, err := a.WT.Update(ctx, base, h.WorkerToken, req.Container)
 	if logs, e := a.Docker.WorkerLogs(ctx, req.HostID, started); e == nil && logs != "" {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "DEBUG", "watchtower", logs)
 	}
+	a.workerOpMu.RUnlock()
 	if err != nil {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "watchtower", err.Error())
-		a.jobProgress(ctx, req.JobID, 100, "Update failed")
-		_ = a.Store.FinishJob(ctx, req.JobID, "failed", string(raw), err.Error())
-		_ = a.Store.Audit(ctx, "system", "update.failed", req.HostID, req.Container, err.Error())
-		if strings.HasPrefix(req.Trigger, "automation:") {
-			if hname, e := a.Store.Host(ctx, req.HostID); e == nil {
-				go a.notifyHostUsers(req.HostID, "auto", req.Container, "Automatic update failed · "+req.Container, hname.Name+" · "+req.Container+" update failed: "+err.Error(), "")
-			}
-		}
-		a.notifyManualUpdateResult(req, "failed", err)
+		finishFailed(raw, err, true, rp)
 		return
 	}
-	a.jobProgress(ctx, req.JobID, 80, "Update engine completed")
+
+	a.jobProgress(ctx, req.JobID, 78, "Update engine completed")
 	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "app", fmt.Sprintf("update completed: updated=%d failed=%d skipped=%d", res.Summary.Updated, res.Summary.Failed, res.Summary.Skipped))
-	status := "success"
 	if res.Summary.Failed > 0 {
-		status = "failed"
+		failure := errors.New(strings.TrimSpace(res.Error))
+		if strings.TrimSpace(res.Error) == "" {
+			failure = fmt.Errorf("update engine reported %d failed container operation(s)", res.Summary.Failed)
+		}
+		finishFailed(raw, failure, true, rp)
+		return
 	}
-	_ = a.Store.Audit(ctx, "system", "update."+status, req.HostID, req.Container, string(raw))
-	if strings.HasPrefix(req.Trigger, "automation:") {
-		if hname, e := a.Store.Host(ctx, req.HostID); e == nil {
-			title := "Automatic update completed · " + req.Container
-			msg := hname.Name + " · " + req.Container + " was updated successfully."
-			if status != "success" {
-				title = "Automatic update failed · " + req.Container
-				msg = hname.Name + " · " + req.Container + " update failed."
+
+	a.jobProgress(ctx, req.JobID, 86, "Verifying updated container")
+	if verifyErr := a.verifyUpdatedContainer(ctx, req.HostID, req.Container); verifyErr != nil {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "verify", verifyErr.Error())
+		finishFailed(raw, fmt.Errorf("post-update verification failed: %w", verifyErr), true, rp)
+		return
+	}
+
+	if dependencyCount > 0 {
+		parentAfter, inspectErr := a.inspectOne(ctx, req.HostID, req.Container)
+		if inspectErr != nil {
+			dependencyStatus = "failed"
+			finishFailed(raw, fmt.Errorf("post-update parent inspect for dependency recreation failed: %w", inspectErr), true, rp)
+			return
+		}
+		if strings.TrimSpace(parentAfter.ID) != "" && strings.TrimSpace(parentAfter.ID) != strings.TrimSpace(targetBeforeInspect.ID) {
+			dependencyStatus = "recreating"
+			if depErr := a.recreateNetworkNamespaceDependents(ctx, req.JobID, req.HostID, req.Container, parentAfter.ID, dependencyCtx); depErr != nil {
+				dependencyStatus = "failed"
+				finishFailed(raw, depErr, true, rp)
+				return
 			}
-			go a.notifyHostUsers(req.HostID, "auto", req.Container, title, msg, "")
+			dependencyStatus = "success"
+		} else {
+			dependencyStatus = "not_required"
+			_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "dependency", "Parent container ID did not change; dependent recreation was not required")
 		}
 	}
-	var manualErr error
-	if status != "success" && strings.TrimSpace(res.Error) != "" {
-		manualErr = errors.New(res.Error)
+
+	a.jobProgress(ctx, req.JobID, 95, "Refreshing update state")
+	_, _, _ = a.check(ctx, req.HostID, req.Container, "post-update")
+	if err := a.captureCurrentConfigDriftBaseline(ctx, req.HostID, req.Container, "post-update"); err != nil {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "config-drift", "Could not refresh post-update drift baseline: "+err.Error())
+		a.Logger.Warn("post-update config drift baseline refresh failed", "host_id", req.HostID, "container", req.Container, "error", err)
 	}
-	if status != "success" || res.Summary.Updated > 0 {
-		a.notifyManualUpdateResult(req, status, manualErr)
+	a.jobProgress(ctx, req.JobID, 100, "Update completed")
+	_ = a.Store.FinishJob(ctx, req.JobID, "success", string(raw), "")
+	_ = a.Store.Audit(ctx, "system", "update.success", req.HostID, req.Container, string(raw))
+	notifyAutomatic("success", nil)
+	if res.Summary.Updated > 0 {
+		a.notifyManualUpdateResult(req, "success", nil)
 	}
-	if status == "success" {
-		a.jobProgress(ctx, req.JobID, 90, "Verifying update state")
-		_, _, _ = a.check(ctx, req.HostID, req.Container, "post-update")
-		if err := a.captureCurrentConfigDriftBaseline(ctx, req.HostID, req.Container, "post-update"); err != nil {
-			_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "config-drift", "Could not refresh post-update drift baseline: "+err.Error())
-			a.Logger.Warn("post-update config drift baseline refresh failed", "host_id", req.HostID, "container", req.Container, "error", err)
-		}
-		a.jobProgress(ctx, req.JobID, 100, "Update completed")
-	} else {
-		a.jobProgress(ctx, req.JobID, 100, "Update failed")
-	}
-	_ = a.Store.FinishJob(ctx, req.JobID, status, string(raw), res.Error)
 }
 
 func (a *App) notifyManualUpdateResult(req updateRequest, status string, updateErr error) {
