@@ -1,7 +1,7 @@
 x-vibewatch-image: &vibewatch-image
   build:
     context: .
-  image: "${WTUI_APP_IMAGE:-vibewatch:0.8.0}"
+  image: "${WTUI_APP_IMAGE:-vibewatch:0.9.1}"
 
 services:
   # Compatibility bridge for upgrades from the pre-Vibewatch Docker runtime

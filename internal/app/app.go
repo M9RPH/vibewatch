@@ -53,31 +53,40 @@ type App struct {
 	Queue         chan updateRequest
 	ctx           context.Context
 	cancel        context.CancelFunc
-	mu            sync.Mutex
+	ensureMu      sync.Mutex
+	ensureLocks   map[int64]*sync.Mutex
 	workerOpMu    sync.RWMutex
 	maintenanceMu sync.Mutex
 	infoRefreshMu sync.Mutex
 	infoRefresh   map[string]bool
 	registryMu    sync.Mutex
 	registryKey   []byte
+	hostHealthMu  sync.Mutex
+	hostHealth    map[int64]hostHealthState
+	hostHealthRun map[int64]bool
+	chainMu       sync.Mutex
+	chainReserved map[string]int64
 }
 type updateRequest struct {
-	JobID     int64
-	HostID    int64
-	Container string
-	Trigger   string
-	Actor     string
+	JobID         int64
+	TransactionID int64
+	HostID        int64
+	Container     string
+	Trigger       string
+	Actor         string
 }
 
 type ContainerView struct {
 	dockercli.Container
-	SystemManaged bool             `json:"system_managed"`
-	SystemRole    string           `json:"system_role,omitempty"`
-	Policy        db.Policy        `json:"policy"`
-	Cache         db.Cache         `json:"update"`
-	Version       db.VersionInfo   `json:"version"`
-	ConfigDrift   ConfigDriftView  `json:"config_drift"`
-	RestorePoint  *db.RestorePoint `json:"restore_point,omitempty"`
+	SystemManaged   bool                 `json:"system_managed"`
+	SystemRole      string               `json:"system_role,omitempty"`
+	Policy          db.Policy            `json:"policy"`
+	Cache           db.Cache             `json:"update"`
+	Version         db.VersionInfo       `json:"version"`
+	ConfigDrift     ConfigDriftView      `json:"config_drift"`
+	Verification    db.VerificationState `json:"verification"`
+	RestorePoint    *db.RestorePoint     `json:"restore_point,omitempty"`
+	ChainManagement *ChainManagementView `json:"chain_management,omitempty"`
 }
 
 type hostInput struct {
@@ -87,10 +96,26 @@ type hostInput struct {
 }
 type HostView struct {
 	db.Host
-	Worker          dockercli.WorkerState `json:"worker"`
-	DockerReachable bool                  `json:"docker_reachable"`
-	DockerVersion   string                `json:"docker_version,omitempty"`
-	DockerError     string                `json:"docker_error,omitempty"`
+	Worker                  dockercli.WorkerState `json:"worker"`
+	DockerReachable         bool                  `json:"docker_reachable"`
+	DockerReachabilityKnown bool                  `json:"docker_reachability_known"`
+	DockerChecking          bool                  `json:"docker_checking"`
+	DockerVersion           string                `json:"docker_version,omitempty"`
+	DockerError             string                `json:"docker_error,omitempty"`
+	DockerLastAttempt       string                `json:"docker_last_attempt,omitempty"`
+	DockerLastSuccess       string                `json:"docker_last_success,omitempty"`
+	DockerProbeDurationMS   int64                 `json:"docker_probe_duration_ms,omitempty"`
+}
+
+type hostHealthState struct {
+	Known       bool
+	Reachable   bool
+	Checking    bool
+	Version     string
+	Error       string
+	LastAttempt string
+	LastSuccess string
+	DurationMS  int64
 }
 
 type policyInput struct {
@@ -173,19 +198,136 @@ type quickSetupInput struct {
 
 func New(cfg Config, store *db.Store, docker *dockercli.Client, wt *watchtower.Client, gh *releases.GitHubClient, reg *registry.Client, po *notify.Pushover, ssh *sshsetup.Client, logger *slog.Logger, authm *auth.Manager) *App {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}}
+	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}, ensureLocks: map[int64]*sync.Mutex{}, hostHealth: map[int64]hostHealthState{}, hostHealthRun: map[int64]bool{}, chainReserved: map[string]int64{}}
 }
+func remoteDockerEndpoint(endpoint string) bool {
+	v := strings.ToLower(strings.TrimSpace(endpoint))
+	return v != "" && !strings.HasPrefix(v, "unix://")
+}
+
+func dockerOperationTimeout(endpoint string, local, remote time.Duration) time.Duration {
+	if remoteDockerEndpoint(endpoint) {
+		return remote
+	}
+	return local
+}
+
+func (a *App) hostHealthView(hostID int64) hostHealthState {
+	a.hostHealthMu.Lock()
+	defer a.hostHealthMu.Unlock()
+	return a.hostHealth[hostID]
+}
+
+func (a *App) updateHostHealth(hostID int64, fn func(hostHealthState) hostHealthState) hostHealthState {
+	a.hostHealthMu.Lock()
+	defer a.hostHealthMu.Unlock()
+	v := fn(a.hostHealth[hostID])
+	a.hostHealth[hostID] = v
+	return v
+}
+
+func hostHealthStale(v hostHealthState, now time.Time) bool {
+	if !v.Known || strings.TrimSpace(v.LastAttempt) == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339Nano, v.LastAttempt)
+	if err != nil {
+		return true
+	}
+	// Reachable hosts are refreshed often enough to keep the UI honest without
+	// turning /api/hosts into a stream of synchronous Docker round trips. Failed
+	// hosts are retried sooner so a transient VPN hiccup recovers quickly.
+	maxAge := 30 * time.Second
+	if !v.Reachable {
+		maxAge = 12 * time.Second
+	}
+	return now.Sub(t) >= maxAge
+}
+
+func (a *App) probeHost(ctx context.Context, h db.Host) (hostHealthState, error) {
+	started := time.Now()
+	now := started.UTC().Format(time.RFC3339Nano)
+	a.updateHostHealth(h.ID, func(v hostHealthState) hostHealthState {
+		v.Checking = true
+		v.LastAttempt = now
+		return v
+	})
+	version, err := a.Docker.PingReliable(ctx, h.Endpoint)
+	duration := time.Since(started).Milliseconds()
+	state := a.updateHostHealth(h.ID, func(v hostHealthState) hostHealthState {
+		v.Known = true
+		v.Checking = false
+		v.LastAttempt = now
+		v.DurationMS = duration
+		if err != nil {
+			v.Reachable = false
+			v.Error = err.Error()
+			return v
+		}
+		v.Reachable = true
+		v.Version = version
+		v.Error = ""
+		v.LastSuccess = time.Now().UTC().Format(time.RFC3339Nano)
+		return v
+	})
+	return state, err
+}
+
+func (a *App) scheduleHostProbe(h db.Host, force bool) {
+	if !bool(h.Enabled) {
+		return
+	}
+	a.hostHealthMu.Lock()
+	state := a.hostHealth[h.ID]
+	if a.hostHealthRun[h.ID] || (!force && !hostHealthStale(state, time.Now())) {
+		a.hostHealthMu.Unlock()
+		return
+	}
+	a.hostHealthRun[h.ID] = true
+	a.hostHealthMu.Unlock()
+	go func() {
+		defer func() {
+			a.hostHealthMu.Lock()
+			delete(a.hostHealthRun, h.ID)
+			a.hostHealthMu.Unlock()
+		}()
+		t := dockerOperationTimeout(h.Endpoint, 6*time.Second, 22*time.Second)
+		ctx, cancel := context.WithTimeout(a.ctx, t)
+		defer cancel()
+		_, _ = a.probeHost(ctx, h)
+	}()
+}
+
+func (a *App) recoverInterruptedJobs() {
+	reason := "controller restarted or previous operation was interrupted"
+	count, err := a.Store.FailActiveJobsWithoutTransaction(a.ctx, reason)
+	if err != nil {
+		a.Logger.Warn("could not recover interrupted jobs", "error", err)
+	} else if count > 0 {
+		a.Logger.Warn("recovered interrupted jobs", "count", count)
+	}
+	chainCount, chainErr := a.Store.FailActiveUpdateChainRuns(a.ctx, reason)
+	if chainErr != nil {
+		a.Logger.Warn("could not recover interrupted update chains", "error", chainErr)
+	} else if chainCount > 0 {
+		a.Logger.Warn("recovered interrupted update chains", "count", chainCount)
+	}
+}
+
 func (a *App) Start() {
+	a.recoverInterruptedJobs()
 	if err := a.reloadRegistryCredentials(a.ctx); err != nil && a.Logger != nil {
 		a.Logger.Warn("registry credentials could not be loaded", "error", err)
 	}
 	go a.updateWorker()
+	go a.recoverInterruptedTransactions()
 	go a.automationLoop()
 	go a.workerSupervisorLoop()
 	go a.systemMaintenanceLoop()
 	hosts, _ := a.Store.Hosts(a.ctx)
 	for _, h := range hosts {
 		if h.Enabled {
+			a.scheduleHostProbe(h, true)
 			a.Events.Start(a.ctx, a.Docker, a.Store, h)
 			go a.startHostWorker(h, "startup")
 		}
@@ -216,7 +358,7 @@ func (a *App) startHostWorker(h db.Host, reason string) {
 	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Minute)
 	defer cancel()
 	a.Logger.Info("vibewatch worker launch requested", "host", h.Name, "host_id", h.ID, "reason", reason, "endpoint", h.Endpoint)
-	if _, err := a.Docker.Ping(ctx, h.Endpoint); err != nil {
+	if _, err := a.probeHost(ctx, h); err != nil {
 		a.Logger.Error("vibewatch worker launch skipped: target docker endpoint unavailable", "host", h.Name, "host_id", h.ID, "error", err)
 		return
 	}
@@ -291,6 +433,7 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("POST /api/hosts/quick-setup", a.handleHostQuickSetup)
 	protected.HandleFunc("/api/hosts/", a.handleHostSubroutes)
 	protected.HandleFunc("GET /api/jobs", a.handleJobs)
+	protected.HandleFunc("POST /api/jobs/{id}/cancel", a.handleJobCancel)
 	protected.HandleFunc("GET /api/jobs/", a.handleJobLogs)
 	protected.HandleFunc("GET /api/job-status/", a.handleJobStatus)
 	protected.HandleFunc("GET /api/automations", a.handleAutomations)
@@ -320,9 +463,18 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("GET /api/container-backups", a.handleContainerBackups)
 	protected.HandleFunc("GET /api/container-backups/download-all", a.handleContainerBackupDownloadAll)
 	protected.HandleFunc("POST /api/container-backups/snapshot", a.handleContainerBackupSnapshot)
+	protected.HandleFunc("DELETE /api/container-backups/archived", a.handleContainerBackupArchivedDelete)
 	protected.HandleFunc("GET /api/container-backups/download", a.handleContainerBackupDownload)
 	protected.HandleFunc("GET /api/update-history", a.handleUpdateHistory)
+	protected.HandleFunc("GET /api/update-chains", a.handleUpdateChains)
+	protected.HandleFunc("POST /api/update-chains", a.handleUpdateChains)
+	protected.HandleFunc("/api/update-chains/", a.handleUpdateChainSubroutes)
+	protected.HandleFunc("GET /api/update-chain-runs", a.handleUpdateChainRuns)
 	protected.HandleFunc("GET /api/restore-points", a.handleRestorePoints)
+	protected.HandleFunc("GET /api/update-transactions", a.handleUpdateTransactions)
+	protected.HandleFunc("GET /api/verification-history", a.handleVerificationHistory)
+	protected.HandleFunc("GET /api/recovery/status", a.handleRecoveryStatus)
+	protected.HandleFunc("POST /api/recovery/gc", a.handleRecoveryGC)
 	protected.HandleFunc("POST /api/rollback", a.handleRollback)
 	protected.HandleFunc("GET /api/system/registry-credentials", a.handleRegistryCredentials)
 	protected.HandleFunc("POST /api/system/registry-credentials", a.handleRegistryCredentials)
@@ -464,27 +616,24 @@ func (a *App) handleHosts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		views := make([]HostView, len(filtered))
-		var wg sync.WaitGroup
 		for i, h := range filtered {
-			i, h := i, h
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				view := HostView{Host: h, Worker: a.Docker.WorkerState(r.Context(), h.ID)}
-				if h.Enabled {
-					ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-					defer cancel()
-					if version, pingErr := a.Docker.Ping(ctx, h.Endpoint); pingErr != nil {
-						view.DockerError = pingErr.Error()
-					} else {
-						view.DockerReachable = true
-						view.DockerVersion = version
-					}
-				}
-				views[i] = view
-			}()
+			if bool(h.Enabled) {
+				a.scheduleHostProbe(h, false)
+			}
+			health := a.hostHealthView(h.ID)
+			views[i] = HostView{
+				Host:                    h,
+				Worker:                  a.Docker.WorkerState(r.Context(), h.ID),
+				DockerReachable:         health.Reachable,
+				DockerReachabilityKnown: health.Known,
+				DockerChecking:          health.Checking,
+				DockerVersion:           health.Version,
+				DockerError:             health.Error,
+				DockerLastAttempt:       health.LastAttempt,
+				DockerLastSuccess:       health.LastSuccess,
+				DockerProbeDurationMS:   health.DurationMS,
+			}
 		}
-		wg.Wait()
 		writeJSON(w, 200, views)
 		return
 	}
@@ -550,8 +699,8 @@ func (a *App) handleHostQuickSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 502, err.Error())
 		return
 	}
-	pingCtx, pingCancel := context.WithTimeout(r.Context(), 8*time.Second)
-	version, pingErr := a.Docker.Ping(pingCtx, res.Endpoint)
+	pingCtx, pingCancel := context.WithTimeout(r.Context(), 22*time.Second)
+	version, pingErr := a.Docker.PingReliable(pingCtx, res.Endpoint)
 	pingCancel()
 	if pingErr != nil {
 		a.Logger.Warn("SSH Docker quick setup configured endpoint but controller cannot reach it", "actor", a.actor(r), "endpoint", res.Endpoint, "error", pingErr)
@@ -650,12 +799,16 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "host not found")
 			return
 		}
-		v, e := a.Docker.Ping(r.Context(), h.Endpoint)
+		testTimeout := dockerOperationTimeout(h.Endpoint, 45*time.Second, 3*time.Minute)
+		testCtx, testCancel := context.WithTimeout(r.Context(), testTimeout)
+		defer testCancel()
+		health, e := a.probeHost(testCtx, h)
 		if e != nil {
 			writeErr(w, 502, e.Error())
 			return
 		}
-		base, workerErr := a.ensureWorker(r.Context(), h)
+		v := health.Version
+		base, workerErr := a.ensureWorker(testCtx, h)
 		if workerErr != nil {
 			writeJSON(w, 200, map[string]any{"ok": true, "docker_version": v, "worker_ready": false, "worker": a.Docker.WorkerState(r.Context(), h.ID), "worker_error": workerErr.Error()})
 			return
@@ -715,7 +868,12 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p, _ := a.Store.Policy(r.Context(), id, container)
-		if p.Mode == "ignore" {
+		if cm, managedByChain := a.stackChainForMember(r.Context(), id, container); managedByChain {
+			if cm.PolicyMode == "ignore" {
+				writeErr(w, 409, fmt.Sprintf("stack %s is Excluded by update chain %s", cm.ScopeKey, cm.ChainName))
+				return
+			}
+		} else if p.Mode == "ignore" {
 			writeErr(w, 409, "container is excluded; change its policy before checking it")
 			return
 		}
@@ -743,6 +901,14 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 202, map[string]any{"job_id": jobID, "status": "queued"})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "preflight" && r.Method == http.MethodPost {
+		a.handleUpdatePreflight(w, r, id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "verification" && (r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodDelete) {
+		a.handleVerification(w, r, id)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "snooze" && r.Method == http.MethodPut {
@@ -819,6 +985,13 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "mode must be manual, auto or ignore")
 			return
 		}
+		if cm, chainManaged := a.stackChainForMember(r.Context(), id, container); chainManaged {
+			current, _ := a.Store.Policy(r.Context(), id, container)
+			if in.Mode != current.Mode {
+				writeErr(w, 409, fmt.Sprintf("policy is managed by update chain %s for stack %s", cm.ChainName, cm.ScopeKey))
+				return
+			}
+		}
 		p := db.Policy{HostID: id, ContainerName: container, Mode: in.Mode, CheckIntervalMinutes: in.CheckIntervalMinutes, ReleaseRepo: in.ReleaseRepo}
 		if err := a.Store.SavePolicy(r.Context(), p); err != nil {
 			writeErr(w, 500, err.Error())
@@ -854,41 +1027,135 @@ func (a *App) handleHostOverview(w http.ResponseWriter, r *http.Request, hostID 
 		return
 	}
 	includeImages := r.URL.Query().Get("include_images") == "1" || strings.EqualFold(r.URL.Query().Get("include_images"), "true")
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), dockerOperationTimeout(h.Endpoint, 35*time.Second, 90*time.Second))
 	defer cancel()
-	overview, err := a.Docker.HostOverview(ctx, h.Endpoint, includeImages)
+	// Collect the image inventory once. The summary endpoint previously caused
+	// HostOverview to inventory images and then repeated that inventory solely
+	// to calculate rollback-protection counts.
+	overview, err := a.Docker.HostOverview(ctx, h.Endpoint, true)
 	if err != nil {
 		writeErr(w, 502, err.Error())
 		return
 	}
 	protectedImages, _, _ := a.rollbackProtectedDockerObjects(hostID)
-	if includeImages {
-		for i := range overview.Images {
-			if protectedImages[overview.Images[i].ID] {
-				overview.Images[i].RollbackProtected = true
-				if overview.Images[i].Unused {
-					overview.ImagesRollbackProtected++
-				}
-			}
-			if overview.Images[i].Unused && !overview.Images[i].RollbackProtected {
-				overview.ImagesCleanupEligible++
+	for i := range overview.Images {
+		if protectedImages[overview.Images[i].ID] {
+			overview.Images[i].RollbackProtected = true
+			if overview.Images[i].Unused {
+				overview.ImagesRollbackProtected++
 			}
 		}
-	} else {
-		// The summary can still expose how many currently local unused images are
-		// protected without returning the full inventory.
-		if xs, e := a.Docker.ImageInventory(ctx, h.Endpoint); e == nil {
-			for _, img := range xs {
-				if img.Unused && protectedImages[img.ID] {
-					overview.ImagesRollbackProtected++
-				}
-				if img.Unused && !protectedImages[img.ID] {
-					overview.ImagesCleanupEligible++
-				}
-			}
+		if overview.Images[i].Unused && !overview.Images[i].RollbackProtected {
+			overview.ImagesCleanupEligible++
 		}
 	}
+	if !includeImages {
+		overview.Images = nil
+	}
 	writeJSON(w, 200, overview)
+}
+
+func cleanupJobTimeout(endpoint string) time.Duration {
+	return dockerOperationTimeout(endpoint, 10*time.Minute, 30*time.Minute)
+}
+
+func (a *App) cleanupProgressCallback(jobID int64) dockercli.CleanupProgress {
+	return func(completed, total int, stage string) {
+		pct := 10
+		lower := strings.ToLower(strings.TrimSpace(stage))
+		switch {
+		case strings.HasPrefix(lower, "removing"):
+			pct = 20
+			if total > 0 {
+				pct += int(float64(completed) / float64(total) * 65)
+			}
+		case strings.HasPrefix(lower, "pruning"):
+			pct = 45
+		case strings.HasPrefix(lower, "refreshing"):
+			pct = 90
+		case strings.HasPrefix(lower, "measuring"), strings.HasPrefix(lower, "inventorying"):
+			pct = 12
+		}
+		a.jobProgress(context.Background(), jobID, pct, stage)
+	}
+}
+
+// respondCleanupJob keeps the cleanup API backward compatible. The dashboard
+// opts into async=1 and receives the job immediately. Older callers may still
+// wait for the historical {job_id,result} response; a disconnected HTTP client
+// no longer cancels the Docker cleanup itself.
+func (a *App) respondCleanupJob(w http.ResponseWriter, r *http.Request, jobID int64) {
+	if r.URL.Query().Get("async") == "1" || strings.EqualFold(r.URL.Query().Get("async"), "true") {
+		writeJSON(w, http.StatusAccepted, map[string]any{"job_id": jobID, "status": "queued"})
+		return
+	}
+	t := time.NewTicker(400 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			// The background cleanup keeps running even when the legacy waiting
+			// HTTP request has been closed by a browser or reverse proxy.
+			return
+		default:
+		}
+		job, err := a.Store.Job(r.Context(), jobID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		switch job.Status {
+		case "success":
+			var result any = map[string]any{}
+			if strings.TrimSpace(job.SummaryJSON) != "" {
+				_ = json.Unmarshal([]byte(job.SummaryJSON), &result)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"job_id": jobID, "result": result})
+			return
+		case "failed":
+			writeErr(w, http.StatusBadGateway, firstNonEmpty(job.Error, "cleanup failed"))
+			return
+		case "cancelled":
+			writeErr(w, http.StatusConflict, "cleanup cancelled")
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (a *App) runImageCleanup(jobID int64, h db.Host, actor string) {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupJobTimeout(h.Endpoint))
+	defer cancel()
+	if !a.beginAsyncJob(ctx, jobID) {
+		return
+	}
+	a.jobProgress(context.Background(), jobID, 5, "Acquiring host cleanup lease")
+	releaseLease, leaseErr := a.holdHostOperationLease(ctx, jobID, h.ID, "image-cleanup")
+	if leaseErr != nil {
+		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", leaseErr.Error())
+		return
+	}
+	defer releaseLease()
+	_ = a.Store.AddJobLog(context.Background(), jobID, "info", "docker", "Pruning images not referenced by any container")
+	protected, _, _ := a.rollbackProtectedDockerObjects(h.ID)
+	result, err := a.Docker.PruneUnusedImagesWithProgress(ctx, h.Endpoint, protected, a.cleanupProgressCallback(jobID))
+	if err != nil {
+		a.jobProgress(context.Background(), jobID, 100, "Image cleanup failed")
+		_ = a.Store.AddJobLog(context.Background(), jobID, "error", "docker", err.Error())
+		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", err.Error())
+		a.Logger.Error("unused image cleanup failed", "host", h.Name, "host_id", h.ID, "job_id", jobID, "error", err)
+		return
+	}
+	summary, _ := json.Marshal(result)
+	_ = a.Store.AddJobLog(context.Background(), jobID, "info", "docker", fmt.Sprintf("Removed %d unused images; %d rollback-protected; %d failed; reclaimed %d bytes", result.RemovedImages, result.ProtectedImages, result.FailedImages, result.ReclaimedBytes))
+	a.jobProgress(context.Background(), jobID, 100, "Image cleanup completed")
+	_ = a.Store.FinishJob(context.Background(), jobID, "success", string(summary), "")
+	_ = a.Store.Audit(context.Background(), actor, "images.prune", h.ID, "", string(summary))
+	a.Logger.Info("unused image cleanup completed", "host", h.Name, "host_id", h.ID, "job_id", jobID, "removed_images", result.RemovedImages, "reclaimed_bytes", result.ReclaimedBytes)
 }
 
 func (a *App) handleImagePrune(w http.ResponseWriter, r *http.Request, hostID int64) {
@@ -905,25 +1172,10 @@ func (a *App) handleImagePrune(w http.ResponseWriter, r *http.Request, hostID in
 		writeErr(w, 500, err.Error())
 		return
 	}
-	_ = a.Store.StartJob(r.Context(), jobID)
-	_ = a.Store.AddJobLog(r.Context(), jobID, "info", "docker", "Pruning images not referenced by any container")
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
-	protected, _, _ := a.rollbackProtectedDockerObjects(hostID)
-	result, err := a.Docker.PruneUnusedImages(ctx, h.Endpoint, protected)
-	if err != nil {
-		_ = a.Store.AddJobLog(context.Background(), jobID, "error", "docker", err.Error())
-		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", err.Error())
-		a.Logger.Error("unused image cleanup failed", "host", h.Name, "host_id", hostID, "job_id", jobID, "error", err)
-		writeErr(w, 502, err.Error())
-		return
-	}
-	summary, _ := json.Marshal(result)
-	_ = a.Store.AddJobLog(context.Background(), jobID, "info", "docker", fmt.Sprintf("Removed %d unused images; %d rollback-protected; %d failed; reclaimed %d bytes", result.RemovedImages, result.ProtectedImages, result.FailedImages, result.ReclaimedBytes))
-	_ = a.Store.FinishJob(context.Background(), jobID, "success", string(summary), "")
-	_ = a.Store.Audit(context.Background(), a.actor(r), "images.prune", hostID, "", string(summary))
-	a.Logger.Info("unused image cleanup completed", "host", h.Name, "host_id", hostID, "job_id", jobID, "removed_images", result.RemovedImages, "reclaimed_bytes", result.ReclaimedBytes)
-	writeJSON(w, 200, map[string]any{"job_id": jobID, "result": result})
+	a.jobProgress(context.Background(), jobID, 2, "Cleanup queued")
+	actor := a.actor(r)
+	go a.runImageCleanup(jobID, h, actor)
+	a.respondCleanupJob(w, r, jobID)
 }
 
 func (a *App) handleHostNetworks(w http.ResponseWriter, r *http.Request, hostID int64) {
@@ -935,7 +1187,7 @@ func (a *App) handleHostNetworks(w http.ResponseWriter, r *http.Request, hostID 
 		writeErr(w, 404, "host not found")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), dockerOperationTimeout(h.Endpoint, 45*time.Second, 90*time.Second))
 	defer cancel()
 	xs, err := a.Docker.NetworkInventory(ctx, h.Endpoint)
 	if err != nil {
@@ -952,6 +1204,32 @@ func (a *App) handleHostNetworks(w http.ResponseWriter, r *http.Request, hostID 
 	writeJSON(w, 200, xs)
 }
 
+func (a *App) runNetworkCleanup(jobID int64, h db.Host, actor string) {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupJobTimeout(h.Endpoint))
+	defer cancel()
+	if !a.beginAsyncJob(ctx, jobID) {
+		return
+	}
+	a.jobProgress(context.Background(), jobID, 5, "Acquiring host cleanup lease")
+	releaseLease, leaseErr := a.holdHostOperationLease(ctx, jobID, h.ID, "network-cleanup")
+	if leaseErr != nil {
+		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", leaseErr.Error())
+		return
+	}
+	defer releaseLease()
+	_, protected, _ := a.rollbackProtectedDockerObjects(h.ID)
+	result, err := a.Docker.PruneUnusedNetworksWithProgress(ctx, h.Endpoint, protected, a.cleanupProgressCallback(jobID))
+	if err != nil {
+		a.jobProgress(context.Background(), jobID, 100, "Network cleanup failed")
+		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", err.Error())
+		return
+	}
+	summary, _ := json.Marshal(result)
+	a.jobProgress(context.Background(), jobID, 100, "Network cleanup completed")
+	_ = a.Store.FinishJob(context.Background(), jobID, "success", string(summary), "")
+	_ = a.Store.Audit(context.Background(), actor, "networks.prune", h.ID, "", string(summary))
+}
+
 func (a *App) handleNetworkPrune(w http.ResponseWriter, r *http.Request, hostID int64) {
 	if !a.requireAdmin(w, r) {
 		return
@@ -966,20 +1244,35 @@ func (a *App) handleNetworkPrune(w http.ResponseWriter, r *http.Request, hostID 
 		writeErr(w, 500, err.Error())
 		return
 	}
-	_ = a.Store.StartJob(r.Context(), jobID)
-	_, protected, _ := a.rollbackProtectedDockerObjects(hostID)
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	a.jobProgress(context.Background(), jobID, 2, "Cleanup queued")
+	actor := a.actor(r)
+	go a.runNetworkCleanup(jobID, h, actor)
+	a.respondCleanupJob(w, r, jobID)
+}
+
+func (a *App) runBuildCacheCleanup(jobID int64, h db.Host, actor string) {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupJobTimeout(h.Endpoint))
 	defer cancel()
-	result, err := a.Docker.PruneUnusedNetworks(ctx, h.Endpoint, protected)
+	if !a.beginAsyncJob(ctx, jobID) {
+		return
+	}
+	a.jobProgress(context.Background(), jobID, 5, "Acquiring host cleanup lease")
+	releaseLease, leaseErr := a.holdHostOperationLease(ctx, jobID, h.ID, "build-cache-cleanup")
+	if leaseErr != nil {
+		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", leaseErr.Error())
+		return
+	}
+	defer releaseLease()
+	result, err := a.Docker.PruneBuildCacheWithProgress(ctx, h.Endpoint, a.cleanupProgressCallback(jobID))
 	if err != nil {
+		a.jobProgress(context.Background(), jobID, 100, "Build cache cleanup failed")
 		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", err.Error())
-		writeErr(w, 502, err.Error())
 		return
 	}
 	summary, _ := json.Marshal(result)
+	a.jobProgress(context.Background(), jobID, 100, "Build cache cleanup completed")
 	_ = a.Store.FinishJob(context.Background(), jobID, "success", string(summary), "")
-	_ = a.Store.Audit(context.Background(), a.actor(r), "networks.prune", hostID, "", string(summary))
-	writeJSON(w, 200, map[string]any{"job_id": jobID, "result": result})
+	_ = a.Store.Audit(context.Background(), actor, "build-cache.prune", h.ID, "", string(summary))
 }
 
 func (a *App) handleBuildCachePrune(w http.ResponseWriter, r *http.Request, hostID int64) {
@@ -996,19 +1289,10 @@ func (a *App) handleBuildCachePrune(w http.ResponseWriter, r *http.Request, host
 		writeErr(w, 500, err.Error())
 		return
 	}
-	_ = a.Store.StartJob(r.Context(), jobID)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
-	result, err := a.Docker.PruneBuildCache(ctx, h.Endpoint)
-	if err != nil {
-		_ = a.Store.FinishJob(context.Background(), jobID, "failed", "", err.Error())
-		writeErr(w, 502, err.Error())
-		return
-	}
-	summary, _ := json.Marshal(result)
-	_ = a.Store.FinishJob(context.Background(), jobID, "success", string(summary), "")
-	_ = a.Store.Audit(context.Background(), a.actor(r), "build-cache.prune", hostID, "", string(summary))
-	writeJSON(w, 200, map[string]any{"job_id": jobID, "result": result})
+	a.jobProgress(context.Background(), jobID, 2, "Cleanup queued")
+	actor := a.actor(r)
+	go a.runBuildCacheCleanup(jobID, h, actor)
+	a.respondCleanupJob(w, r, jobID)
 }
 
 func imageStateStale(lastChecked, lastError string) bool {
@@ -1155,37 +1439,61 @@ func (a *App) refreshExcludedImageState(hostID int64, c dockercli.Container) {
 }
 
 func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID int64) {
+	// Bound a slow VPN/remote Docker endpoint without discarding already cached
+	// browser data. Request cancellation also terminates the Docker CLI process.
 	h, err := a.Store.Host(r.Context(), hostID)
 	if err != nil {
 		writeErr(w, 404, "host not found")
 		return
 	}
-	cs, err := a.Docker.ListContainers(r.Context(), h.Endpoint)
+	ctx, cancel := context.WithTimeout(r.Context(), dockerOperationTimeout(h.Endpoint, 25*time.Second, 75*time.Second))
+	defer cancel()
+	cs, err := a.Docker.ListContainers(ctx, h.Endpoint)
 	if err != nil {
 		writeErr(w, 502, err.Error())
 		return
 	}
-	latestRestorePoints, _ := a.Store.LatestRestorePointsForHost(r.Context(), hostID)
+	latestRestorePoints, _ := a.Store.LatestRestorePointsForHost(ctx, hostID)
+	stackManagement, _ := a.stackChainManagement(ctx, hostID)
+
+	// Inspect image labels/platforms in batches. Previously first-load rendering
+	// could issue an image-inspect round-trip for every container, which becomes
+	// very visible across higher-latency VPN links.
+	imageRefs := make([]string, 0, len(cs))
+	for _, c := range cs {
+		ref := strings.TrimSpace(c.ImageID)
+		if ref == "" {
+			ref = strings.TrimSpace(c.Image)
+		}
+		if ref != "" {
+			imageRefs = append(imageRefs, ref)
+		}
+	}
+	imageMeta, metaErr := a.Docker.ImageMetadataBatch(ctx, h.Endpoint, imageRefs...)
+	if metaErr != nil {
+		a.Logger.Debug("container image metadata batch unavailable", "host_id", hostID, "error", metaErr)
+		imageMeta = map[string]dockercli.ImageMetadata{}
+	}
+
 	views := make([]ContainerView, 0, len(cs))
 	for _, c := range cs {
-		p, _ := a.Store.Policy(r.Context(), hostID, c.Name)
-		cache, _ := a.Store.Cache(r.Context(), hostID, c.Name)
-		v, _ := a.Store.Version(r.Context(), hostID, c.Name)
+		p, _ := a.Store.Policy(ctx, hostID, c.Name)
+		cache, _ := a.Store.Cache(ctx, hostID, c.Name)
+		v, _ := a.Store.Version(ctx, hostID, c.Name)
 		managed, role := a.systemManagedContainer(c.Name)
-		labelRef := c.ImageID
+		labelRef := strings.TrimSpace(c.ImageID)
 		if labelRef == "" {
-			labelRef = c.Image
+			labelRef = strings.TrimSpace(c.Image)
 		}
-		labels, e := a.Docker.ImageLabels(r.Context(), h.Endpoint, labelRef)
-		if e == nil {
-			installed, source := dockercli.InstalledVersion(c.Image, labels)
+		if meta, ok := imageMeta[labelRef]; ok {
+			installed, source := dockercli.InstalledVersion(c.Image, meta.Labels)
 			if installed != "" {
 				v.Installed = installed
 				v.InstalledSource = source
 			}
 			repo := strings.TrimSpace(p.ReleaseRepo)
 			if repo == "" {
-				repo, _ = releases.DetectFromLabels(labels)
+				repo, _ = releases.DetectFromLabels(meta.Labels)
 			}
 			if repo == "" {
 				repo, _ = releases.FallbackFromImage(c.Image)
@@ -1193,19 +1501,26 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 			if repo != "" {
 				v.ReleaseRepo = repo
 			}
-			_ = a.Store.SaveVersion(r.Context(), v)
+			_ = a.Store.SaveVersion(ctx, v)
 			if versionStale(v.CheckedAt) {
-				platform := registry.Platform{}
-				if local, pe := a.Docker.ImagePlatform(r.Context(), h.Endpoint, labelRef); pe == nil {
-					platform = registry.Platform{OS: local.OS, Architecture: local.Architecture, Variant: local.Variant}
-				}
+				platform := registry.Platform{OS: meta.OS, Architecture: meta.Architecture, Variant: meta.Variant}
 				go a.refreshVersion(context.Background(), hostID, c.Name, c.Image, repo, v.Installed, v.InstalledSource, platform)
 			}
+		} else if versionStale(v.CheckedAt) {
+			// Metadata refresh is asynchronous; do not turn a container-page request
+			// into a sequence of remote Docker calls when batch metadata was missing.
+			go a.refreshVersion(context.Background(), hostID, c.Name, c.Image, strings.TrimSpace(p.ReleaseRepo), v.Installed, v.InstalledSource)
 		}
-		if !managed && p.Mode == "ignore" && imageStateStale(cache.LastCheckedAt, cache.LastError) {
+		effectiveMode := p.Mode
+		if c.StackName != "" {
+			if cm, ok := stackManagement[c.StackName]; ok {
+				effectiveMode = cm.PolicyMode
+			}
+		}
+		if !managed && effectiveMode == "ignore" && imageStateStale(cache.LastCheckedAt, cache.LastError) {
 			go a.refreshExcludedImageState(hostID, c)
 		}
-		driftDB, _ := a.Store.ConfigDrift(r.Context(), hostID, c.Name)
+		driftDB, _ := a.Store.ConfigDrift(ctx, hostID, c.Name)
 		drift := driftViewFromDB(driftDB)
 		if !managed && driftStale(drift.CheckedAt) {
 			go func(cc dockercli.Container) {
@@ -1219,7 +1534,19 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 			copy := rp
 			restorePoint = &copy
 		}
-		views = append(views, ContainerView{Container: c, SystemManaged: managed, SystemRole: role, Policy: p, Cache: cache, Version: v, ConfigDrift: drift, RestorePoint: restorePoint})
+		verification, _ := a.Store.VerificationState(ctx, hostID, c.Name)
+		if !managed {
+			profile, _ := a.effectiveVerificationProfile(ctx, hostID, c.Name)
+			verification = verificationStateForProfile(profile, verification)
+		}
+		var chainManagement *ChainManagementView
+		if c.StackName != "" {
+			if cm, ok := stackManagement[c.StackName]; ok {
+				copy := cm
+				chainManagement = &copy
+			}
+		}
+		views = append(views, ContainerView{Container: c, SystemManaged: managed, SystemRole: role, Policy: p, Cache: cache, Version: v, ConfigDrift: drift, Verification: verification, RestorePoint: restorePoint, ChainManagement: chainManagement})
 	}
 	writeJSON(w, 200, views)
 }
@@ -1277,13 +1604,23 @@ func (a *App) refreshVersion(ctx context.Context, hostID int64, container, image
 }
 
 func (a *App) ensureWorker(ctx context.Context, h db.Host) (string, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	// Worker readiness is serialized per host, not globally. A slow VPN host
+	// must never block checks or updates on unrelated LAN hosts.
+	a.ensureMu.Lock()
+	lock := a.ensureLocks[h.ID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		a.ensureLocks[h.ID] = lock
+	}
+	a.ensureMu.Unlock()
+	lock.Lock()
+	defer lock.Unlock()
 	base, err := a.Docker.EnsureWorker(ctx, h)
 	if err != nil {
 		return "", err
 	}
-	if err := a.WT.WaitReady(ctx, base); err != nil {
+	readyTimeout := dockerOperationTimeout(h.Endpoint, 60*time.Second, 4*time.Minute)
+	if err := a.WT.WaitReadyFor(ctx, base, readyTimeout); err != nil {
 		state := a.Docker.WorkerState(context.Background(), h.ID)
 		logs, _ := a.Docker.WorkerLogsRecent(context.Background(), h.ID, 80)
 		if logs != "" {
@@ -1292,6 +1629,25 @@ func (a *App) ensureWorker(ctx context.Context, h db.Host) (string, error) {
 		return "", fmt.Errorf("%w (worker status=%s exit_code=%d restarting=%t)", err, state.Status, state.ExitCode, state.Restarting)
 	}
 	return base, nil
+}
+
+// beginAsyncJob safely starts a queued asynchronous job. Jobs created directly
+// in the running state (for example internal post-rollback checks) are allowed
+// through unchanged. A queued job cancelled by the user is never resurrected.
+func (a *App) beginAsyncJob(ctx context.Context, jobID int64) bool {
+	job, err := a.Store.Job(ctx, jobID)
+	if err != nil {
+		return false
+	}
+	switch job.Status {
+	case "running":
+		return true
+	case "queued":
+		ok, claimErr := a.Store.ClaimQueuedJob(ctx, jobID)
+		return claimErr == nil && ok
+	default:
+		return false
+	}
 }
 
 func (a *App) jobProgress(ctx context.Context, jobID int64, percent int, stage string) {
@@ -1316,6 +1672,9 @@ func (a *App) check(ctx context.Context, hostID int64, container, trigger string
 }
 
 func (a *App) enqueueCheck(ctx context.Context, hostID int64, container, trigger, actor string) (int64, error) {
+	if chainID, reserved := a.chainReservation(hostID, container); reserved {
+		return 0, fmt.Errorf("%s is reserved by running update chain #%d", container, chainID)
+	}
 	active, err := a.Store.HasActiveJob(ctx, hostID, container)
 	if err != nil {
 		return 0, err
@@ -1333,8 +1692,15 @@ func (a *App) enqueueCheck(ctx context.Context, hostID int64, container, trigger
 	}
 	_ = a.Store.Audit(ctx, actor, "check.queue", hostID, container, trigger)
 	go func() {
-		ctx := a.ctx
-		_ = a.Store.StartJob(ctx, id)
+		timeout := 12 * time.Minute
+		if h, e := a.Store.Host(a.ctx, hostID); e == nil && remoteDockerEndpoint(h.Endpoint) {
+			timeout = 15 * time.Minute
+		}
+		ctx, cancel := context.WithTimeout(a.ctx, timeout)
+		defer cancel()
+		if !a.beginAsyncJob(ctx, id) {
+			return
+		}
 		a.jobProgress(ctx, id, 10, "Starting update check")
 		_, _ = a.runCheck(ctx, id, hostID, container, trigger)
 	}()
@@ -1407,7 +1773,11 @@ func (a *App) runCheck(ctx context.Context, jobID, hostID int64, container, trig
 		_ = a.Store.SaveCache(ctx, c)
 		_ = a.Store.TouchPolicy(ctx, hostID, item.Name)
 		if p, e := a.Store.Policy(ctx, hostID, item.Name); e == nil {
-			if p.Mode == "manual" && item.UpdateAvailable {
+			effectiveMode := p.Mode
+			if cm, chainManaged := a.stackChainForMember(ctx, hostID, item.Name); chainManaged {
+				effectiveMode = cm.PolicyMode
+			}
+			if effectiveMode == "manual" && item.UpdateAvailable {
 				fingerprint := strings.TrimSpace(item.LatestDigest)
 				if fingerprint == "" {
 					fingerprint = strings.TrimSpace(item.ImageID) + ":update"
@@ -1450,6 +1820,15 @@ func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigge
 	if managed, _ := a.systemManagedContainer(container); managed {
 		return 0, fmt.Errorf("Vibewatch system containers are maintained from Owner Settings")
 	}
+	isChainTrigger := strings.HasPrefix(trigger, "chain:") || strings.HasPrefix(trigger, "chain-auto:")
+	if chainID, reserved := a.chainReservation(hostID, container); reserved && !isChainTrigger {
+		return 0, fmt.Errorf("%s is reserved by running update chain #%d", container, chainID)
+	}
+	if !isChainTrigger {
+		if cm, chainManaged := a.stackChainForMember(ctx, hostID, container); chainManaged {
+			return 0, fmt.Errorf("%s is managed by update chain %s for stack %s; run the chain instead of updating an individual member", container, cm.ChainName, cm.ScopeKey)
+		}
+	}
 	active, err := a.Store.HasActiveJob(ctx, hostID, container)
 	if err != nil {
 		return 0, err
@@ -1458,7 +1837,7 @@ func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigge
 		return 0, fmt.Errorf("an update job is already queued or running for %s", container)
 	}
 	p, _ := a.Store.Policy(ctx, hostID, container)
-	if p.Mode == "ignore" {
+	if !isChainTrigger && p.Mode == "ignore" {
 		return 0, fmt.Errorf("container is excluded; change its policy before updating it")
 	}
 	if cache, e := a.Store.Cache(ctx, hostID, container); e == nil && cacheHasSnoozedUpdate(cache) {
@@ -1495,8 +1874,24 @@ func (a *App) updateWorker() {
 }
 func (a *App) executeUpdate(req updateRequest) {
 	ctx := a.ctx
-	_ = a.Store.StartJob(ctx, req.JobID)
-	a.jobProgress(ctx, req.JobID, 10, "Starting update")
+	if !a.beginAsyncJob(ctx, req.JobID) {
+		return
+	}
+	leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, req.JobID, req.HostID, req.Container, "update")
+	if leaseErr != nil {
+		a.failJob(req.JobID, leaseErr)
+		return
+	}
+	leaseReleased := false
+	releaseLease := func() {
+		if !leaseReleased {
+			_ = a.Store.ReleaseOperationLease(context.Background(), leaseKey, leaseOwner)
+			leaseReleased = true
+		}
+	}
+	defer releaseLease()
+
+	a.jobProgress(ctx, req.JobID, 8, "Starting update pipeline")
 	started := time.Now()
 	beforeContainer, beforeVersion := a.currentContainerState(ctx, req.HostID, req.Container)
 	beforeCache, _ := a.Store.Cache(ctx, req.HostID, req.Container)
@@ -1506,21 +1901,40 @@ func (a *App) executeUpdate(req updateRequest) {
 	dependencyCount := 0
 	dependencyStatus := "none"
 	dependencyDetails := ""
-	var dependencyCtx []networkNamespaceDependencyRuntime
-	var targetBeforeInspect inspectContainer
+	preflightStatus := ""
+	preflightDetails := ""
+	verificationStatus := verificationStatusNotConfigured
+	verificationDetails := "[]"
+
+	txID, txErr := a.Store.CreateUpdateTransaction(ctx, db.UpdateTransaction{JobID: req.JobID, HostID: req.HostID, ContainerName: req.Container, Trigger: req.Trigger, Actor: req.Actor, State: txQueued, Status: "running", TargetDigest: attemptedDigest})
+	if txErr != nil {
+		a.failJob(req.JobID, fmt.Errorf("create persistent update transaction: %w", txErr))
+		return
+	}
+	tx, _ := a.Store.UpdateTransaction(ctx, txID)
+	req.TransactionID = txID
+	_ = a.Store.RenewOperationLease(ctx, leaseKey, leaseOwner, txID, operationLeaseTTL)
+	stopHeartbeat := a.startLeaseHeartbeat(ctx, leaseKey, leaseOwner, txID)
+	defer stopHeartbeat()
+	if err := a.txTransition(ctx, &tx, txPreflight, "running", "update preflight started"); err != nil {
+		a.failJob(req.JobID, fmt.Errorf("persist update transaction preflight state: %w", err))
+		return
+	}
+
 	defer func() {
-		a.recordUpdateHistory(req, beforeContainer, beforeVersion, historySnapshotID, restorePointID, attemptedDigest, started, dependencyCount, dependencyStatus, dependencyDetails)
+		a.recordUpdateHistory(req, beforeContainer, beforeVersion, historySnapshotID, restorePointID, attemptedDigest, started, dependencyCount, dependencyStatus, dependencyDetails, preflightStatus, preflightDetails, verificationStatus, verificationDetails)
 	}()
-	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "app", "update started")
+	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "app", fmt.Sprintf("update pipeline started · transaction #%d", txID))
 
 	h, err := a.Store.Host(ctx, req.HostID)
 	if err != nil {
+		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
 		a.failJob(req.JobID, err)
 		a.notifyManualUpdateResult(req, "failed", err)
 		return
 	}
 	notifyAutomatic := func(status string, resultErr error) {
-		if !strings.HasPrefix(req.Trigger, "automation:") {
+		if !strings.HasPrefix(req.Trigger, "automation:") && !strings.HasPrefix(req.Trigger, "chain-auto:") {
 			return
 		}
 		title := "Automatic update completed · " + req.Container
@@ -1535,42 +1949,94 @@ func (a *App) executeUpdate(req updateRequest) {
 		go a.notifyHostUsers(req.HostID, "auto", req.Container, title, msg, "")
 	}
 
-	a.jobProgress(ctx, req.JobID, 14, "Resolving container dependencies")
-	targetBeforeInspect, dependencyCtx, err = a.discoverNetworkNamespaceDependents(ctx, req.HostID, req.Container)
-	if err != nil {
-		err = fmt.Errorf("network namespace dependency scan failed: %w", err)
+	// Manual, automatic and chain updates all enter the exact same preflight and
+	// recovery preparation path. The transaction id is passed into preflight so
+	// snapshot and restore-point stages are durable state-machine transitions.
+	a.jobProgress(ctx, req.JobID, 12, "Running update preflight")
+	preflight, prepared := a.runUpdatePreflight(ctx, req, true)
+	if fresh, e := a.Store.UpdateTransaction(ctx, txID); e == nil {
+		tx = fresh
+	}
+	preflightStatus = preflight.Status
+	if bs, e := json.Marshal(preflight.Checks); e == nil {
+		preflightDetails = string(bs)
+	}
+	for _, check := range preflight.Checks {
+		if check.Key == "custom_verification" && check.Status == preflightGreen {
+			verificationStatus = "pending"
+			verificationDetails = `[{"type":"custom_verification","status":"pending","detail":"configured; waiting for post-update execution"}]`
+			break
+		}
+	}
+	historySnapshotID = prepared.Snapshot.ID
+	restorePointID = prepared.RestorePoint.ID
+	if err := a.Store.SetUpdateTransactionPrepared(ctx, txID, historySnapshotID, restorePointID, attemptedDigest); err != nil {
+		err = fmt.Errorf("persist prepared recovery context: %w", err)
+		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
 		a.failJob(req.JobID, err)
-		_ = a.Store.Audit(ctx, "system", "update.blocked-dependency-scan", req.HostID, req.Container, err.Error())
+		a.notifyManualUpdateResult(req, "failed", err)
+		return
+	}
+	tx.SnapshotID, tx.RestorePointID, tx.TargetDigest = historySnapshotID, restorePointID, attemptedDigest
+	dependencyCount = len(prepared.Dependencies)
+	if dependencyCount > 0 {
+		dependencyStatus = "prepared"
+		dependencyDetails = dependencyNames(prepared.Dependencies)
+	}
+	if preflight.Status == "blocked" {
+		err := fmt.Errorf("update preflight blocked the update")
+		for _, check := range preflight.Checks {
+			if check.Status == preflightRed {
+				err = fmt.Errorf("preflight blocked: %s: %s", check.Title, firstNonEmpty(check.Detail, check.Description))
+				break
+			}
+		}
+		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
+		a.jobProgress(ctx, req.JobID, 100, "Update blocked by preflight")
+		_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
+		_ = a.Store.Audit(ctx, req.Actor, "update.blocked-preflight", req.HostID, req.Container, err.Error())
 		notifyAutomatic("failed", err)
 		a.notifyManualUpdateResult(req, "failed", err)
 		return
 	}
-	dependencyCount = len(dependencyCtx)
-	if dependencyCount > 0 {
-		dependencyStatus = "detected"
-		dependencyDetails = dependencyNames(dependencyCtx)
-		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "dependency", fmt.Sprintf("Detected %d network namespace dependent(s): %s", dependencyCount, dependencyDetails))
-		for _, dep := range dependencyCtx {
-			detail := fmt.Sprintf("type=%s parent=%s dependent=%s parent_id=%s dependent_id=%s was_running=%t", networkNamespaceDependencyType, req.Container, dep.SourceContainer, targetBeforeInspect.ID, dep.SourceContainerID, dep.WasRunning)
-			_ = a.Store.Audit(ctx, "system", "dependency.detected", req.HostID, dep.SourceContainer, detail)
+	if preflight.Status == "ready_with_warnings" {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "preflight", fmt.Sprintf("preflight ready with %d warning(s)", preflight.Warnings))
+	}
+	if tx.State != txPrepared {
+		if err := a.txTransition(ctx, &tx, txPrepared, "running", "snapshot and restore point prepared"); err != nil {
+			err = fmt.Errorf("persist prepared transaction state: %w", err)
+			a.failJob(req.JobID, err)
+			a.notifyManualUpdateResult(req, "failed", err)
+			return
 		}
 	}
-	finishFailed := func(raw []byte, failure error, allowAutoRollback bool, rp db.RestorePoint) {
-		if dependencyCount > 0 && (dependencyStatus == "detected" || dependencyStatus == "prepared") {
+	rp := prepared.RestorePoint
+
+	finishFailed := func(raw []byte, failure error, allowAutoRollback bool) {
+		if dependencyCount > 0 && (dependencyStatus == "prepared" || dependencyStatus == "detected") {
 			dependencyStatus = "not_run"
 		}
 		finalErr := failure
+		rollbackAttempted := false
 		if allowAutoRollback && rp.ID > 0 {
+			_ = a.txTransition(ctx, &tx, txRollback, "running", "failure detected; evaluating automatic rollback")
 			attempted, rollbackErr := a.runAutomaticRollback(req, rp, failure)
+			rollbackAttempted = attempted
 			if attempted {
 				if rollbackErr == nil {
 					finalErr = fmt.Errorf("%v; automatic rollback completed from restore point #%d", failure, rp.ID)
 					_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "rollback", fmt.Sprintf("Automatic rollback completed from restore point #%d", rp.ID))
+					_ = a.txTransition(ctx, &tx, txRolledBack, "rolled_back", finalErr.Error())
+					_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "rolled_back", "automatic_rollback", failure.Error())
 				} else {
 					finalErr = fmt.Errorf("%v; automatic rollback failed: %v", failure, rollbackErr)
 					_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "rollback", "Automatic rollback failed: "+rollbackErr.Error())
+					_ = a.txTransition(ctx, &tx, txFailed, "failed", finalErr.Error())
 				}
 			}
+		}
+		if !rollbackAttempted && !transactionTerminalState(tx.State) {
+			_ = a.txTransition(ctx, &tx, txFailed, "failed", finalErr.Error())
 		}
 		a.jobProgress(ctx, req.JobID, 100, "Update failed")
 		_ = a.Store.FinishJob(ctx, req.JobID, "failed", string(raw), finalErr.Error())
@@ -1579,80 +2045,21 @@ func (a *App) executeUpdate(req updateRequest) {
 		a.notifyManualUpdateResult(req, "failed", finalErr)
 	}
 
-	a.jobProgress(ctx, req.JobID, 20, "Creating recovery snapshot")
-	snapshotReason := "before-update"
-	if req.Trigger == "manual" {
-		snapshotReason = "before-manual-update"
-	} else if strings.HasPrefix(req.Trigger, "automation:") {
-		snapshotReason = "before-automatic-update"
-	}
-	snapshotCtx, snapshotCancel := context.WithTimeout(ctx, 60*time.Second)
-	snap, snapshotErr := a.createSnapshotForContainer(snapshotCtx, req.HostID, req.Container, snapshotReason)
-	snapshotCancel()
-	if snapshotErr != nil {
-		err := fmt.Errorf("pre-update recovery snapshot failed: %w", snapshotErr)
-		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "backup", err.Error()+"; update blocked")
-		a.jobProgress(ctx, req.JobID, 100, "Update blocked: backup failed")
-		_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
-		_ = a.Store.Audit(ctx, "system", "update.blocked-backup", req.HostID, req.Container, err.Error())
-		a.Logger.Error("pre-update container recovery snapshot failed; update blocked", "host_id", req.HostID, "container", req.Container, "job_id", req.JobID, "error", snapshotErr)
-		notifyAutomatic("failed", err)
+	if err := a.txTransition(ctx, &tx, txUpdating, "running", "Watchtower update execution started"); err != nil {
+		err = fmt.Errorf("persist destructive update stage: %w", err)
+		a.failJob(req.JobID, err)
 		a.notifyManualUpdateResult(req, "failed", err)
 		return
 	}
-	historySnapshotID = snap.ID
-	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "backup", "Recovery snapshot created: "+snap.Filename)
-	if dependencyCount > 0 {
-		a.jobProgress(ctx, req.JobID, 27, "Protecting dependent container configurations")
-		dependencyCtx, err = a.attachDependencySnapshots(ctx, req.HostID, snap, dependencyCtx)
-		if err != nil {
-			dependencyStatus = "snapshot_failed"
-			err = fmt.Errorf("pre-update dependency recovery snapshot failed: %w", err)
-			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "dependency", err.Error()+"; update blocked")
-			a.jobProgress(ctx, req.JobID, 100, "Update blocked: dependency backup failed")
-			_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
-			_ = a.Store.Audit(ctx, "system", "update.blocked-dependency-backup", req.HostID, req.Container, err.Error())
-			notifyAutomatic("failed", err)
-			a.notifyManualUpdateResult(req, "failed", err)
-			return
-		}
-		dependencyStatus = "prepared"
-	}
-
-	a.jobProgress(ctx, req.JobID, 31, "Capturing full container restore point")
-	restoreCtx, restoreCancel := context.WithTimeout(ctx, 10*time.Minute)
-	rp, restoreErr := a.createRestorePointForSnapshot(restoreCtx, req.HostID, req.Container, snap, snapshotReason, req.Trigger, dependencyCtx)
-	restoreCancel()
-	restorePointID = rp.ID
-	if restoreErr != nil {
-		err := fmt.Errorf("pre-update full restore point failed: %w", restoreErr)
-		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "rollback", err.Error()+"; update blocked")
-		a.jobProgress(ctx, req.JobID, 100, "Update blocked: restore point failed")
-		_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
-		_ = a.Store.Audit(ctx, "system", "update.blocked-restore-point", req.HostID, req.Container, err.Error())
-		notifyAutomatic("failed", err)
-		a.notifyManualUpdateResult(req, "failed", err)
-		return
-	}
-	if rp.Status == "config_only" {
-		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "rollback", "Docker Swarm target: configuration recovery snapshot retained, but writable-layer one-click rollback is not supported")
-	} else {
-		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "rollback", fmt.Sprintf("Full restore point #%d ready · writable layer captured as %s", rp.ID, rp.ImageRef))
-	}
-
-	a.jobProgress(ctx, req.JobID, 40, "Preparing update worker")
-	// Only the actual Watchtower operation needs to hold the worker-operation
-	// read lock. Keeping it across snapshot/verification/rollback would force
-	// nested read-lock acquisition during post-update checks and could deadlock
-	// when worker maintenance is waiting for the write lock.
+	a.jobProgress(ctx, req.JobID, 45, "Preparing update worker")
 	a.workerOpMu.RLock()
 	base, err := a.ensureWorker(ctx, h)
 	if err != nil {
 		a.workerOpMu.RUnlock()
-		finishFailed(nil, err, false, rp)
+		finishFailed(nil, err, false)
 		return
 	}
-	a.jobProgress(ctx, req.JobID, 50, "Update engine working")
+	a.jobProgress(ctx, req.JobID, 55, "Update engine working")
 	res, raw, err := a.WT.Update(ctx, base, h.WorkerToken, req.Container)
 	if logs, e := a.Docker.WorkerLogs(ctx, req.HostID, started); e == nil && logs != "" {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "DEBUG", "watchtower", logs)
@@ -1660,40 +2067,45 @@ func (a *App) executeUpdate(req updateRequest) {
 	a.workerOpMu.RUnlock()
 	if err != nil {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "watchtower", err.Error())
-		finishFailed(raw, err, true, rp)
+		finishFailed(raw, err, true)
 		return
 	}
 
-	a.jobProgress(ctx, req.JobID, 78, "Update engine completed")
+	a.jobProgress(ctx, req.JobID, 72, "Update engine completed")
 	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "app", fmt.Sprintf("update completed: updated=%d failed=%d skipped=%d", res.Summary.Updated, res.Summary.Failed, res.Summary.Skipped))
 	if res.Summary.Failed > 0 {
 		failure := errors.New(strings.TrimSpace(res.Error))
 		if strings.TrimSpace(res.Error) == "" {
 			failure = fmt.Errorf("update engine reported %d failed container operation(s)", res.Summary.Failed)
 		}
-		finishFailed(raw, failure, true, rp)
+		finishFailed(raw, failure, true)
 		return
 	}
 
-	a.jobProgress(ctx, req.JobID, 86, "Verifying updated container")
+	_ = a.txTransition(ctx, &tx, txDockerHealth, "running", "Docker health verification started")
+	a.jobProgress(ctx, req.JobID, 80, "Checking Docker health")
 	if verifyErr := a.verifyUpdatedContainer(ctx, req.HostID, req.Container); verifyErr != nil {
+		verificationStatus = verificationStatusFailed
+		verificationDetails = fmt.Sprintf(`[{"type":"docker_health","status":"failed","error":%q}]`, verifyErr.Error())
 		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "verify", verifyErr.Error())
-		finishFailed(raw, fmt.Errorf("post-update verification failed: %w", verifyErr), true, rp)
+		finishFailed(raw, fmt.Errorf("post-update Docker health verification failed: %w", verifyErr), true)
 		return
 	}
+	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "verify", "Docker health/running-state verification passed")
 
 	if dependencyCount > 0 {
+		_ = a.txTransition(ctx, &tx, txDependencies, "running", "network namespace dependency reconciliation started")
 		parentAfter, inspectErr := a.inspectOne(ctx, req.HostID, req.Container)
 		if inspectErr != nil {
 			dependencyStatus = "failed"
-			finishFailed(raw, fmt.Errorf("post-update parent inspect for dependency recreation failed: %w", inspectErr), true, rp)
+			finishFailed(raw, fmt.Errorf("post-update parent inspect for dependency recreation failed: %w", inspectErr), true)
 			return
 		}
-		if strings.TrimSpace(parentAfter.ID) != "" && strings.TrimSpace(parentAfter.ID) != strings.TrimSpace(targetBeforeInspect.ID) {
+		if strings.TrimSpace(parentAfter.ID) != "" && strings.TrimSpace(parentAfter.ID) != strings.TrimSpace(prepared.TargetInspect.ID) {
 			dependencyStatus = "recreating"
-			if depErr := a.recreateNetworkNamespaceDependents(ctx, req.JobID, req.HostID, req.Container, parentAfter.ID, dependencyCtx); depErr != nil {
+			if depErr := a.recreateNetworkNamespaceDependents(ctx, req.JobID, req.HostID, req.Container, parentAfter.ID, prepared.Dependencies); depErr != nil {
 				dependencyStatus = "failed"
-				finishFailed(raw, depErr, true, rp)
+				finishFailed(raw, depErr, true)
 				return
 			}
 			dependencyStatus = "success"
@@ -1703,19 +2115,45 @@ func (a *App) executeUpdate(req updateRequest) {
 		}
 	}
 
+	_ = a.txTransition(ctx, &tx, txVerifying, "running", "custom verification started")
+	a.jobProgress(ctx, req.JobID, 88, "Running custom verification")
+	verification := a.runCustomVerification(ctx, req.HostID, req.Container, req.Trigger, req.Actor, req.JobID)
+	verificationStatus = verification.Status
+	if bs, e := json.Marshal(verification); e == nil {
+		verificationDetails = string(bs)
+	}
+	if verification.Status == verificationStatusFailed {
+		finishFailed(raw, fmt.Errorf("custom verification failed: %s", verification.Error), true)
+		return
+	}
+	if verification.Status == verificationStatusNotConfigured {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "verify", "No custom verification configured; Docker health/running-state result is authoritative")
+	}
+
+	_ = a.txTransition(ctx, &tx, txRefreshing, "running", "refreshing update metadata and config drift baseline")
 	a.jobProgress(ctx, req.JobID, 95, "Refreshing update state")
 	_, _, _ = a.check(ctx, req.HostID, req.Container, "post-update")
 	if err := a.captureCurrentConfigDriftBaseline(ctx, req.HostID, req.Container, "post-update"); err != nil {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "config-drift", "Could not refresh post-update drift baseline: "+err.Error())
 		a.Logger.Warn("post-update config drift baseline refresh failed", "host_id", req.HostID, "container", req.Container, "error", err)
 	}
+	_ = a.txTransition(ctx, &tx, txSuccess, "success", "update transaction completed")
 	a.jobProgress(ctx, req.JobID, 100, "Update completed")
 	_ = a.Store.FinishJob(ctx, req.JobID, "success", string(raw), "")
-	_ = a.Store.Audit(ctx, "system", "update.success", req.HostID, req.Container, string(raw))
+	_ = a.Store.Audit(ctx, "system", "update.success", req.HostID, req.Container, fmt.Sprintf("transaction=%d %s", txID, string(raw)))
 	notifyAutomatic("success", nil)
 	if res.Summary.Updated > 0 {
 		a.notifyManualUpdateResult(req, "success", nil)
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return "blocked"
 }
 
 func (a *App) notifyManualUpdateResult(req updateRequest, status string, updateErr error) {
@@ -1765,40 +2203,94 @@ func (a *App) policyScanHost(ctx context.Context, hostID int64, trigger string, 
 	if err != nil {
 		return watchtower.CheckResponse{}, err
 	}
+	stackManagement, _ := a.stackChainManagement(ctx, hostID)
+	automationID := int64(0)
+	if strings.HasPrefix(trigger, "automation:") {
+		automationID, _ = strconv.ParseInt(strings.TrimPrefix(trigger, "automation:"), 10, 64)
+	}
 	var aggregate watchtower.CheckResponse
-	for _, c := range cs {
-		if managed, _ := a.systemManagedContainer(c.Name); managed {
-			continue
-		}
-		p, _ := a.Store.Policy(ctx, hostID, c.Name)
-		if p.Mode == "ignore" {
-			res, e := a.readOnlyRegistryCheck(ctx, hostID, c, trigger+":excluded-info")
-			if e != nil {
-				a.Logger.Debug("excluded read-only registry check unavailable", "host_id", hostID, "container", c.Name, "error", e)
-				continue
-			}
-			aggregate.Count += res.Count
-			aggregate.Containers = append(aggregate.Containers, res.Containers...)
-			continue
-		}
-		if c.State != "running" {
-			continue
-		}
-		res, _, e := a.check(ctx, hostID, c.Name, trigger)
-		if e != nil {
-			a.Logger.Warn("policy scan container failed", "host_id", hostID, "container", c.Name, "error", e)
-			continue
-		}
-		aggregate.Count += res.Count
-		aggregate.Containers = append(aggregate.Containers, res.Containers...)
-		if installAuto && p.Mode == "auto" {
-			for _, item := range res.Containers {
-				if item.Name == c.Name && item.UpdateAvailable {
-					_, _ = a.enqueueUpdate(ctx, hostID, c.Name, trigger, "scheduler")
+	var aggregateMu sync.Mutex
+	jobs := make(chan dockercli.Container)
+	var wg sync.WaitGroup
+	workerCount := 2
+	if len(cs) < workerCount {
+		workerCount = len(cs)
+	}
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range jobs {
+				if managed, _ := a.systemManagedContainer(c.Name); managed {
+					continue
+				}
+				if _, reserved := a.chainReservation(hostID, c.Name); reserved {
+					a.Logger.Debug("policy scan skipped container reserved by update chain", "host_id", hostID, "container", c.Name)
+					continue
+				}
+				p, _ := a.Store.Policy(ctx, hostID, c.Name)
+				mode := p.Mode
+				chainManaged := false
+				if c.StackName != "" {
+					if cm, ok := stackManagement[c.StackName]; ok {
+						chainManaged = true
+						mode = cm.PolicyMode
+						if installAuto {
+							// Stack policy belongs to the chain. Auto mode is executed only by
+							// the ordered chain transaction; Manual/Excluded are refreshed only
+							// by the automation explicitly bound to that chain.
+							if mode == "auto" {
+								continue
+							}
+							if automationID == 0 || cm.AutomationID != automationID {
+								continue
+							}
+						}
+					}
+				}
+				var res watchtower.CheckResponse
+				var e error
+				if mode == "ignore" {
+					res, e = a.readOnlyRegistryCheck(ctx, hostID, c, trigger+":excluded-info")
+					if e != nil {
+						a.Logger.Debug("excluded read-only registry check unavailable", "host_id", hostID, "container", c.Name, "error", e)
+						continue
+					}
+				} else {
+					if c.State != "running" {
+						continue
+					}
+					res, _, e = a.check(ctx, hostID, c.Name, trigger)
+					if e != nil {
+						a.Logger.Warn("policy scan container failed", "host_id", hostID, "container", c.Name, "error", e)
+						continue
+					}
+				}
+				aggregateMu.Lock()
+				aggregate.Count += res.Count
+				aggregate.Containers = append(aggregate.Containers, res.Containers...)
+				aggregateMu.Unlock()
+				if installAuto && mode == "auto" && !chainManaged {
+					for _, item := range res.Containers {
+						if item.Name == c.Name && item.UpdateAvailable {
+							_, _ = a.enqueueUpdate(ctx, hostID, c.Name, trigger, "scheduler")
+						}
+					}
 				}
 			}
+		}()
+	}
+	for _, c := range cs {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return aggregate, ctx.Err()
+		case jobs <- c:
 		}
 	}
+	close(jobs)
+	wg.Wait()
 	return aggregate, nil
 }
 
@@ -1838,6 +2330,10 @@ func (a *App) runAutomations(now time.Time) {
 			}
 		}
 		_ = a.Store.Audit(a.ctx, "scheduler", "automation.run", 0, "", fmt.Sprintf("%s target=%s:%d", rule.Name, rule.TargetType, rule.TargetID))
+		// Chains bound to this existing policy run reserve their members before the
+		// ordinary policy scan starts. The scan therefore skips those containers
+		// and cannot race or duplicate the explicitly ordered chain transaction.
+		a.startAutomationChains(a.ctx, rule, hostIDs)
 		for _, hostID := range hostIDs {
 			h, e := a.Store.Host(a.ctx, hostID)
 			if e != nil || !bool(h.Enabled) {
@@ -2186,6 +2682,45 @@ func (a *App) handleJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, x)
 }
+func (a *App) handleJobCancel(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("id")), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid job id")
+		return
+	}
+	job, err := a.Store.Job(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !a.isAdmin(r) && !a.hostAllowed(r, job.HostID) {
+		writeErr(w, http.StatusForbidden, "job access denied")
+		return
+	}
+	if job.Status != "queued" {
+		writeErr(w, http.StatusConflict, "only queued jobs can be cancelled")
+		return
+	}
+	actor := a.actor(r)
+	reason := "cancelled before execution by " + actor
+	ok, err := a.Store.CancelQueuedJob(r.Context(), id, reason)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusConflict, "job already started or is no longer queued")
+		return
+	}
+	_ = a.Store.ReleaseOperationLeaseByJob(context.Background(), id)
+	_ = a.Store.AddJobLog(context.Background(), id, "WARN", "app", reason)
+	a.jobProgress(context.Background(), id, 100, "Cancelled before execution")
+	_ = a.Store.Audit(context.Background(), actor, "job.cancelled", job.HostID, job.ContainerName, fmt.Sprintf("job=%d type=%s trigger=%s", job.ID, job.Type, job.Trigger))
+	job.Status = "cancelled"
+	job.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": job})
+}
+
 func (a *App) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 	idS := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/jobs/"), "/")
 	id, _ := strconv.ParseInt(idS, 10, 64)
@@ -2243,6 +2778,12 @@ func latestJobProgress(logs []db.JobLog, status string) (int, string) {
 		percent = 100
 		if stage == "" || stage == "Queued" {
 			stage = "Failed"
+		}
+	}
+	if status == "cancelled" {
+		percent = 100
+		if stage == "" || stage == "Queued" {
+			stage = "Cancelled before execution"
 		}
 	}
 	return percent, stage
@@ -2438,9 +2979,15 @@ func (a *App) handleApplicationLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	lines := strings.Split(string(b), "\n")
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		lines = nil
+	}
 	if len(lines) > 500 {
 		lines = lines[len(lines)-500:]
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
 	}
 	writeJSON(w, 200, map[string]any{"lines": lines})
 }
@@ -2479,6 +3026,32 @@ func (a *App) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 	writeZipJSON(zw, "docker-events.json", events)
 	writeZipJSON(zw, "automations.json", automations)
 	writeZipJSON(zw, "host-groups.json", groups)
+	if chainViews, e := a.chainViews(r.Context()); e == nil {
+		writeZipJSON(zw, "update-chains.json", chainViews)
+	}
+	if chainRuns, e := a.Store.UpdateChainRuns(r.Context(), 0, 200); e == nil {
+		runDiag := make([]map[string]any, 0, len(chainRuns))
+		for _, run := range chainRuns {
+			steps, _ := a.Store.UpdateChainRunSteps(r.Context(), run.ID)
+			runDiag = append(runDiag, map[string]any{"run": run, "steps": steps})
+		}
+		writeZipJSON(zw, "update-chain-runs.json", runDiag)
+	}
+	verificationDiag := map[string]any{}
+	for _, h := range hosts {
+		profiles, _ := a.Store.VerificationProfiles(r.Context(), h.ID)
+		rows := make([]map[string]any, 0, len(profiles))
+		for _, p := range profiles {
+			checks := verificationChecks(p.ChecksJSON)
+			checkMeta := make([]map[string]any, 0, len(checks))
+			for _, c := range checks {
+				checkMeta = append(checkMeta, map[string]any{"type": c.Type, "port": c.Port, "expected_status": c.ExpectedStatus, "content_match_configured": c.ExpectedContent != "", "timeout_seconds": c.TimeoutSeconds})
+			}
+			rows = append(rows, map[string]any{"scope_type": p.ScopeType, "scope_key": p.ScopeKey, "enabled": bool(p.Enabled), "start_delay_seconds": p.StartDelaySeconds, "retry_count": p.RetryCount, "retry_interval_seconds": p.RetryIntervalSeconds, "checks": checkMeta})
+		}
+		verificationDiag[fmt.Sprintf("host-%d-%s", h.ID, sanitizeFilename(h.Name))] = rows
+	}
+	writeZipJSON(zw, "verification-profiles.json", verificationDiag)
 	if history, e := a.Store.UpdateHistory(r.Context(), 500, 0, ""); e == nil {
 		writeZipJSON(zw, "update-history.json", history)
 	}
@@ -2510,7 +3083,8 @@ func (a *App) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 			cache, _ := a.Store.Cache(r.Context(), h.ID, c.Name)
 			v, _ := a.Store.Version(r.Context(), h.ID, c.Name)
 			drift, _ := a.Store.ConfigDrift(r.Context(), h.ID, c.Name)
-			rows = append(rows, map[string]any{"name": c.Name, "image": c.Image, "image_id": c.ImageID, "state": c.State, "policy": p, "digest_state": cache, "version_metadata": v, "config_drift": drift})
+			verification, _ := a.Store.VerificationState(r.Context(), h.ID, c.Name)
+			rows = append(rows, map[string]any{"name": c.Name, "image": c.Image, "image_id": c.ImageID, "state": c.State, "policy": p, "digest_state": cache, "version_metadata": v, "config_drift": drift, "verification_state": verification})
 		}
 		containerState[key] = rows
 	}
@@ -2770,6 +3344,23 @@ func (a *App) runSystemMaintenance(now time.Time) {
 	if loc, e := time.LoadLocation(a.Cfg.Timezone); e == nil {
 		local = now.In(loc)
 	}
+	// Recovery storage is reconciled periodically. This central GC validates
+	// retained restore points first, then lets the existing retention/protection
+	// logic expire only objects that are no longer part of a valid transaction.
+	lastGC := a.Store.Setting(a.ctx, "recovery_gc_last_at", "")
+	gcDue := true
+	if t, e := time.Parse(time.RFC3339Nano, lastGC); e == nil && now.Sub(t) < 6*time.Hour {
+		gcDue = false
+	}
+	if gcDue {
+		_ = a.Store.SetSetting(a.ctx, "recovery_gc_last_at", now.UTC().Format(time.RFC3339Nano))
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			a.runRecoveryGC(ctx, "scheduled")
+		}()
+	}
+
 	if settingBool(a.Store, a.ctx, "worker_auto_update", true) {
 		cron := a.Store.Setting(a.ctx, "worker_update_cron", "30 3 * * *")
 		last := a.Store.Setting(a.ctx, "worker_last_update_at", "")

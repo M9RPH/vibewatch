@@ -484,8 +484,9 @@ button, input, select { font: inherit; }
 
 /* V0.8.2.1 Container Configs table ----------------------------------------- */
 .wt-backup-table {
-  min-width: 1320px;
-  table-layout: auto;
+  width: 100%;
+  min-width: 1040px;
+  table-layout: fixed;
 }
 .wt-backup-table tbody td {
   height: auto;
@@ -493,19 +494,19 @@ button, input, select { font: inherit; }
   vertical-align: top;
   overflow: visible;
 }
-.wt-backup-table tbody td:nth-child(1) { min-width: 185px; }
-.wt-backup-table tbody td:nth-child(2) { min-width: 120px; }
-.wt-backup-table tbody td:nth-child(3) { min-width: 110px; }
-.wt-backup-table tbody td:nth-child(4) { min-width: 180px; }
-.wt-backup-table tbody td:nth-child(5) { min-width: 110px; }
-.wt-backup-table tbody td:nth-child(6) { min-width: 370px; }
-.wt-backup-table tbody td:nth-child(7) { min-width: 150px; }
+.wt-backup-table th:nth-child(1), .wt-backup-table td:nth-child(1) { width: 16%; }
+.wt-backup-table th:nth-child(2), .wt-backup-table td:nth-child(2) { width: 10%; }
+.wt-backup-table th:nth-child(3), .wt-backup-table td:nth-child(3) { width: 9%; }
+.wt-backup-table th:nth-child(4), .wt-backup-table td:nth-child(4) { width: 15%; }
+.wt-backup-table th:nth-child(5), .wt-backup-table td:nth-child(5) { width: 10%; }
+.wt-backup-table th:nth-child(6), .wt-backup-table td:nth-child(6) { width: 29%; }
+.wt-backup-table th:nth-child(7), .wt-backup-table td:nth-child(7) { width: 11%; }
 .wt-backup-snapshots-cell { padding-top: .55rem !important; padding-bottom: .55rem !important; }
 .wt-backup-slot {
   display: grid;
-  grid-template-columns: 82px minmax(0,1fr) auto;
+  grid-template-columns: 68px minmax(0,1fr) auto;
   align-items: center;
-  gap: .5rem;
+  gap: .4rem;
   border: 1px solid var(--wt-border-soft);
   border-radius: .55rem;
   background: var(--wt-surface-muted);
@@ -610,3 +611,93 @@ button, input, select { font: inherit; }
   max-width: 100%;
   margin-top: .3rem;
 }
+
+/* V0.8.5 update-chain member surfaces ------------------------------------ */
+.wt-chain-member {
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .75rem;
+  background: var(--wt-surface-solid);
+  padding: .75rem;
+}
+.wt-chain-member-index {
+  display: grid;
+  height: 2.25rem;
+  place-items: center;
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .55rem;
+  background: var(--wt-surface-muted);
+  color: var(--wt-text-2);
+  font-size: .875rem;
+  font-weight: 700;
+}
+.wt-chain-member-service {
+  min-width: 0;
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .55rem;
+  background: color-mix(in srgb, var(--wt-surface-muted) 72%, var(--wt-surface-solid));
+  padding: .5rem .75rem;
+}
+:root[data-theme="light"] .wt-chain-member {
+  background: #fff;
+}
+:root[data-theme="light"] .wt-chain-member-index,
+:root[data-theme="light"] .wt-chain-member-service {
+  background: #f8fafc;
+}
+
+/* V0.8.5 dashboard grouping / accordion ---------------------------------- */
+.wt-dashboard-icon {
+  display: inline-grid;
+  width: 2rem;
+  height: 2rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .65rem;
+  background: color-mix(in srgb, var(--wt-accent) 8%, var(--wt-surface-solid));
+  color: var(--wt-accent);
+}
+.wt-dashboard-icon svg { width: 1rem; height: 1rem; }
+.wt-dashboard-icon-small { width: 1.65rem; height: 1.65rem; border-radius: .5rem; }
+.wt-dashboard-icon-small svg { width: .85rem; height: .85rem; }
+.wt-dashboard-host-group {
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .9rem;
+  background: color-mix(in srgb, var(--wt-surface-muted) 45%, transparent);
+  padding: .8rem;
+}
+.wt-host-summary-pill {
+  min-width: 0;
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .65rem;
+  background: color-mix(in srgb, var(--wt-surface-muted) 76%, transparent);
+  padding: .55rem .65rem;
+}
+:root[data-theme="light"] .wt-dashboard-host-group { background: #fbfcfe; }
+:root[data-theme="light"] .wt-host-summary-pill { background: #f8fafc; }
+.wt-chain-member select,
+.wt-chain-member input {
+  border-color: var(--wt-border) !important;
+  background: var(--wt-input) !important;
+  color: var(--wt-text) !important;
+}
+
+/* V0.9.1 dashboard cleanup progress -------------------------------------- */
+.wt-host-action-tile.has-progress {
+  align-items: flex-start;
+  min-height: 104px;
+}
+.wt-cleanup-progress {
+  margin-top: .55rem;
+  width: 100%;
+  min-width: 0;
+  border-top: 1px solid var(--wt-border-soft);
+  padding-top: .5rem;
+}
+.wt-cleanup-progress .wt-op-track {
+  margin-top: .32rem;
+}
+.wt-cleanup-progress.is-done .wt-op-bar { background: #10b981; }
+.wt-cleanup-progress.is-failed .wt-op-bar { background: #ef4444; }
+.wt-cleanup-progress.is-done .wt-op-bar::after,
+.wt-cleanup-progress.is-failed .wt-op-bar::after { display: none; }

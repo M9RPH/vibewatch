@@ -78,19 +78,45 @@ func (c *Client) request(ctx context.Context, method, rawURL, token string, dst 
 	return body, nil
 }
 func (c *Client) WaitReady(ctx context.Context, base string) error {
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/readyz", nil)
+	return c.WaitReadyFor(ctx, base, 30*time.Second)
+}
+
+func (c *Client) WaitReadyFor(ctx context.Context, base string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var lastErr error
+	for {
+		if err := waitCtx.Err(); err != nil {
+			if lastErr != nil {
+				return fmt.Errorf("vibewatch worker did not become ready within %s: %v", timeout, lastErr)
+			}
+			return fmt.Errorf("vibewatch worker did not become ready within %s: %w", timeout, err)
+		}
+		probeCtx, probeCancel := context.WithTimeout(waitCtx, 5*time.Second)
+		req, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, base+"/readyz", nil)
 		resp, err := c.HTTP.Do(req)
+		probeCancel()
 		if err == nil {
 			_ = resp.Body.Close()
-			if resp.StatusCode == 200 {
+			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
+			lastErr = fmt.Errorf("readyz returned HTTP %d", resp.StatusCode)
+		} else {
+			lastErr = err
 		}
-		time.Sleep(750 * time.Millisecond)
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-waitCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
 	}
-	return fmt.Errorf("vibewatch worker did not become ready")
 }
 func (c *Client) Check(ctx context.Context, base, token, container string) (CheckResponse, []byte, error) {
 	u := base + "/v1/check"

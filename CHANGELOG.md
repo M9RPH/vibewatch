@@ -1,5 +1,116 @@
 # Changelog
 
+## 0.9.1
+
+- Added persistent asynchronous Dashboard cleanup jobs for Images, anonymous Volumes, Networks and Build Cache. Cleanup is no longer tied to the browser/reverse-proxy request lifecycle, so a long-running remote/VPN cleanup continues server-side even when the initiating HTTP connection closes.
+- Added granular cleanup progress stages and per-object counters to Dashboard cleanup tiles. Image, anonymous-volume and network cleanup report inventory/removal/refresh progress; build-cache cleanup reports measurement, prune and refresh stages through the existing Job progress stream. Active cleanup progress is recovered after a page refresh from persistent queued/running Jobs.
+- Hardened cleanup for remote Docker endpoints with a 30-minute background job budget, longer bounded inventory/object timeouts for TCP/VPN hosts, and per-object failure isolation so one slow image/volume/network operation does not cancel the remaining cleanup list.
+- Preserved cleanup API compatibility: Dashboard uses the new `async=1` mode, while legacy callers may still wait for the historical `{job_id,result}` response; disconnecting a legacy request no longer cancels the underlying cleanup.
+- Fixed the NAS2/VPN failure pattern from the support bundle where a large image cleanup was cancelled after roughly 90 seconds by the HTTP request context, causing all remaining `docker image rm` calls and the final `docker info` refresh to fail with `context canceled`.
+- Reworked the desktop Sidebar into a flex layout with a scrollable navigation region and non-overlaying controller/worker/user footer. On shorter screen heights the menu scrolls instead of being covered by the status box.
+- Added cleanup progress/remote-timeout regression coverage. No SQLite schema migration is required.
+
+## 0.9.0
+
+- Added durable per-update transactions with an explicit persisted state machine (`queued → preflight → snapshot → restore_point → prepared → updating → docker_health → dependencies → verifying → refreshing → success`, plus rollback/recovery states). Jobs expose the current transaction stage and transaction history is retained independently from transient in-memory workers.
+- Added controller crash recovery for interrupted update transactions. Pre-mutation interruptions are safely aborted; post-mutation interruptions reconcile the live runtime, network-namespace dependents and Custom Verification before either keeping the healthy updated runtime or invoking the existing full Restore Point rollback engine. Persisted leases owned by the interrupted job are reclaimed safely on startup.
+- Added hierarchical persistent operation leases. Container update/rollback/chain lifecycle operations can run independently across containers, while host-scoped image/volume/network/build-cache cleanup is mutually exclusive with every container mutation on that host. Manual rollback is also blocked while an Update Chain reserves the target.
+- Added Restore Point integrity validation for the retained Config Snapshot, writable-layer image, dependency snapshots, named volumes and custom networks. Integrity is checked immediately before full rollback and periodically by Recovery GC; degraded/expired points are blocked before destructive work.
+- Added central Recovery GC with six-hour scheduled reconciliation and manual Admin/Owner execution. It applies existing snapshot retention, validates Restore Points, heals eligible recovered points, expires broken snapshot relationships, prunes old reliability history and removes only orphaned Vibewatch-owned `vibewatch-restore/host-*` images.
+- Added Recovery Storage/Integrity visibility to Container Rollback, including protected image/volume/network counts, last GC result, per-Restore-Point integrity state and a manual `Run recovery GC` action.
+- Enriched Update Preflight diagnostics with source, per-check duration metadata and explicit blocking classification. Critical transaction-state persistence failures now block an update before the running container can be mutated.
+- Added durable Verification History (latest 5,000 runs) with trigger, transaction link, total duration and per-check timings; the Containers verification editor now shows the ten latest runs.
+- Added Update Transaction visibility to Jobs so an update job exposes its durable pipeline state and recovery action instead of only its coarse queued/running/success state.
+- Added a Docker integration test lab: `make test-integration` exercises health warm-up and the stale `container:<id>` namespace/recreate regression against a real Docker daemon; optional `sudo make test-netem` creates isolated network namespaces with ~50 ms RTT and configurable packet loss using `tc netem`.
+- Added SQLite migration tables `update_transactions`, `update_transaction_events`, `operation_leases`, `verification_history` and `recovery_gc_runs`, plus Restore Point integrity columns. Existing V0.8.5 data migrates additively without mandatory reconfiguration.
+
+## 0.8.5
+
+- Unified the Update Chain member surfaces with the shared light/dark design tokens so detected stack members, order badges and member controls no longer render as inconsistent grey blocks in Light Mode.
+- Added explicit deletion for `Archived only` Container Configs. Deleting an archived config removes its retained snapshots, expires linked Restore Points/object protection, and refuses deletion while a snapshot is pinned by another retained dependency rollback transaction.
+- Reworked Dashboard host presentation into compact expandable host cards. Collapsed cards show the essential Docker/container/worker snapshot; expanded cards retain the existing full runtime, storage, inventory and cleanup controls.
+- Grouped Dashboard hosts by their exact Host Group membership without aggregating or mixing per-host metrics. Hosts with multiple group memberships are shown once under that combined membership; ungrouped hosts remain in their own section.
+- Added restrained Dashboard icons to overview, attention, host, inventory and cleanup headings for quicker visual scanning.
+- Moved `Host groups` from the Hosts page right-side setup column into the main left workspace directly below configured Docker hosts. SSH Quick Setup, Add Docker Host and Create Host Group remain in the right-side tools column.
+- Made post-update Docker Health verification tolerant of slow application warm-up. A transient `unhealthy` result is polled through a bounded grace window (minimum 45 seconds, derived from Docker health start-period/interval/timeout, capped at 2 minutes); only persistent unhealthy state after that window triggers the existing rollback path. Stopped/dead/restarting states remain immediately critical.
+- No SQLite schema migration is required.
+
+## 0.8.4.2
+
+- Chain hotfix: each step can now choose `Skip`, `Restart` or `Recreate` when that member is already current. The lifecycle action is only eligible when the same chain run has at least one actionable image update; a completely current/snoozed chain remains a true no-op with no restart/recreate and no Pushover completion message.
+- `Recreate if current` uses the existing Config Snapshot, full Restore Point, Network Namespace dependency rebinding, Docker Health and Custom Verification paths. If the recreate fails, Vibewatch restores the original container; retained recreate Restore Points also participate in `Rollback completed members`.
+- Added additive `update_chain_steps.current_action` migration with backwards-compatible `skip` default for all existing chains.
+- Tightened the Create Update Chain layout with a bounded form width so the editor no longer stretches across the entire page after the vertical page layout hotfix.
+- UI hotfix: reordered Update Chains vertically as `Create update chain` → `Configured chains` → `Chain history`, reordered the sidebar to the operational flow Dashboard → Hosts → Containers → Container Configs → Container Rollback → Update Chains → Automation → Jobs → History → Logs → Users → Settings, and corrected visible web UI version labels to V0.8.4.2.
+- Added Stack-scoped Update Chains that use the Docker Compose stack already detected by Vibewatch as the membership source. Selecting a stack imports all current non-system stack members while keeping update order and per-step waits explicitly user controlled.
+- Added `Sync stack` and fail-closed live-membership validation. A Stack Chain cannot run when services were added/removed since its last sync; the same host/stack cannot be owned by multiple Stack Chains.
+- Added chain-level `Manual`, `Auto Update` and `Excluded` policy ownership for Stack Chains. The Containers page displays this effective stack policy and removes individual member policy editing while a stack is chain-managed.
+- Blocked direct individual updates for Stack Chain members in both UI and backend so an ordered stack update cannot be bypassed. Per-container verification, release source, snooze, history and rollback remain available; checks remain available unless the stack policy is Excluded.
+- Integrated stack policy ownership into existing scheduled policy runs without adding another scheduler: Auto Stack Chains execute in configured order through their bound Automation, while bound Manual/Excluded stacks can refresh update information/read-only registry state. Normal policy scans never fall back to unordered Auto updates for chain-owned stack members.
+- Preserved existing V0.8.4/V0.8.4.1 free-form chains as `Custom Chain` definitions with inherited legacy per-container policy behavior.
+- Added additive SQLite migration columns `scope_type`, `scope_key` and `policy_mode` on `update_chains`, including legacy migration/regression coverage.
+
+## 0.8.4.1
+
+- Moved low-level Job History out of History into a dedicated Jobs page. History now focuses on update/rollback transactions and their Preflight/Verification/dependency results.
+- Added atomic queued-job cancellation. Only jobs still in `queued` can be cancelled; running Docker operations remain intentionally non-interruptible for transaction safety. Queue/goroutine consumers atomically claim work so a cancelled request cannot later be resurrected.
+- Added Cancel controls for queued jobs on the Jobs page and directly in the Containers per-row progress panel for queued manual checks, updates and rollbacks. Durable queued jobs are mirrored back into the Containers row after a page refresh.
+- Added `cancelled` as a terminal job state for job-status polling and Update Chain waiting. Cancelling a queued chain master marks the run cancelled and releases reservations; a cancelled child update stops/fails the step under the existing chain safety rules.
+- Expanded the V0.8.4 per-container progress stream with granular Preflight stages for host/dependency inspection, health/verification configuration, registry/architecture, storage, volumes/bind mounts/recovery, Config Snapshot, Restore Point and the final Preflight decision before the existing update/health/verification stages.
+- Added regression coverage for atomic queued-job cancellation/claiming and cancelled terminal progress.
+- No SQLite schema migration; existing V0.8.4 data remains compatible.
+
+## 0.8.4
+
+- Added one shared update safety pipeline used by manual updates, Auto Update policies and Update Chains: preflight, recovery preparation, Watchtower update, Docker Health/runtime verification, custom application verification and the existing rollback path.
+- Added reusable Update Preflight with Green/Warning/Blocked checks for registry manifest availability, target architecture, current container state, recovery readiness, network-namespace dependencies, Docker Healthcheck/custom verification coverage, named volumes, bind mounts, disk-space visibility and major-version metadata. Red conditions block both manual and automatic updates; manual preview uses the same engine without creating recovery artifacts.
+- Added container- and Compose-stack Custom Verification profiles with HTTP/HTTPS/TCP checks, expected HTTP status/content, start delay, retry count/interval and multiple combined checks. Verification state is stored as `Verified`, `Failed`, `Not configured` or pending/running, recorded in Update History/Audit and can trigger existing notifications.
+- Routed failed post-update custom verification through the existing automatic Restore Point rollback implementation; full rollback now also performs post-rollback custom verification after Docker Health and reports a degraded/failed rollback if functional verification still fails.
+- Added **Update Chains / Service Groups** with explicit per-host ordering, per-step wait, stop-on-failure, optional reverse rollback of previously successful members, manual Run Now, optional binding to an existing Automation policy run, chain/run history and policy enforcement. Each step uses the normal container check/update job and does not bypass the central update engine.
+- Added chain-member reservation so a running chain cannot race manual checks/updates or the normal Auto Update scanner. Critical preflight/verification/rollback/dependency failures always stop a chain even when ordinary step failures are configured to continue. Interrupted chain runs are marked failed on controller restart rather than automatically resumed.
+- Extended Update History with durable preflight/verification fields and added additive SQLite tables for verification profiles/state plus chain definitions, ordered steps, runs and run-step history. Existing V0.8.3.2 installations migrate in place with no mandatory user reconfiguration.
+- Added Containers UI for preflight preview, per-container verification state and verification-profile editing, plus a manager-only Update Chains page with robust up/down ordering controls, Run Now and chain history.
+- Extended support bundles with chain/run data and sanitized verification profile/state metadata without exposing configured URLs or expected response content.
+- Added regression tests for HTTP/TCP verification, verification validation, v0.8.3.2 schema migration/preservation, verification persistence, chain persistence/order validation and interrupted-chain recovery.
+- Extended legacy Docker-event database corruption recovery to preserve the new V0.8.4 verification/chain tables and copy only schema columns common to the damaged source and current destination, keeping pre-V0.8.4 databases recoverable before additive migrations run.
+
+## 0.8.3.2
+
+- Made Container Config discovery remote/VPN consistent: per-host API reads use endpoint-aware deadlines, the browser merges hosts incrementally, cached/live rows are preserved when one host fails, and archived snapshots are loaded independently.
+- Increased pre-update recovery snapshot timeouts to 3 minutes for remote Docker endpoints and manual config snapshots to 4 minutes; dependent recovery snapshots use the same remote-aware policy.
+- Batched Network Namespace candidate container inspection before updates, reducing Docker CLI round-trips across higher-latency links while retaining fail-closed safety.
+- Added generous host-aware total rollback deadlines and bounded safety recovery/image cleanup contexts so broken VPN/TCP links cannot leave rollback Docker operations unbounded.
+- Changed Application log presentation to newest-first and explicitly keeps Audit newest-first. Audit persistence is now bounded to the latest 5,000 entries; Docker Events and Pushover already retain 5,000 each. Application log files remain size-rotated (25 MiB plus five backups).
+- Dashboard Containers summary now includes offline/non-running count.
+- Restyled the Containers digest explanation as a blue Info notice, narrowed the Container Configs table to match other views, and added a GitHub sidebar link for `M9RPH/vibewatch` below Discord.
+- No SQLite schema migration; V0.8.3.1 data remains compatible.
+
+## 0.8.3.1
+
+- Made configured Docker-host reachability asynchronous and cached. `/api/hosts` now returns immediately from the most recent probe state and schedules bounded background probes instead of synchronously waiting for every endpoint.
+- Added retry-aware remote Docker probing: non-unix endpoints receive three bounded attempts; Docker CLI processes canceled by context now report `context deadline exceeded` instead of opaque `signal: killed` errors.
+- Added remote-aware request budgets for container inventories, Dashboard overviews, volumes and networks while preserving the V0.8.3 stale-while-refresh browser behavior.
+- Increased remote Watchtower worker readiness tolerance to four minutes and made individual `/readyz` probes bounded, preventing slow worker initialization across VPN links from being classified as failed after only 30 seconds.
+- Added controller-start recovery for jobs stranded in `queued`/`running` by a previous restart/interruption, and bounded asynchronous manual check jobs so they cannot remain active indefinitely.
+- Extended browser-side job monitoring for remote checks and long update/rollback operations so the UI does not time out before the backend/worker timeout budget is exhausted.
+- Added context-aware exponential reconnect backoff for Docker event streams after remote TCP/VPN interruptions. Event-stream loss remains independent from Docker-host availability.
+- Host UI now distinguishes `Checking Docker`/`Refreshing` from confirmed `Docker unreachable`, retains the last successful Docker-contact timestamp, and Dashboard inventory attempts are no longer suppressed solely by a transient reachability probe failure.
+- Added regression tests for remote Docker ping retries, timeout error normalization and slow worker readiness.
+- Fixed version propagation so Docker Compose, the runtime binary, OCI image label, web package and visible UI all report V0.8.3.1 instead of retaining the old V0.8.0 build tag/runtime constant. The Go binary version is now injected from the repository `VERSION` file during Docker builds.
+- No SQLite schema migration; V0.8.3 data remains compatible.
+
+## 0.8.3
+
+- Hotfix: corrected the Dashboard per-host refresh state updater so `HostRefreshState.loading` is always present when an overview request fails; this fixes the TypeScript `TS2345` error during `npm run build`/Docker Compose builds.
+- Reworked Container/Dashboard refresh behavior for high-latency remote/VPN Docker hosts: per-host inventory refreshes are incremental, stale-while-refresh, in-flight de-duplicated and short-term throttled instead of rebuilding all host data only after the slowest host completes.
+- Manual `Check all on host` / `Check all · all hosts` now dispatches individual asynchronous container check jobs with per-container progress/stage in the existing table rows. Hosts run independently with at most two concurrent checks per host; the top bulk banner is summary-only.
+- Changed Watchtower worker readiness locking from one global lock to per-host locks so a slow remote worker cannot block unrelated hosts. Scheduled host policy scans now also use bounded two-container concurrency per host.
+- Batched container image metadata inspection and cached local image labels/platform data, removing the first-load image-inspect-per-container pattern on remote hosts.
+- Batched Docker network inspection, avoided redundant Docker info calls, and collapsed image/build-cache `docker system df` collection into one call per overview. Dashboard overview no longer inventories images a second time solely for rollback-protection counters.
+- Dashboard host overview, volume and network calls are started in parallel and each host card updates independently. Last successful Dashboard values remain available across page navigation and are labeled `Refreshing` / `Cached data` on slow or failed refreshes.
+- Added a 25-second bound to container inventory requests so a broken remote endpoint cannot hold a browser request indefinitely.
+- No database migration; V0.8.2.1 data remains compatible.
+
 ## 0.8.2.1
 
 - Cosmetic consistency pass across all table-based views: table headers now align with their underlying cell content instead of inheriting the browser's centered `th` default; explicitly right-aligned action columns remain right aligned.

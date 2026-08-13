@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/watchtower-ui/watchtower-ui/internal/db"
@@ -62,31 +63,33 @@ type snapshotInfo struct {
 	Note                 string   `json:"note"`
 }
 
+type inspectHealthcheck struct {
+	Test        []string `json:"Test"`
+	Interval    int64    `json:"Interval"`
+	Timeout     int64    `json:"Timeout"`
+	StartPeriod int64    `json:"StartPeriod"`
+	Retries     int      `json:"Retries"`
+}
+
 type inspectContainer struct {
 	ID     string `json:"Id"`
 	Name   string `json:"Name"`
 	Config struct {
-		Hostname    string            `json:"Hostname"`
-		Domainname  string            `json:"Domainname"`
-		User        string            `json:"User"`
-		Tty         bool              `json:"Tty"`
-		OpenStdin   bool              `json:"OpenStdin"`
-		StdinOnce   bool              `json:"StdinOnce"`
-		Env         []string          `json:"Env"`
-		Cmd         []string          `json:"Cmd"`
-		Entrypoint  []string          `json:"Entrypoint"`
-		Image       string            `json:"Image"`
-		Labels      map[string]string `json:"Labels"`
-		WorkingDir  string            `json:"WorkingDir"`
-		StopSignal  string            `json:"StopSignal"`
-		StopTimeout *int              `json:"StopTimeout"`
-		Healthcheck *struct {
-			Test        []string `json:"Test"`
-			Interval    int64    `json:"Interval"`
-			Timeout     int64    `json:"Timeout"`
-			StartPeriod int64    `json:"StartPeriod"`
-			Retries     int      `json:"Retries"`
-		} `json:"Healthcheck"`
+		Hostname    string              `json:"Hostname"`
+		Domainname  string              `json:"Domainname"`
+		User        string              `json:"User"`
+		Tty         bool                `json:"Tty"`
+		OpenStdin   bool                `json:"OpenStdin"`
+		StdinOnce   bool                `json:"StdinOnce"`
+		Env         []string            `json:"Env"`
+		Cmd         []string            `json:"Cmd"`
+		Entrypoint  []string            `json:"Entrypoint"`
+		Image       string              `json:"Image"`
+		Labels      map[string]string   `json:"Labels"`
+		WorkingDir  string              `json:"WorkingDir"`
+		StopSignal  string              `json:"StopSignal"`
+		StopTimeout *int                `json:"StopTimeout"`
+		Healthcheck *inspectHealthcheck `json:"Healthcheck"`
 	} `json:"Config"`
 	HostConfig struct {
 		RestartPolicy struct {
@@ -222,35 +225,108 @@ func (a *App) discoverContainerBackupUnits(ctx context.Context) ([]ContainerBack
 	if err != nil {
 		return nil, err
 	}
+	units, err := a.discoverContainerBackupUnitsForHosts(ctx, hosts)
+	if err != nil {
+		return nil, err
+	}
+	// Preserve the original all-host behavior: archived configs remain visible
+	// even when their former host was removed or disabled. Per-host discovery
+	// intentionally filters archives to that host, while the aggregate view and
+	// support bundle must retain orphaned recovery artifacts.
+	archived, _ := a.scanArchivedBackupUnits()
+	byID := make(map[string]ContainerBackupUnit, len(units)+len(archived))
+	for _, u := range units {
+		byID[fmt.Sprintf("%d:%s:%s", u.HostID, u.Kind, u.Key)] = u
+	}
+	for _, u := range archived {
+		id := fmt.Sprintf("%d:%s:%s", u.HostID, u.Kind, u.Key)
+		if existing, ok := byID[id]; ok {
+			if len(existing.Snapshots) == 0 {
+				existing.Snapshots = u.Snapshots
+				byID[id] = existing
+			}
+			continue
+		}
+		byID[id] = u
+	}
+	merged := make([]ContainerBackupUnit, 0, len(byID))
+	for _, u := range byID {
+		merged = append(merged, u)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].HostName != merged[j].HostName {
+			return merged[i].HostName < merged[j].HostName
+		}
+		if merged[i].Kind != merged[j].Kind {
+			return merged[i].Kind < merged[j].Kind
+		}
+		return merged[i].Name < merged[j].Name
+	})
+	return merged, nil
+}
+
+// discoverContainerBackupUnitsForHosts inventories hosts independently. Docker
+// calls are bounded per endpoint so a high-latency VPN host cannot serialize or
+// indefinitely block configuration discovery for faster hosts.
+func (a *App) discoverContainerBackupUnitsForHosts(ctx context.Context, hosts []db.Host) ([]ContainerBackupUnit, error) {
 	units := map[string]*ContainerBackupUnit{}
+	selectedHosts := map[int64]bool{}
+	hostErrors := []error{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, h := range hosts {
 		if !bool(h.Enabled) {
 			continue
 		}
-		cs, err := a.Docker.ListContainers(ctx, h.Endpoint)
-		if err != nil {
-			a.Logger.Warn("container backup discovery skipped unreachable host", "host_id", h.ID, "host", h.Name, "error", err)
-			continue
-		}
-		for _, c := range cs {
-			if managed, _ := a.systemManagedContainer(c.Name); managed {
-				continue
+		selectedHosts[h.ID] = true
+		h := h
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hostCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 35*time.Second, 2*time.Minute))
+			defer cancel()
+			cs, err := a.Docker.ListContainers(hostCtx, h.Endpoint)
+			if err != nil {
+				a.Logger.Warn("container config discovery skipped unreachable host", "host_id", h.ID, "host", h.Name, "error", err)
+				mu.Lock()
+				hostErrors = append(hostErrors, fmt.Errorf("%s: %w", h.Name, err))
+				mu.Unlock()
+				return
 			}
-			kind, key, name, stackType := backupUnitFromContainer(c)
-			id := fmt.Sprintf("%d:%s:%s", h.ID, kind, key)
-			u := units[id]
-			if u == nil {
-				u = &ContainerBackupUnit{HostID: h.ID, HostName: h.Name, Kind: kind, Key: key, Name: name, StackType: stackType, Live: true, Containers: []string{}, Snapshots: []ContainerBackupSnapshot{}}
+			local := map[string]*ContainerBackupUnit{}
+			for _, c := range cs {
+				if managed, _ := a.systemManagedContainer(c.Name); managed {
+					continue
+				}
+				kind, key, name, stackType := backupUnitFromContainer(c)
+				id := fmt.Sprintf("%d:%s:%s", h.ID, kind, key)
+				u := local[id]
+				if u == nil {
+					u = &ContainerBackupUnit{HostID: h.ID, HostName: h.Name, Kind: kind, Key: key, Name: name, StackType: stackType, Live: true, Containers: []string{}, Snapshots: []ContainerBackupSnapshot{}}
+					local[id] = u
+				}
+				if !containsString(u.Containers, c.Name) {
+					u.Containers = append(u.Containers, c.Name)
+				}
+			}
+			mu.Lock()
+			for id, u := range local {
 				units[id] = u
 			}
-			if !containsString(u.Containers, c.Name) {
-				u.Containers = append(u.Containers, c.Name)
-			}
-		}
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
+	if len(hosts) == 1 && len(hostErrors) > 0 {
+		return nil, hostErrors[0]
+	}
+
 	// Also surface archived snapshots for services/stacks that no longer exist.
 	archived, _ := a.scanArchivedBackupUnits()
 	for _, au := range archived {
+		if len(selectedHosts) > 0 && !selectedHosts[au.HostID] {
+			continue
+		}
 		id := fmt.Sprintf("%d:%s:%s", au.HostID, au.Kind, au.Key)
 		if live := units[id]; live != nil {
 			live.Snapshots = au.Snapshots
@@ -1231,12 +1307,115 @@ func (a *App) handleContainerBackups(w http.ResponseWriter, r *http.Request) {
 	if !a.requireAdmin(w, r) {
 		return
 	}
+	if r.URL.Query().Get("archived_only") == "1" {
+		units, err := a.scanArchivedBackupUnits()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"retention": a.containerSnapshotRetention(r.Context()), "units": units, "backup_root": a.containerBackupRoot()})
+		return
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("host_id")); raw != "" {
+		hostID, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || hostID <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid host_id")
+			return
+		}
+		if !a.hostAllowed(r, hostID) {
+			writeErr(w, http.StatusForbidden, "host access denied")
+			return
+		}
+		h, err := a.Store.Host(r.Context(), hostID)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		units, err := a.discoverContainerBackupUnitsForHosts(r.Context(), []db.Host{h})
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"retention": a.containerSnapshotRetention(r.Context()), "units": units, "backup_root": a.containerBackupRoot()})
+		return
+	}
 	units, err := a.discoverContainerBackupUnits(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"retention": a.containerSnapshotRetention(r.Context()), "units": units, "backup_root": a.containerBackupRoot()})
+}
+
+func (a *App) handleContainerBackupArchivedDelete(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAdmin(w, r) {
+		return
+	}
+	hostID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("host_id")), 10, 64)
+	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if err != nil || hostID <= 0 || (kind != "stack" && kind != "service") || key == "" {
+		writeErr(w, http.StatusBadRequest, "valid host_id, kind and key are required")
+		return
+	}
+	// Archived snapshots can outlive a deleted host. Enforce the normal host
+	// permission when the host still exists; orphaned archived artifacts remain
+	// manageable by Admin/Owner rather than becoming undeletable forever.
+	if _, hostErr := a.Store.Host(r.Context(), hostID); hostErr == nil && !a.hostAllowed(r, hostID) {
+		writeErr(w, http.StatusForbidden, "host access denied")
+		return
+	}
+	dir := a.backupUnitDir(hostID, kind, key)
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		writeErr(w, http.StatusNotFound, "archived container config not found")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	type candidate struct {
+		path       string
+		snapshotID string
+		info       snapshotInfo
+	}
+	candidates := []candidate{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".zip") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		info, _, infoErr := readSnapshotInfo(path)
+		if infoErr != nil || info.HostID != hostID || info.UnitKind != kind || info.UnitKey != key {
+			continue
+		}
+		snapshotID := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		if a.dependencySnapshotPinned(r.Context(), hostID, snapshotID) {
+			writeErr(w, http.StatusConflict, fmt.Sprintf("snapshot %s is still pinned by a retained rollback transaction", snapshotID))
+			return
+		}
+		candidates = append(candidates, candidate{path: path, snapshotID: snapshotID, info: info})
+	}
+	if len(candidates) == 0 {
+		writeErr(w, http.StatusNotFound, "no archived snapshots found for this config")
+		return
+	}
+	removed := 0
+	for _, c := range candidates {
+		if err := os.Remove(c.path); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Sprintf("remove %s: %v", filepath.Base(c.path), err))
+			return
+		}
+		removed++
+		// Expiring the linked restore point also releases its retained restore
+		// image/object protection. This keeps Container Configs and Container
+		// Rollback consistent after an explicit archive deletion.
+		a.expireRestorePointsForSnapshot(context.Background(), hostID, c.snapshotID)
+	}
+	_ = os.Remove(dir) // remove the now-empty unit directory when possible
+	_ = a.Store.Audit(r.Context(), a.actor(r), "container-config.archive.delete", hostID, "", fmt.Sprintf("%s:%s snapshots=%d", kind, key, removed))
+	writeJSON(w, http.StatusOK, map[string]any{"removed_snapshots": removed, "host_id": hostID, "kind": kind, "key": key})
 }
 
 func (a *App) handleContainerBackupSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -1256,7 +1435,12 @@ func (a *App) handleContainerBackupSnapshot(w http.ResponseWriter, r *http.Reque
 		writeErr(w, http.StatusForbidden, "host access denied")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	h, err := a.Store.Host(r.Context(), in.HostID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), dockerOperationTimeout(h.Endpoint, 90*time.Second, 4*time.Minute))
 	defer cancel()
 	snap, err := a.createContainerSnapshot(ctx, in.HostID, in.Kind, in.Key, "manual")
 	if err != nil {

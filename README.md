@@ -1,6 +1,98 @@
-# Vibewatch V0.8.2.1
+# Vibewatch V0.9.1
 
 A central multi-host Docker update controller using the Nicholas Fedor Watchtower fork as an intentionally passive update worker.
+
+## V0.9.1 cleanup reliability
+
+V0.9.1 keeps the V0.9 transactional update/recovery architecture and hardens host-wide Docker cleanup, especially across remote/VPN Docker endpoints.
+
+- **Visible cleanup progress:** Images, anonymous Volumes, Networks and Build Cache now run as persistent Jobs and display stage/percentage progress directly inside their Dashboard cleanup tile.
+- **Request-independent cleanup:** the browser starts a cleanup and then polls Job status; reverse-proxy/browser timeouts can no longer cancel the Docker operation. This specifically fixes the observed NAS2 cleanup cancellation after about 90 seconds.
+- **Remote cleanup budgets:** TCP/VPN hosts receive longer bounded inventory and per-object cleanup windows while LAN/local hosts keep shorter limits. A failed individual image/volume/network removal is isolated and the remaining eligible objects continue.
+- **Reload-safe UX:** queued/running cleanup Jobs are rediscovered from the existing Jobs store after a page refresh and progress continues to be shown.
+- **Short-screen Sidebar:** the controller/worker/user status panel no longer overlays navigation items; the menu becomes independently scrollable when vertical space is limited.
+- **No DB migration:** V0.9.1 uses the existing Job/Job Log/lease schema from V0.9.0.
+
+### Upgrade to V0.9.1
+
+Copy the existing complete **`data/` directory** and `.env` into the V0.9.1 project directory and rebuild normally. No manual reconfiguration or schema migration is required.
+
+## V0.9.0 reliability release
+
+V0.9.0 deliberately focuses on making the existing Update/Preflight/Verification/Restore/Chain engine more transactional and recoverable rather than adding another updater path.
+
+- **Durable Update Transactions:** every actual update receives a persistent transaction and state-machine stage linked to its Job, Config Snapshot, Restore Point and target digest. Critical transaction persistence must succeed before Docker mutation begins.
+- **Crash recovery:** after a controller restart Vibewatch reconciles interrupted post-mutation transactions against the real Docker runtime. A healthy updated runtime is preserved; an unhealthy runtime is restored through the existing full Restore Point rollback path. Pre-mutation interruptions are safely aborted.
+- **Hierarchical operation leases:** container mutations and host-wide cleanup cannot race. Unrelated containers remain independently updateable, while cleanup on one host is blocked whenever that host has an active update/rollback/chain lifecycle mutation.
+- **Restore Point integrity:** retained snapshots, restore images, dependency snapshots, volumes and networks are validated before rollback and by periodic Recovery GC. Degraded points are visibly blocked instead of failing halfway through a restore.
+- **Recovery GC:** scheduled every six hours and runnable manually from Container Rollback. It reuses existing retention/protection rules and removes only orphaned Vibewatch-owned restore images.
+- **Richer Preflight diagnostics:** each check exposes its source, approximate duration and whether it is blocking. Transaction-persistence failures are Red/Blocked.
+- **Verification history:** the latest 5,000 verification runs retain trigger, transaction, duration, result/error and detailed per-check timing; the Containers verification dialog shows recent history.
+- **Real Docker regression lab:** `make test-integration` covers health warm-up plus the Gluetun-style stale namespace-ID lifecycle; `sudo make test-netem` optionally validates the fixture across isolated ~50 ms RTT namespaces with configurable loss.
+
+### Upgrade to V0.9.0
+
+Copy the existing complete **`data/` directory** and `.env` into the V0.9.0 project directory and rebuild normally. Startup creates a normal pre-migration SQLite backup before the additive migration. V0.9.0 adds reliability tables for transactions/leases/verification history/Recovery GC and three Restore Point integrity fields; existing V0.8.5 hosts, users, groups, policies, automations, chains, snapshots, Restore Points and history remain in place. No manual reconfiguration is required.
+
+## V0.8.5 highlights
+
+- **Expandable/grouped Dashboard hosts:** host cards start compact, expand to the existing full details, and are grouped by exact Host Group membership without combining host metrics.
+- **Safer Docker Health warm-up:** temporary `unhealthy` states are given a bounded recovery grace window before the existing rollback engine is invoked; hard runtime failures still fail immediately.
+- **Archived Config cleanup:** Admin/Owner can delete `Archived only` Container Configs; linked rollback protection expires consistently and pinned dependency snapshots are protected.
+- **Light Mode consistency:** Update Chain stack-member cards and controls use the common Vibewatch surface/input design tokens in both themes.
+- **Hosts layout:** Host Groups now live under configured Docker hosts in the main workspace.
+- **No DB migration:** V0.8.5 is compatible with the existing V0.8.4.2 SQLite schema.
+
+## V0.8.4.2 highlights
+
+- **Stack-first Update Chains:** an Update Chain can now use a detected Docker Compose stack as its membership source. Selecting a stack imports every currently detected non-system container from that stack; Vibewatch still does **not** infer application dependency order. The user explicitly orders the imported services and can configure per-step waits.
+- **Stack membership safety:** `Sync stack` refreshes a Stack Chain after services are added or removed. Vibewatch validates the live stack membership again before every run and blocks the chain if its saved members no longer match, preventing silent partial-stack updates.
+- **One policy per managed stack:** Stack Chains own `Manual`, `Auto Update` or `Excluded` for the whole stack. Member rows on Containers show the chain-owned policy instead of editable per-container policy controls, eliminating conflicting policy sources.
+- **Ordered-update enforcement:** a direct individual update of a Stack Chain member is blocked so the configured sequence cannot be bypassed. Per-container Check (except Excluded), Verification, release source, Snooze, History and Rollback remain available.
+- **Automation reuse:** Auto stack chains execute in order through their bound existing Automation/Policy Run. Manual and Excluded stack chains can reuse that same schedule for update-information refresh/read-only checks without being independently updated. Normal policy scans never fall back to unordered updates for Auto stack members.
+- **Backward compatibility:** existing V0.8.4/V0.8.4.1 free-form chains migrate as `Custom Chain` with inherited legacy per-container policy behavior. V0.8.4.2 additionally gives every chain step a backwards-compatible `current_action` default of `skip`; existing chain order, history, policies and automations are retained.
+- **Current-member actions:** a step may `Skip`, `Restart` or safely `Recreate` an already-current member, but only when another member in the same run has an actionable update. If the whole chain is current (or only snoozed updates exist), the chain is a silent no-op with no lifecycle changes and no completion Pushover.
+
+## V0.8.4.1 highlights
+
+- **Dedicated Jobs page:** low-level Job History is no longer mixed into Update History. History now stays focused on update/rollback transactions, Preflight and Verification; Jobs provides the execution trail for checks, updates, rollbacks, chains and maintenance work.
+- **Safe queued-job cancellation:** queued jobs can be cancelled before execution from the Jobs page. The transition is atomic in SQLite and queue workers atomically claim work, so a cancelled request cannot later be resurrected. Running Docker mutations remain intentionally non-interruptible.
+- **Cancel queued container operations in place:** queued manual checks, updates and rollbacks expose a Cancel action directly in the per-container progress panel, including after a page refresh while the job is still queued.
+- **Granular Preflight progress:** the update progress bar now exposes host/dependency inspection, health/verification configuration, registry/architecture checks, storage checks, mounts/recovery checks, Config Snapshot creation, Restore Point creation and the final Preflight decision before entering the existing update/health/verification stages.
+- **No schema migration:** V0.8.4.1 reuses the V0.8.4 database schema and is backward-compatible with existing V0.8.4 data.
+
+## V0.8.4 highlights
+
+- **Shared safety pipeline:** manual updates, Auto Update policies and Update Chains all flow through the same `Preflight → Snapshot/Restore Point → Update → Docker Health → Custom Verification → Success/Rollback` engine. Chains call the normal per-container update job instead of implementing a second updater.
+- **Update Preflight:** every update performs a single reusable readiness evaluation covering registry/manifest availability, target architecture, container state, recovery-artifact readiness, Docker network-namespace dependencies, Docker Healthcheck/custom verification coverage, named volumes, bind-mount observability, disk-space visibility and major-version metadata. Red checks block manual and automatic execution; yellow checks remain warnings.
+- **Manual Preflight preview:** the Containers page previews the same preflight engine before a manual update. Preview is side-effect free; the execution pass repeats the safety checks and creates the actual Config Snapshot and Restore Point immediately before mutation.
+- **Custom Verification:** optional container- or Compose-stack verification profiles support HTTP, HTTPS and TCP checks, expected HTTP status/content, start delay, retries and retry intervals. Docker Health remains the first post-start gate; failed custom verification enters the existing automatic rollback path and is persisted in Update History/Audit.
+- **Post-rollback verification:** full Restore Point rollback now also runs the applicable custom verification profile after Docker Health. A rollback that restores the container but fails functional verification is reported as degraded/failed rather than as a false success.
+- **Update Chains / Service Groups:** Admins/Owners can define explicit per-host ordered groups with per-step waits, stop-on-failure, optional rollback of previously completed members and optional binding to an existing Automation policy run. From V0.8.4.2, a detected Docker Compose stack can own the chain membership and a single stack-level Manual/Auto Update/Excluded policy; existing custom chains retain their legacy per-container policy semantics.
+- **Concurrency safety:** an active chain reserves all of its members so manual checks/updates and the normal policy scanner cannot race the transaction. Interrupted controller runs are marked failed on restart instead of being ambiguously resumed.
+- **Durable history:** Update History now records preflight and verification state/details. Chain definitions, steps, runs and run steps as well as verification profiles/states are stored in SQLite and included in the support bundle with sensitive verification details sanitized.
+- **Backward-compatible migration:** V0.8.3.2 installations migrate additively. Existing containers default to `Not configured` verification and existing policies/automations continue without mandatory reconfiguration.
+
+## V0.8.3.2 highlights
+
+- **Remote-consistent Container Configs:** configuration inventories are fetched per host with endpoint-aware timeouts and rendered incrementally. Archived snapshots remain visible while a slow/unreachable VPN host refreshes, and live host data is preserved on failed refreshes.
+- **Remote snapshot budgets:** pre-update snapshots use up to three minutes on TCP/remote hosts, manual snapshots up to four minutes, and dependent-container recovery snapshots inherit the same remote-aware budget.
+- **Batched namespace dependency discovery:** candidate containers are inspected in one Docker call before a parent update instead of one inspect round-trip per container, reducing VPN latency while keeping fail-closed dependency safety.
+- **Bounded rollback operations:** manual/full rollback transactions now have generous host-aware total deadlines and bounded safety-recovery/cleanup contexts so a broken tunnel cannot leave a job running forever.
+- **Log consistency and retention:** Application logs are shown newest-first like Audit/Docker/Pushover. Audit history is now retained to the latest 5,000 events; Docker Events and Pushover already use 5,000-entry retention, while app.log uses 25 MiB rotation with five backups.
+- **Dashboard clarity:** the global Containers card now shows running and offline counts.
+- **UI polish:** the Containers digest explanation is a blue Info notice, Container Configs is narrowed to match the other tables, and the sidebar includes a GitHub link to `M9RPH/vibewatch` below Discord.
+- **No database migration:** V0.8.3.2 remains compatible with the existing V0.8.3.1 data directory.
+
+## V0.8.3 highlights
+
+- **Remote-host tolerant loading:** container inventories refresh independently per host and keep their last successful rows visible while a slow or temporarily unavailable VPN host refreshes. Per-host refreshes are de-duplicated and throttled so the 8-second UI refresh cannot stack overlapping Docker requests.
+- **Granular Check All progress:** `Check all on host` and `Check all · all hosts` now use the same per-container asynchronous check jobs as the single-container Check action. Every queued/running container exposes its own progress bar and stage directly in the table; the bulk banner is only a compact summary.
+- **Hosts no longer block each other:** bulk checks run hosts independently and use a bounded maximum of two concurrent container checks per host. Worker readiness locking is per Docker host instead of global, so a slow VPN worker cannot stall checks on unrelated LAN hosts.
+- **Fewer remote Docker round-trips:** container image labels/platforms are batch-inspected and cached, network inspect is batched, Docker system disk usage is collected once for image/build-cache data, redundant host-info calls are avoided, and the Dashboard fetches overview/volumes/networks in parallel.
+- **Stale-while-refresh Dashboard:** host cards update independently, retain the most recent successful values across Dashboard navigation, and clearly show `Refreshing` / `Cached data` when a new collection is slow or fails.
+- **Automation scan parity:** scheduled host policy scans also use bounded per-host concurrency instead of checking every eligible container strictly one after another.
+- **No database migration:** V0.8.3 is compatible with the V0.8.2.1 data directory and does not change update/rollback persistence formats.
 
 ## V0.8.2.1 highlights
 
@@ -75,7 +167,7 @@ A central multi-host Docker update controller using the Nicholas Fedor Watchtowe
 |---|---|---|---|
 | Manual | Watchtower digest check; never install | Yes | Yes |
 | Auto Update | Watchtower digest check; queue install when changed | Yes | Yes |
-| Excluded | Read-only local/registry digest info only | Direct action blocked; Check All may refresh read-only info | Blocked until policy changes |
+| Excluded | Read-only local/registry digest info only | Direct action blocked; background/scheduled read-only metadata refresh only | Blocked until policy changes |
 
 The Watchtower workers themselves remain passive. V0.8.1 continues to start them with `WATCHTOWER_HTTP_API_PERIODIC_POLLS=false` and `WATCHTOWER_UPDATE_ON_START=false`. Updates are initiated only by Vibewatch manual actions, policy automation, worker maintenance, or the explicit Owner-only application self-update helper.
 
@@ -215,15 +307,33 @@ docker compose up -d --build
 
 Open `http://SERVER:8085` (or `WTUI_PORT`). Login name for the Owner is `admin`. Initially the password is `WTUI_ADMIN_PASSWORD`; after changing it under Users → Managed accounts, the persistent Vibewatch password takes precedence.
 
-### Upgrade to V0.8.2.1
+### Upgrade to V0.8.5
 
-Copy the existing **entire `data/` directory** and `.env` into the V0.8.2.1 project directory, then run:
+Copy the existing **entire `data/` directory** and `.env` into the V0.8.5 project directory and rebuild normally. V0.8.5 does not add a SQLite migration; existing V0.8.4.2 hosts, groups, chains, verification profiles, Restore Points, snapshots, policies, users and history remain compatible.
+
+### Upgrade to V0.8.4.2
+
+Copy the existing **entire `data/` directory** and `.env` into the V0.8.4.2 project directory, then run:
 
 ```bash
 docker compose up -d --build
 ```
 
-V0.8.2.1 is backward-compatible with the V0.8.2/V0.8.1/V0.8.0 data directory (and therefore the earlier supported upgrade chain). No new SQLite migration is required for V0.8.2.1; existing hosts, users, groups, policies, automations, Pushover settings, recovery snapshots, Restore Points, Config Drift baselines and logs remain compatible. Existing pre-V0.8.0 history remains available through the legacy image/config rollback path while V0.8.x updates create full restore points. Keep the entire `/data` directory when upgrading. Once private registry credentials are configured, `/data/registry-credentials.key` is required together with `vibewatch.db`; do not migrate only the database file. Database backups created by Vibewatch also preserve a companion registry-key copy when one exists.
+V0.8.4.2 applies an additive Update Chain migration: `update_chains` receives `scope_type`, `scope_key` and `policy_mode`, and `update_chain_steps` receives `current_action` (`skip` by default). Existing V0.8.4/V0.8.4.1 chains automatically become `Custom Chain` entries with inherited per-container policy behavior; no existing chain steps, chain history, policies or automations are discarded. New stack-scoped chains can instead own a single Manual/Auto Update/Excluded policy for all detected members of that Compose stack. Upgrades coming from V0.8.3.2 or older also receive the V0.8.4 verification/preflight/chain migrations. Keep the complete `/data` directory, including `registry-credentials.key` when private registry credentials are configured.
+
+### Upgrade to V0.8.4.1
+
+V0.8.4.1 used the V0.8.4 SQLite schema. When upgrading through V0.8.4.2 the additive stack-chain columns are applied automatically; no manual migration step is required.
+
+### Upgrade to V0.8.3.2
+
+Copy the existing **entire `data/` directory** and `.env` into the V0.8.3.2 project directory, then run:
+
+```bash
+docker compose up -d --build
+```
+
+V0.8.3.2 is backward-compatible with the V0.8.2.1/V0.8.2/V0.8.1/V0.8.0 data directory (and therefore the earlier supported upgrade chain). No new SQLite migration is required for V0.8.3.2; existing hosts, users, groups, policies, automations, Pushover settings, recovery snapshots, Restore Points, Config Drift baselines and logs remain compatible. Existing pre-V0.8.0 history remains available through the legacy image/config rollback path while V0.8.x updates create full restore points. Keep the entire `/data` directory when upgrading. Once private registry credentials are configured, `/data/registry-credentials.key` is required together with `vibewatch.db`; do not migrate only the database file. Database backups created by Vibewatch also preserve a companion registry-key copy when one exists.
 
 ## Publishing later
 
@@ -233,6 +343,9 @@ The included GitHub Actions workflow builds `linux/amd64` and `linux/arm64` imag
 
 - GitHub patch notes require a detectable/configured GitHub repository; non-GitHub projects can still use registry version information and Watchtower update detection.
 - Full-container rollback is available for Compose/standalone containers only while both the linked recovery snapshot and committed restore image remain retained. Swarm restore points remain configuration-only. Docker volume and bind-mount contents are not copied into the committed restore image, so application/database data migrations still need their own data backup.
-- Automatic rollback reacts only to concrete Docker runtime failure signals after an update: missing/stopped/restarting containers or an explicit `unhealthy` healthcheck. Containers without a healthcheck are observed for a short running-state stability window, but Vibewatch cannot determine whether an otherwise-running application is functionally correct; use manual rollback for that case.
+- Automatic rollback reacts to concrete Docker runtime failure signals (missing/stopped/restarting or a Docker healthcheck that remains `unhealthy` through its bounded post-update grace window) and, when configured, failed V0.8.4 Custom Verification. Containers without a Docker healthcheck still receive a short running-state stability gate. Without a custom verification profile Vibewatch intentionally cannot infer application-level correctness and reports `Not configured`.
 - Network-namespace dependency handling currently covers direct Docker Engine `container:<id>` relationships only. It deliberately does not attempt to infer every possible application, startup-order or data dependency. Recreating a dependent follows normal Docker recreate semantics: mounted volumes/binds persist, while application data written only to that dependent container's writable layer should not be treated as a persistent datastore.
+- Custom HTTP/HTTPS/TCP verification runs from the Vibewatch controller network namespace. Targets must therefore be reachable from the controller; HTTPS uses normal certificate validation and V0.8.4 does not add an insecure-TLS bypass.
+- Remote Docker Engine APIs do not provide a universally reliable way to stat arbitrary host bind paths or the host filesystem's free capacity. Preflight reports those unverifiable remote conditions as explicit warnings rather than false green checks; missing Docker volumes, manifest/platform failures and recovery-preparation failures remain blocking.
+- Update Chains bind optionally to an existing Automation policy run and therefore reuse its cron schedule, host/group target and pause state. V0.8.3.2 had no separate persisted duration-style maintenance-window model, so V0.8.4 does not introduce a parallel maintenance-window subsystem. A controller restart marks an active chain failed instead of attempting an ambiguous automatic resume; retained Restore Points/history remain available for operator recovery.
 - The application self-update path only becomes meaningful once the controller itself is deployed from a registry image rather than a locally built tag.

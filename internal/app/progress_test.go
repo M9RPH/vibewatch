@@ -27,4 +27,8 @@ func TestLatestJobProgressTerminalStatusIsOneHundred(t *testing.T) {
 	if pct != 100 {
 		t.Fatalf("failed should be terminal 100%%, got %d", pct)
 	}
+	pct, stage := latestJobProgress(nil, "cancelled")
+	if pct != 100 || stage != "Cancelled before execution" {
+		t.Fatalf("cancelled should be terminal 100%% with cancellation stage, got %d %q", pct, stage)
+	}
 }

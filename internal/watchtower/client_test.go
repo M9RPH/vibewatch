@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestCheckAllOmitsContainerFilter(t *testing.T) {
@@ -44,5 +46,30 @@ func TestCheckSingleAddsContainerFilter(t *testing.T) {
 	}
 	if got != "paperless web" {
 		t.Fatalf("unexpected container query: %q", got)
+	}
+}
+
+func TestWaitReadyForToleratesSlowWorkerStartup(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/readyz" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := New()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.WaitReadyFor(ctx, srv.URL, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() < 3 {
+		t.Fatalf("expected readiness retries, got %d", calls.Load())
 	}
 }

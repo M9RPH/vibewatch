@@ -66,7 +66,7 @@ func (a *App) handleUpdateHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-func (a *App) recordUpdateHistory(req updateRequest, before dockercli.Container, beforeVersion db.VersionInfo, snapshotID string, restorePointID int64, attemptedDigest string, started time.Time, dependencyCount int, dependencyStatus, dependencyDetails string) {
+func (a *App) recordUpdateHistory(req updateRequest, before dockercli.Container, beforeVersion db.VersionInfo, snapshotID string, restorePointID int64, attemptedDigest string, started time.Time, dependencyCount int, dependencyStatus, dependencyDetails, preflightStatus, preflightDetails, verificationStatus, verificationDetails string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	job, err := a.Store.Job(ctx, req.JobID)
@@ -96,5 +96,5 @@ func (a *App) recordUpdateHistory(req updateRequest, before dockercli.Container,
 	if actor == "" {
 		actor = "system"
 	}
-	_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: req.HostID, ContainerName: req.Container, Action: "update", Trigger: req.Trigger, Actor: actor, Status: job.Status, FromVersion: beforeVersion.Installed, ToVersion: toVersion, FromImageRef: before.Image, ToImageRef: toRef, FromDigest: before.ImageID, ToDigest: toDigest, SnapshotID: snapshotID, RestorePointID: restorePointID, DurationMS: time.Since(started).Milliseconds(), Error: job.Error, DependencyCount: dependencyCount, DependencyStatus: dependencyStatus, DependencyDetails: dependencyDetails})
+	_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: req.HostID, ContainerName: req.Container, Action: "update", Trigger: req.Trigger, Actor: actor, Status: job.Status, FromVersion: beforeVersion.Installed, ToVersion: toVersion, FromImageRef: before.Image, ToImageRef: toRef, FromDigest: before.ImageID, ToDigest: toDigest, SnapshotID: snapshotID, RestorePointID: restorePointID, DurationMS: time.Since(started).Milliseconds(), Error: job.Error, DependencyCount: dependencyCount, DependencyStatus: dependencyStatus, DependencyDetails: dependencyDetails, PreflightStatus: preflightStatus, PreflightDetails: preflightDetails, VerificationStatus: verificationStatus, VerificationDetails: verificationDetails})
 }

@@ -1,0 +1,3 @@
+FROM scratch
+COPY fixture-server /fixture-server
+ENTRYPOINT ["/fixture-server"]

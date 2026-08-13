@@ -26,6 +26,8 @@ import (
 	"github.com/watchtower-ui/watchtower-ui/internal/watchtower"
 )
 
+var version = "dev"
+
 func env(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -146,7 +148,6 @@ func main() {
 	if !authm.Enabled() {
 		logger.Warn("authentication is disabled; set WTUI_ADMIN_PASSWORD before exposing the UI")
 	}
-	const version = "0.8.0"
 	// V0.4.5 migration: Pushover credentials are now fully per-account. If an
 	// older installation had a shared application token, import it once into
 	// the Owner account (reserved user_id 0). It is never inherited by Admins

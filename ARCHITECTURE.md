@@ -1,4 +1,37 @@
-# Vibewatch V0.8.2.1 Architecture
+# Vibewatch V0.9.1 Architecture
+
+## V0.9.1 asynchronous cleanup execution
+
+Dashboard host cleanup reuses the persistent Job and V0.9 hierarchical host lease systems. The HTTP handler creates a queued cleanup Job and starts background execution with a controller-owned context; the Dashboard polls `/api/job-status/<id>` and renders the normal Job progress stream inside the corresponding cleanup tile. The request that initiated cleanup is therefore not the lifetime owner of the Docker operation. Remote TCP/VPN endpoints receive a larger bounded cleanup budget plus bounded inventory/per-object operations. Existing synchronous cleanup API callers remain supported, but a disconnected request does not cancel server-side work.
+
+The desktop Sidebar is a vertical flex layout: Brand, scrollable navigation, then the controller/worker/user/community status footer. The footer consumes layout space rather than absolutely overlaying menu items.
+
+## V0.9.0 reliability architecture
+
+### Durable update transaction state machine
+
+The normal update engine remains the only mutation path. V0.9 wraps that existing pipeline in `update_transactions` rather than introducing a second updater. Each update Job persists its transition through `queued`, `preflight`, `snapshot`, `restore_point`, `prepared`, `updating`, `docker_health`, `dependencies`, `verifying`, `refreshing` and a terminal state. Rollback/recovery states are part of the same transition graph. Snapshot ID, Restore Point ID and target digest are linked to the transaction before mutation. Persistence of the preflight/prepared/destructive transition is safety-critical: failure blocks the Docker update before Watchtower is invoked.
+
+### Crash recovery
+
+On startup, jobs without an active durable update transaction are handled by the existing interrupted-job cleanup. Active transactions are reconciled separately after a short Docker/remote-host settle window. A transaction interrupted before image mutation is safely aborted. A post-mutation transaction reclaims only its own stale persisted lease, validates its Restore Point, verifies the current Docker runtime, repairs persisted Network Namespace dependents if they point at a stale parent, and re-runs Custom Verification. A healthy runtime is kept; otherwise the existing full Restore Point rollback engine is invoked. Unsafe ambiguity is recorded as `recovery_required` instead of guessing.
+
+### Persistent hierarchical leases
+
+`operation_leases` is the central concurrency guard for destructive operations. `container:<host>:<name>` leases serialize update, rollback and Chain restart/recreate for that container. `host:<host>` leases are used by image, volume, network, build-cache and Recovery-GC cleanup. Host and child-container leases conflict hierarchically, so cleanup cannot invalidate an update's recovery graph between Preflight and mutation. Leases heartbeat and expire, and controller crash recovery reclaims only the interrupted transaction's own lease.
+
+### Restore Point integrity and Recovery GC
+
+Restore Points persist `integrity_status`, `integrity_checked_at` and structured `integrity_details`. Validation checks the Config Snapshot, full restore image where required, pinned dependency snapshots, referenced named volumes and custom networks. Full rollback validates again immediately before any destructive action. Scheduled Recovery GC runs approximately every six hours, first applies the existing snapshot retention/pinning logic, validates retained points, expires missing snapshot relationships, heals eligible recovered full points, prunes bounded reliability history, then removes only orphaned images under `vibewatch-restore/host-<id>/`. It never runs host cleanup while a container mutation lease is active.
+
+### Preflight and verification observability
+
+The existing Preflight result now records `source`, `duration_ms` and explicit `blocking` metadata per check. Verification keeps the existing latest-state cache and additionally appends bounded history (5,000 runs) containing trigger, actor, Job/Transaction IDs, total duration, check details and error. This history is diagnostic only and does not create a second monitoring/alerting system.
+
+### Integration reliability lab
+
+`tests/integration` contains a dependency-free HTTP fixture. `make test-integration` requires a disposable Docker daemon and tests warm-up health behavior plus concrete `network_mode=container:<id>` stale-parent/recreate semantics. `sudo make test-netem` is optional Linux/root coverage using isolated network namespaces and `tc netem`; it does not alter the workstation's normal interfaces. These tests complement unit/migration tests and are intended for CI/development rather than production hosts.
+
 
 ## Control plane
 
@@ -35,7 +68,13 @@ Workers run centrally on the controller's Docker daemon. Each worker has a stabl
 
 Workers do not self-update and do not run autonomous update schedules. The controller owns their lifecycle. A worker image maintenance run pulls the configured Watchtower image and, only if the image ID changed, recreates workers sequentially from persisted host records.
 
-The `workerOpMu` read/write lock prevents worker replacement while a check/update is actively using a worker and prevents new worker operations during recreation.
+The `workerOpMu` read/write lock prevents worker replacement while a check/update is actively using a worker and prevents new worker operations during recreation. Worker readiness itself is serialized **per host**. A high-latency or unavailable remote Docker endpoint therefore cannot hold a global worker-start lock and delay unrelated hosts.
+
+## Remote-host collection model
+
+Container inventories are cached in the browser control state and refreshed independently per host. A refresh never clears the last successful rows while a new Docker request is in flight. Per-host in-flight de-duplication and a short freshness window prevent overlapping periodic requests on slow VPN links. Dashboard host overview, volume inventory and network inventory are started in parallel and each host card updates as its own data arrives; the latest successful dashboard values are retained across page navigation within the current browser session.
+
+High-latency Docker CLI round-trips are reduced by batching container/image/network inspect operations and reusing image label/platform metadata caches. Manual bulk checks create individual asynchronous check jobs with bounded concurrency (two checks per host), allowing each container to expose its own progress while different hosts proceed independently. Scheduled policy scans use the same bounded-per-host principle.
 
 ## Policy automation
 
@@ -204,3 +243,76 @@ Retained pre-update snapshots now protect named or anonymous Docker volumes refe
 
 The Dashboard keeps inventory and cleanup actions separate. Inventory counts are loaded per Docker host for Images, Volumes and Networks; fetch failures remain explicit unavailable states rather than zero-value inventories. Cleanup tiles show only eligible objects after rollback/system/in-use protection, plus Docker-reported reclaimable Build Cache.
 
+
+
+## V0.8.3.2 remote consistency
+
+Container Config discovery is host-scoped and parallel/incremental at the UI boundary. Snapshot and rollback operations use endpoint-aware timeout budgets so TCP/VPN hosts receive larger deadlines than local Docker sockets. Network-namespace dependency discovery batches candidate container inspect operations and remains fail-closed if the dependency graph cannot be verified.
+
+Diagnostic retention is bounded: Application logging rotates at 25 MiB with five backups, Audit retains 5,000 events, Docker Events retains 5,000 JSONL records, and Pushover delivery history retains 5,000 records. API views intentionally return smaller recent tails.
+
+## V0.8.4.1 queued-job lifecycle and progress
+
+Queued asynchronous work is now explicitly claimable/cancellable. `CancelQueuedJob` atomically transitions only `queued → cancelled`; `ClaimQueuedJob` atomically transitions only `queued → running`. Queue/goroutine consumers call the shared `beginAsyncJob` gate before Docker mutation, and `StartJob` cannot resurrect a cancelled row. Running jobs are deliberately not cancellable because stopping a Docker update/rollback midway would violate the existing transaction/Restore Point safety model.
+
+The Containers view mirrors a queued job from durable `/api/jobs` state, not only local browser state, so a queued manual operation can still be cancelled after a page refresh. `cancelled` is a terminal job status for progress polling and Update Chain child-job waiting. Cancelling a queued chain master marks its chain run cancelled and releases reservations; cancelling a queued child step is treated as a failed/stopped step under the existing chain safety rules.
+
+The V0.8.4 execution Preflight already participated in the per-container progress stream, but V0.8.4.1 exposes its internal phases rather than one coarse `Running update preflight` message:
+
+`Load host → inspect container/dependencies → health/verification config → registry/architecture → storage → volumes/bind mounts/recovery → Config Snapshot → Restore Point → Preflight decision → update worker → Docker Health → Custom Verification → refresh/success`.
+
+Job History is presented on its own Jobs page; Update History remains the transaction-oriented record for update/rollback, Preflight, Verification and dependency outcomes. No SQLite schema migration is required for V0.8.4.1.
+
+## V0.8.4 shared update safety pipeline
+
+V0.8.4 keeps one authoritative per-container update path. Manual updates, existing Auto Update policy execution and Update Chains all enter the same `executeUpdate` implementation. A chain step does not pull/recreate a container itself: it dispatches the normal check/update job and waits for that job's durable result.
+
+The execution sequence is:
+
+`Request → Preflight → Config Snapshot / Restore Point → Watchtower update → Docker running/Health gate → Network Namespace dependent recreation → Custom Verification → Success`
+
+Any critical execution/verification failure enters the existing Restore Point auto-rollback path rather than a verification-specific rollback implementation. Full rollback restores the parent/dependents using the existing transaction logic, performs Docker Health/runtime verification and then re-runs the effective custom verification profile.
+
+### Update Preflight
+
+`runUpdatePreflight` is shared by preview and execution. Preview evaluates readiness without creating recovery artifacts. The execution pass repeats the checks immediately before mutation and, when no red check exists, creates the retained Config Snapshot/dependency snapshots and Restore Point. This closes the race between a user preview and the real update while keeping preview side-effect free.
+
+Preflight returns individual `green`, `yellow` and `red` checks plus an aggregate `ready`, `ready_with_warnings` or `blocked` status. Registry manifest/platform checks reuse the existing registry subsystem; namespace dependencies reuse the existing Docker inspect dependency model; snapshot/Restore Point creation reuses the established recovery functions. Red blocks are enforced inside `executeUpdate`, so manual and automatic callers cannot bypass them.
+
+For remote Docker endpoints, Docker Engine does not expose a universally reliable free-filesystem-path stat or arbitrary host-path stat API. Vibewatch therefore reports remote free-space/bind-mount observability conservatively as warnings when it cannot verify them from the controller instead of inventing a safe result. Active mounted volumes and Docker's own inventory are still checked.
+
+### Custom Verification
+
+Verification profiles are keyed by host plus scope (`container` or Compose `stack`). A container-specific profile overrides a stack profile. No matching profile is `Not configured` and remains a non-blocking preflight warning for backward compatibility.
+
+Profiles contain start delay, retry count/interval and an ordered JSON check list. Supported checks are HTTP, HTTPS and TCP. HTTP(S) can require an exact status and optional response substring; HTTPS uses normal certificate validation. TCP checks require host/port. Checks execute from the Vibewatch controller, therefore remote application endpoints must be reachable from the controller's network namespace. All configured checks must pass for `Verified`.
+
+Verification start/success/failure is written to jobs and Audit, durable state is stored per container, and Update History captures the aggregate status/details. Failure after a successful container recreation invokes the normal automatic rollback path.
+
+### Update Chains / Service Groups
+
+`update_chains` stores the user-defined transaction and `update_chain_steps` stores unique ordered container members with optional wait seconds. Chain execution is deliberately explicit: Vibewatch does not infer application-level Redis/PostgreSQL/application order. Network Namespace dependencies remain the separate Docker-derived dependency mechanism already used by single-container updates.
+
+V0.8.4.2 adds two chain scopes. Existing free-form definitions remain `custom` chains and keep their legacy per-container policy semantics. A `stack` chain uses the detected Docker Compose `stack_name` as its membership source. Selecting/syncing the stack imports every currently detected non-system member, while the user still owns the order and per-step waits. The live member set is validated again on save and immediately before execution. A changed stack blocks execution until `Sync stack` is performed, avoiding an apparently successful chain that silently omitted a newly added service. The same host/stack may be owned by only one Stack Chain.
+
+A Stack Chain is also the policy owner for that stack. `policy_mode` is `manual`, `auto` or `ignore` (Excluded); member container rows expose this effective chain policy and do not permit individual mode changes while managed. Direct individual updates are rejected server-side so the configured sequence cannot be bypassed. Checks/verification/source metadata/snooze/history/rollback remain container-level operations; an Excluded Stack Chain uses read-only registry discovery rather than update execution. Existing Custom Chains use `policy_mode=inherit` and continue to evaluate their members' stored per-container policies.
+
+Each step performs the existing update check. Already-current/snoozed members are skipped. A required update is dispatched through the normal update queue with a chain trigger and the chain waits for its result. Step waits occur only after successful/skip completion. `stop_on_failure` controls ordinary step failures, but critical safety failures (preflight, verification, rollback/restore or dependency transaction failure) always stop the chain. When `rollback_completed` is enabled, previously successful members are rolled back in reverse order through their existing Restore Points.
+
+Automatic Stack Chain execution is bound by `automation_id` to an existing Automation policy run and requires the chain-level mode `auto`. The chain therefore reuses that run’s timezone-aware cron, host/group target and enabled/paused state instead of introducing another scheduler. Its members are reserved before the ordinary policy scan, and the ordinary scanner deliberately skips Auto stack members rather than falling back to unordered per-container updates if the chain does not run. Bound Manual/Excluded Stack Chains can use the same Automation run to refresh update information without mutating containers. Existing Custom Chains retain the V0.8.4 automation behavior. If the controller restarts during a chain, active run/step rows are marked failed and are not automatically resumed; retained recovery artifacts/history allow an operator to assess/rollback safely.
+
+### V0.8.4 / V0.8.4.2 persistence migration
+
+The SQLite migrations are additive. V0.8.4 adds `verification_profiles`, `verification_state`, `update_chains`, `update_chain_steps`, `update_chain_runs` and `update_chain_run_steps`, plus preflight/verification columns on `update_history`. V0.8.4.2 adds `scope_type`, `scope_key` and `policy_mode` to `update_chains`, plus `current_action` to `update_chain_steps`. Legacy rows default to `custom`, empty scope key and `inherit`, so existing V0.8.4/V0.8.4.1 chains retain per-container policy behavior. Existing policies, users, hosts, backups, Restore Points and history remain readable. Containers without verification configuration resolve to `Not configured`.
+
+### V0.8.4.2 current-member lifecycle actions
+
+Update Chain steps persist `current_action = skip|restart|recreate`. Every chain run first refreshes digest state for **all** members before performing any lifecycle action. If no actionable update exists anywhere in the chain, the run finishes as `no_changes`: no member is restarted/recreated and no chain-completion Pushover notification is sent. If at least one member will actually update, already-current members follow their configured action in chain order. `Restart` preserves stopped containers. `Recreate` captures a normal Config Snapshot plus full Restore Point first, reuses the runtime-reconstruction and Network Namespace dependency logic, verifies Docker/custom health afterwards, and can be restored by `Rollback completed members`. Existing steps migrate to `skip`.
+
+## V0.8.5 dashboard/config/health consistency
+
+Dashboard host cards are presentation-only accordions over the existing per-host cached overview/inventory APIs. Host Group membership changes only the visual grouping: no group totals are substituted for a host and a host with multiple memberships is rendered once under the exact combined membership key. Collapsed cards retain essential host/container/worker state; expansion reveals the pre-V0.8.5 metrics, inventory and cleanup controls.
+
+Archived Container Config deletion is an explicit Admin/Owner operation on a non-live config unit. Its snapshot ZIPs are removed and `expireRestorePointsForSnapshot` is reused so linked Restore Points, restore-image tags and rollback object protection expire atomically. Cross-stack dependency snapshots pinned by another retained restore transaction block deletion rather than silently degrading that rollback.
+
+Post-update Docker health verification distinguishes lifecycle failure from warm-up latency. Stopped/dead/restarting states still fail immediately. `healthy` succeeds immediately. `starting` and transient `unhealthy` are polled through a grace window derived from the container healthcheck (`StartPeriod`, `Interval`, `Timeout`), with a 45-second floor and 2-minute cap. Only an `unhealthy` state that persists to the end of that window enters the existing update failure/automatic rollback path; the health verifier does not implement a separate rollback engine.

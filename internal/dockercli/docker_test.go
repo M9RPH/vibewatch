@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/watchtower-ui/watchtower-ui/internal/db"
 )
@@ -682,5 +683,189 @@ exit 1
 	cache := byName["cache"]
 	if !cache.UsageKnown || cache.RefCount != 0 || cache.InUse || !cache.Unused {
 		t.Fatalf("fallback did not verify unused cache volume: %#v", cache)
+	}
+}
+
+func TestNetworkInventoryBatchesInspectForRemoteHost(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  *"network ls -q --no-trunc"*) printf '%s\n' 'net1' 'net2'; exit 0 ;;
+  *"network inspect net1 net2"*) printf '%s\n' '[{"Id":"net1","Name":"app_default","Driver":"bridge","Scope":"local","Created":"2026-08-12T00:00:00Z","Containers":{"c1":{}}},{"Id":"net2","Name":"unused_net","Driver":"bridge","Scope":"local","Created":"2026-08-12T00:00:00Z","Containers":{}}]'; exit 0 ;;
+esac
+printf 'unexpected: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	got, err := c.NetworkInventory(context.Background(), "tcp://vpn-host:2375")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 networks, got %d: %#v", len(got), got)
+	}
+	b, _ := os.ReadFile(logPath)
+	logText := string(b)
+	if !strings.Contains(logText, "network inspect net1 net2") {
+		t.Fatalf("expected one batched network inspect, log:\n%s", logText)
+	}
+	if strings.Contains(logText, "network inspect net1\n") || strings.Contains(logText, "network inspect net2\n") {
+		t.Fatalf("unexpected per-network inspect on healthy batch, log:\n%s", logText)
+	}
+}
+
+func TestImageMetadataBatchCachesPlatformAndLabels(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  *"image inspect sha256:one sha256:two"*) printf '%s\n' '[{"Id":"sha256:one","RepoTags":["example/one:latest"],"Os":"linux","Architecture":"amd64","Variant":"","Config":{"Labels":{"org.opencontainers.image.version":"1.2.3"}}},{"Id":"sha256:two","RepoTags":["example/two:latest"],"Os":"linux","Architecture":"arm64","Variant":"v8","Config":{"Labels":{"org.opencontainers.image.version":"4.5.6"}}}]'; exit 0 ;;
+esac
+printf 'unexpected: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	meta, err := c.ImageMetadataBatch(context.Background(), "tcp://vpn-host:2375", "sha256:one", "sha256:two", "sha256:one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta["sha256:one"].Labels["org.opencontainers.image.version"] != "1.2.3" || meta["example/two:latest"].Architecture != "arm64" {
+		t.Fatalf("unexpected metadata: %#v", meta)
+	}
+	// These calls must be served from the cache populated by the batch and not
+	// add another remote Docker round-trip.
+	p, err := c.ImagePlatform(context.Background(), "tcp://vpn-host:2375", "sha256:two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Architecture != "arm64" || p.Variant != "v8" {
+		t.Fatalf("unexpected cached platform: %#v", p)
+	}
+	labels, err := c.ImageLabels(context.Background(), "tcp://vpn-host:2375", "sha256:one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labels["org.opencontainers.image.version"] != "1.2.3" {
+		t.Fatalf("unexpected cached labels: %#v", labels)
+	}
+	b, _ := os.ReadFile(logPath)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], "image inspect sha256:one sha256:two") {
+		t.Fatalf("expected exactly one remote image inspect, log:\n%s", string(b))
+	}
+}
+
+func TestDockerRunReportsContextDeadlineInsteadOfSignalKilled(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "docker")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := c.Ping(ctx, "tcp://192.168.178.66:2375")
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("expected deadline error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "signal: killed") {
+		t.Fatalf("opaque signal error leaked through: %v", err)
+	}
+}
+
+func TestPingReliableRetriesRemoteEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+count=0
+[ -f "` + countPath + `" ] && count=$(cat "` + countPath + `")
+count=$((count+1))
+printf '%s' "$count" > "` + countPath + `"
+if [ "$count" -lt 3 ]; then
+  echo temporary failure >&2
+  exit 1
+fi
+printf '29.4.3\n'
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	version, err := c.PingReliable(ctx, "tcp://192.168.178.66:2375")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(version) != "29.4.3" {
+		t.Fatalf("unexpected version %q", version)
+	}
+	b, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(b)) != "3" {
+		t.Fatalf("expected three attempts, got %q", string(b))
+	}
+}
+
+func TestV091CleanupProgressReportsPerObjectStages(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "docker")
+	anon := strings.Repeat("c", 64)
+	body := `#!/bin/sh
+case "$*" in
+  *"volume ls -q"*) printf '%s\n' '` + anon + `'; exit 0 ;;
+  *"volume inspect"*) printf '%s\n' '[{"Name":"` + anon + `","Driver":"local","Scope":"local","Mountpoint":"/v","CreatedAt":"2026-08-13T00:00:00Z","Labels":{"com.docker.volume.anonymous":""}}]'; exit 0 ;;
+  *"ps -aq --no-trunc"*) exit 0 ;;
+  *"volume rm ` + anon + `"*) exit 0 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	var stages []string
+	result, err := c.PruneUnusedAnonymousVolumesWithProgress(context.Background(), "tcp://docker:2375", nil, func(done, total int, stage string) {
+		stages = append(stages, stage)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.RemovedVolumes) != 1 {
+		t.Fatalf("removed=%d want 1", len(result.RemovedVolumes))
+	}
+	joined := strings.Join(stages, " | ")
+	for _, want := range []string{"Inventorying volumes", "Removing anonymous volumes · 1/1", "Refreshing volume inventory"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing progress stage %q in %q", want, joined)
+		}
+	}
+}
+
+func TestV091CleanupTimeoutsGiveRemoteHostsLongerBudget(t *testing.T) {
+	if cleanupInventoryTimeout("tcp://192.168.178.66:2375") <= cleanupInventoryTimeout("unix:///var/run/docker.sock") {
+		t.Fatal("remote cleanup inventory timeout should exceed local timeout")
+	}
+	if cleanupObjectTimeout("tcp://192.168.178.66:2375") <= cleanupObjectTimeout("unix:///var/run/docker.sock") {
+		t.Fatal("remote cleanup object timeout should exceed local timeout")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,5 +59,55 @@ exit 0
 	got := string(b)
 	if !strings.Contains(got, "VACUUM INTO") || !strings.Contains(got, backup) {
 		t.Fatalf("backup did not use VACUUM INTO for destination: %s", got)
+	}
+}
+
+func TestQueuedJobCancellationAndClaimAreAtomic(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not available in test environment")
+	}
+	dir := t.TempDir()
+	s := New(filepath.Join(dir, "watchtower-ui.db"))
+	ctx := context.Background()
+	if err := s.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.CreateJob(ctx, "update", "manual", 1, "app", "queued")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := s.CancelQueuedJob(ctx, id, "cancelled by test")
+	if err != nil || !cancelled {
+		t.Fatalf("cancel queued job: cancelled=%v err=%v", cancelled, err)
+	}
+	job, err := s.Job(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != "cancelled" || job.FinishedAt == "" {
+		t.Fatalf("unexpected cancelled job state: %+v", job)
+	}
+	claimed, err := s.ClaimQueuedJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("a cancelled job must not be claimable")
+	}
+
+	id2, err := s.CreateJob(ctx, "update", "manual", 1, "app2", "queued")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = s.ClaimQueuedJob(ctx, id2)
+	if err != nil || !claimed {
+		t.Fatalf("claim queued job: claimed=%v err=%v", claimed, err)
+	}
+	cancelled, err = s.CancelQueuedJob(ctx, id2, "too late")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled {
+		t.Fatal("a running job must not be cancellable")
 	}
 }

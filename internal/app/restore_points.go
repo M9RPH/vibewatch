@@ -340,18 +340,53 @@ func (a *App) inspectOne(ctx context.Context, hostID int64, container string) (i
 	return xs[0], nil
 }
 
+func dockerHealthVerificationWindow(hc *inspectHealthcheck) time.Duration {
+	if hc == nil {
+		return 12 * time.Second
+	}
+	// Docker health transitions can legitimately lag behind container startup,
+	// especially when an image has a start period or a long health interval. A
+	// transient unhealthy result is therefore treated as recoverable during this
+	// bounded grace window instead of triggering an immediate rollback.
+	window := 45 * time.Second
+	startPeriod := time.Duration(hc.StartPeriod)
+	interval := time.Duration(hc.Interval)
+	timeout := time.Duration(hc.Timeout)
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if timeout < 0 {
+		timeout = 0
+	}
+	derived := startPeriod + 2*interval + timeout + 10*time.Second
+	if derived > window {
+		window = derived
+	}
+	if window > 2*time.Minute {
+		window = 2 * time.Minute
+	}
+	return window
+}
+
 func (a *App) verifyUpdatedContainer(ctx context.Context, hostID int64, container string) error {
-	deadline := time.Now().Add(12 * time.Second)
+	started := time.Now()
+	deadline := started.Add(12 * time.Second)
 	// Containers without a Docker healthcheck still get a short stability
 	// window. We intentionally do not guess application health, but this catches
 	// the common case where a new image starts and immediately crash-loops.
 	noHealthStableSince := time.Time{}
 	var lastErr error
+	lastHealth := ""
+	healthWindowSet := false
 	for {
 		cur, err := a.inspectOne(ctx, hostID, container)
 		if err != nil {
 			lastErr = err
 		} else {
+			// A later successful inspect supersedes a transient remote/API read
+			// error; do not let a stale inspect error trigger rollback after the
+			// container has resumed reporting valid health state.
+			lastErr = nil
 			if cur.State.Restarting {
 				return fmt.Errorf("container is restarting after update")
 			}
@@ -360,11 +395,19 @@ func (a *App) verifyUpdatedContainer(ctx context.Context, hostID int64, containe
 			}
 			if cur.State.Health != nil {
 				noHealthStableSince = time.Time{}
-				switch strings.ToLower(strings.TrimSpace(cur.State.Health.Status)) {
-				case "unhealthy":
-					return fmt.Errorf("container healthcheck reports unhealthy after update")
+				if !healthWindowSet {
+					deadline = started.Add(dockerHealthVerificationWindow(cur.Config.Healthcheck))
+					healthWindowSet = true
+				}
+				lastHealth = strings.ToLower(strings.TrimSpace(cur.State.Health.Status))
+				switch lastHealth {
 				case "healthy":
 					return nil
+				case "unhealthy", "starting", "":
+					// Keep polling. A just-recreated service can report unhealthy before
+					// its application is actually ready, even though it recovers shortly
+					// afterwards. Only a persistent unhealthy state at the deadline is
+					// considered rollback-worthy.
 				}
 			} else {
 				// No Docker healthcheck exists. Running state is the strongest safe
@@ -380,11 +423,15 @@ func (a *App) verifyUpdatedContainer(ctx context.Context, hostID int64, containe
 			}
 		}
 		if time.Now().After(deadline) {
-			// A healthcheck that is still "starting" is not proof of failure.
-			// Only explicit unhealthy/stopped/restarting states trigger rollback.
 			if lastErr != nil {
 				return lastErr
 			}
+			if lastHealth == "unhealthy" {
+				return fmt.Errorf("container healthcheck remained unhealthy for %s after update", time.Since(started).Round(time.Second))
+			}
+			// A healthcheck that is still starting is not proof of application
+			// failure. Custom Verification, when configured, remains the stronger
+			// application-level gate after this Docker lifecycle check.
 			return nil
 		}
 		select {

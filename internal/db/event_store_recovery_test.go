@@ -73,6 +73,13 @@ func TestRepairDockerEventCorruptionPreservesCoreTables(t *testing.T) {
 	if err := s.SetSetting(ctx, "sentinel", "preserve-me"); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.SaveVerificationProfile(ctx, VerificationProfile{HostID: 1, ScopeType: "container", ScopeKey: "paperless", Enabled: Bool(true), ChecksJSON: `[{"type":"http","url":"http://paperless/health"}]`}); err != nil {
+		t.Fatal(err)
+	}
+	chainID, err := s.SaveUpdateChain(ctx, UpdateChain{Name: "Paperless", HostID: 1, StopOnFailure: Bool(true)}, []UpdateChainStep{{ContainerName: "redis", Position: 1}, {ContainerName: "paperless", Position: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.exec(ctx, `CREATE TABLE docker_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, raw_json TEXT NOT NULL); CREATE INDEX idx_events_host ON docker_events(host_id,id DESC);`); err != nil {
 		t.Fatal(err)
 	}
@@ -123,5 +130,11 @@ func TestRepairDockerEventCorruptionPreservesCoreTables(t *testing.T) {
 	}
 	if got := s.Setting(ctx, "sentinel", ""); got != "preserve-me" {
 		t.Fatalf("setting not preserved: %q", got)
+	}
+	if profile, err := s.VerificationProfile(ctx, 1, "container", "paperless"); err != nil || !bool(profile.Enabled) {
+		t.Fatalf("verification profile not preserved: %#v err=%v", profile, err)
+	}
+	if chain, err := s.UpdateChain(ctx, chainID); err != nil || chain.Name != "Paperless" {
+		t.Fatalf("update chain not preserved: %#v err=%v", chain, err)
 	}
 }

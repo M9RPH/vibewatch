@@ -28,11 +28,18 @@ type Client struct {
 	WorkerVersion string
 	labelMu       sync.Mutex
 	labelCache    map[string]cachedLabels
+	platformMu    sync.Mutex
+	platformCache map[string]cachedPlatform
 }
 
 type cachedLabels struct {
 	Labels map[string]string
 	At     time.Time
+}
+
+type cachedPlatform struct {
+	Platform ImagePlatform
+	At       time.Time
 }
 
 type Container struct {
@@ -55,6 +62,15 @@ type ImagePlatform struct {
 	Architecture string `json:"architecture"`
 	Variant      string `json:"variant,omitempty"`
 	ImageID      string `json:"image_id"`
+}
+
+type ImageMetadata struct {
+	ID           string
+	RepoTags     []string
+	Labels       map[string]string
+	OS           string
+	Architecture string
+	Variant      string
 }
 
 type ImageSummary struct {
@@ -171,13 +187,17 @@ type BuildCachePruneResult struct {
 	AfterReclaimable  int64 `json:"after_reclaimable_bytes"`
 }
 
+// CleanupProgress reports coarse-grained cleanup progress. completed/total are
+// object counts when a cleanup can enumerate work; total may be zero for stage-only operations.
+type CleanupProgress func(completed, total int, stage string)
+
 type EventWatcher struct {
 	mu     sync.Mutex
 	cancel map[int64]context.CancelFunc
 }
 
 func New(logger *slog.Logger) *Client {
-	return &Client{Binary: "docker", Logger: logger, WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.5", labelCache: map[string]cachedLabels{}}
+	return &Client{Binary: "docker", Logger: logger, WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.5", labelCache: map[string]cachedLabels{}, platformCache: map[string]cachedPlatform{}}
 }
 
 func (c *Client) cmd(ctx context.Context, endpoint string, args ...string) *exec.Cmd {
@@ -194,6 +214,9 @@ func (c *Client) run(ctx context.Context, endpoint string, args ...string) (stri
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("docker %s: %w", strings.Join(safeArgs(args), " "), ctxErr)
+		}
 		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(safeArgs(args), " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return strings.TrimSpace(string(out)), nil
@@ -244,6 +267,66 @@ func safeArgs(args []string) []string {
 
 func (c *Client) Ping(ctx context.Context, endpoint string) (string, error) {
 	return c.run(ctx, endpoint, "version", "--format", "{{.Server.Version}}")
+}
+
+func remoteEndpoint(endpoint string) bool {
+	v := strings.ToLower(strings.TrimSpace(endpoint))
+	return v != "" && !strings.HasPrefix(v, "unix://")
+}
+
+func cleanupInventoryTimeout(endpoint string) time.Duration {
+	if remoteEndpoint(endpoint) {
+		return 4 * time.Minute
+	}
+	return 90 * time.Second
+}
+
+func cleanupObjectTimeout(endpoint string) time.Duration {
+	if remoteEndpoint(endpoint) {
+		return 2 * time.Minute
+	}
+	return 45 * time.Second
+}
+
+// PingReliable is the reachability probe used for configured hosts. Remote TCP
+// endpoints get a few bounded attempts because a healthy VPN connection can
+// occasionally add connection/setup latency even when its steady-state RTT is
+// only tens of milliseconds. Each attempt has its own deadline so one stalled
+// Docker CLI process cannot consume the entire retry budget.
+func (c *Client) PingReliable(ctx context.Context, endpoint string) (string, error) {
+	attempts := 1
+	perAttempt := 4 * time.Second
+	if remoteEndpoint(endpoint) {
+		attempts = 3
+		perAttempt = 6 * time.Second
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, perAttempt)
+		version, err := c.Ping(attemptCtx, endpoint)
+		cancel()
+		if err == nil {
+			return version, nil
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		delay := time.Duration(attempt) * 350 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return "", fmt.Errorf("Docker endpoint did not respond after %d attempt(s): %w", attempts, lastErr)
 }
 
 var dockerSizePattern = regexp.MustCompile(`(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?i?b)`)
@@ -386,10 +469,10 @@ func (c *Client) ImageInventory(ctx context.Context, endpoint string) ([]ImageSu
 	return c.imageInventory(ctx, endpoint)
 }
 
-func (c *Client) imageDiskUsage(ctx context.Context, endpoint string) (total, reclaimable int64, exact bool) {
+func (c *Client) diskUsage(ctx context.Context, endpoint string) (imageTotal, imageReclaimable int64, imageExact bool, buildTotal, buildReclaimable int64) {
 	out, err := c.run(ctx, endpoint, "system", "df", "--format", "{{json .}}")
 	if err != nil || strings.TrimSpace(out) == "" {
-		return 0, 0, false
+		return 0, 0, false, 0, 0
 	}
 	scan := bufio.NewScanner(strings.NewReader(out))
 	for scan.Scan() {
@@ -398,30 +481,27 @@ func (c *Client) imageDiskUsage(ctx context.Context, endpoint string) (total, re
 			Size        string `json:"Size"`
 			Reclaimable string `json:"Reclaimable"`
 		}
-		if json.Unmarshal([]byte(scan.Text()), &row) == nil && strings.EqualFold(strings.TrimSpace(row.Type), "Images") {
-			return parseDockerBytes(row.Size), parseDockerBytes(row.Reclaimable), true
+		if json.Unmarshal([]byte(scan.Text()), &row) != nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(row.Type)) {
+		case "images":
+			imageTotal, imageReclaimable, imageExact = parseDockerBytes(row.Size), parseDockerBytes(row.Reclaimable), true
+		case "build cache":
+			buildTotal, buildReclaimable = parseDockerBytes(row.Size), parseDockerBytes(row.Reclaimable)
 		}
 	}
-	return 0, 0, false
+	return
+}
+
+func (c *Client) imageDiskUsage(ctx context.Context, endpoint string) (total, reclaimable int64, exact bool) {
+	total, reclaimable, exact, _, _ = c.diskUsage(ctx, endpoint)
+	return
 }
 
 func (c *Client) buildCacheDiskUsage(ctx context.Context, endpoint string) (total, reclaimable int64) {
-	out, err := c.run(ctx, endpoint, "system", "df", "--format", "{{json .}}")
-	if err != nil || strings.TrimSpace(out) == "" {
-		return 0, 0
-	}
-	scan := bufio.NewScanner(strings.NewReader(out))
-	for scan.Scan() {
-		var row struct {
-			Type        string `json:"Type"`
-			Size        string `json:"Size"`
-			Reclaimable string `json:"Reclaimable"`
-		}
-		if json.Unmarshal([]byte(scan.Text()), &row) == nil && strings.EqualFold(strings.TrimSpace(row.Type), "Build Cache") {
-			return parseDockerBytes(row.Size), parseDockerBytes(row.Reclaimable)
-		}
-	}
-	return 0, 0
+	_, _, _, total, reclaimable = c.diskUsage(ctx, endpoint)
+	return
 }
 
 func (c *Client) aggregateContainerStats(ctx context.Context, endpoint string) (cpu float64, mem int64, maxLimit int64, available bool, errText string) {
@@ -710,7 +790,16 @@ func (c *Client) VolumeInventory(ctx context.Context, endpoint string) ([]Volume
 }
 
 func (c *Client) PruneUnusedAnonymousVolumes(ctx context.Context, endpoint string, protected map[string]bool) (VolumePruneResult, error) {
-	before, err := c.VolumeInventory(ctx, endpoint)
+	return c.PruneUnusedAnonymousVolumesWithProgress(ctx, endpoint, protected, nil)
+}
+
+func (c *Client) PruneUnusedAnonymousVolumesWithProgress(ctx context.Context, endpoint string, protected map[string]bool, progress CleanupProgress) (VolumePruneResult, error) {
+	if progress != nil {
+		progress(0, 0, "Inventorying volumes")
+	}
+	invCtx, invCancel := context.WithTimeout(ctx, cleanupInventoryTimeout(endpoint))
+	before, err := c.VolumeInventory(invCtx, endpoint)
+	invCancel()
 	if err != nil {
 		return VolumePruneResult{}, err
 	}
@@ -718,6 +807,7 @@ func (c *Client) PruneUnusedAnonymousVolumes(ctx context.Context, endpoint strin
 	protectedCount := 0
 	removed := []string{}
 	failed := []string{}
+	eligible := make([]VolumeSummary, 0)
 	for _, v := range before {
 		if !v.Unused || !v.Anonymous {
 			continue
@@ -727,21 +817,38 @@ func (c *Client) PruneUnusedAnonymousVolumes(ctx context.Context, endpoint strin
 			protectedCount++
 			continue
 		}
-		// Do not use `docker volume prune`: it cannot exclude retained rollback
-		// volumes. Delete only the inventory items Vibewatch has verified as
-		// unused anonymous and not protected.
-		if _, removeErr := c.run(ctx, endpoint, "volume", "rm", v.Name); removeErr != nil {
-			failed = append(failed, v.Name)
-			continue
+		eligible = append(eligible, v)
+	}
+	if progress != nil {
+		progress(0, len(eligible), fmt.Sprintf("Removing anonymous volumes · 0/%d", len(eligible)))
+	}
+	for i, v := range eligible {
+		if err := ctx.Err(); err != nil {
+			return VolumePruneResult{RemovedVolumes: removed, ProtectedVolumes: protectedCount, FailedVolumes: failed, BeforeUnusedAnonymous: beforeCount}, err
 		}
-		removed = append(removed, v.Name)
+		itemCtx, itemCancel := context.WithTimeout(ctx, cleanupObjectTimeout(endpoint))
+		_, removeErr := c.run(itemCtx, endpoint, "volume", "rm", v.Name)
+		itemCancel()
+		if removeErr != nil {
+			failed = append(failed, v.Name)
+		} else {
+			removed = append(removed, v.Name)
+		}
+		if progress != nil {
+			progress(i+1, len(eligible), fmt.Sprintf("Removing anonymous volumes · %d/%d", i+1, len(eligible)))
+		}
 	}
 	if len(failed) > 0 && len(removed) == 0 {
-		return VolumePruneResult{}, fmt.Errorf("failed to remove %d unused anonymous volume(s)", len(failed))
+		return VolumePruneResult{RemovedVolumes: removed, ProtectedVolumes: protectedCount, FailedVolumes: failed, BeforeUnusedAnonymous: beforeCount}, fmt.Errorf("failed to remove %d unused anonymous volume(s)", len(failed))
 	}
-	after, err := c.VolumeInventory(ctx, endpoint)
+	if progress != nil {
+		progress(len(eligible), len(eligible), "Refreshing volume inventory")
+	}
+	refreshCtx, refreshCancel := context.WithTimeout(ctx, cleanupInventoryTimeout(endpoint))
+	after, err := c.VolumeInventory(refreshCtx, endpoint)
+	refreshCancel()
 	if err != nil {
-		return VolumePruneResult{}, err
+		return VolumePruneResult{RemovedVolumes: removed, ProtectedVolumes: protectedCount, FailedVolumes: failed, BeforeUnusedAnonymous: beforeCount}, err
 	}
 	afterCount := 0
 	for _, v := range after {
@@ -822,6 +929,85 @@ func (c *Client) InspectImagesRaw(ctx context.Context, endpoint string, refs ...
 	return []byte(out), nil
 }
 
+// ImageMetadataBatch inspects many local images with a small number of Docker
+// round-trips. It is used by container-list rendering so a high-latency remote
+// host does not require one image-inspect command per container.
+func (c *Client) ImageMetadataBatch(ctx context.Context, endpoint string, refs ...string) (map[string]ImageMetadata, error) {
+	seen := map[string]bool{}
+	clean := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref != "" && !seen[ref] {
+			seen[ref] = true
+			clean = append(clean, ref)
+		}
+	}
+	result := map[string]ImageMetadata{}
+	if len(clean) == 0 {
+		return result, nil
+	}
+	for start := 0; start < len(clean); start += dockerInspectBatchSize {
+		end := start + dockerInspectBatchSize
+		if end > len(clean) {
+			end = len(clean)
+		}
+		batch := clean[start:end]
+		out, err := c.run(ctx, endpoint, append([]string{"image", "inspect"}, batch...)...)
+		if err != nil {
+			return nil, err
+		}
+		var rows []struct {
+			ID           string   `json:"Id"`
+			RepoTags     []string `json:"RepoTags"`
+			OS           string   `json:"Os"`
+			Architecture string   `json:"Architecture"`
+			Variant      string   `json:"Variant"`
+			Config       struct {
+				Labels map[string]string `json:"Labels"`
+			} `json:"Config"`
+		}
+		if err := json.Unmarshal([]byte(out), &rows); err != nil {
+			return nil, fmt.Errorf("decode image metadata: %w", err)
+		}
+		for _, row := range rows {
+			m := ImageMetadata{ID: strings.TrimSpace(row.ID), RepoTags: row.RepoTags, Labels: row.Config.Labels, OS: strings.TrimSpace(row.OS), Architecture: strings.TrimSpace(row.Architecture), Variant: strings.TrimSpace(row.Variant)}
+			if m.Labels == nil {
+				m.Labels = map[string]string{}
+			}
+			if m.ID != "" {
+				result[m.ID] = m
+			}
+			for _, tag := range row.RepoTags {
+				if tag = strings.TrimSpace(tag); tag != "" {
+					result[tag] = m
+				}
+			}
+			c.labelMu.Lock()
+			if m.ID != "" {
+				c.labelCache[endpoint+"\x00"+m.ID] = cachedLabels{Labels: m.Labels, At: time.Now()}
+			}
+			for _, tag := range row.RepoTags {
+				if tag = strings.TrimSpace(tag); tag != "" {
+					c.labelCache[endpoint+"\x00"+tag] = cachedLabels{Labels: m.Labels, At: time.Now()}
+				}
+			}
+			c.labelMu.Unlock()
+			platform := ImagePlatform{OS: m.OS, Architecture: m.Architecture, Variant: m.Variant, ImageID: m.ID}
+			c.platformMu.Lock()
+			if m.ID != "" {
+				c.platformCache[endpoint+"\x00"+m.ID] = cachedPlatform{Platform: platform, At: time.Now()}
+			}
+			for _, tag := range row.RepoTags {
+				if tag = strings.TrimSpace(tag); tag != "" {
+					c.platformCache[endpoint+"\x00"+tag] = cachedPlatform{Platform: platform, At: time.Now()}
+				}
+			}
+			c.platformMu.Unlock()
+		}
+	}
+	return result, nil
+}
+
 func (c *Client) HostOverview(ctx context.Context, endpoint string, includeImages bool) (HostOverview, error) {
 	out, err := c.run(ctx, endpoint, "info", "--format", "{{json .}}")
 	if err != nil {
@@ -845,17 +1031,21 @@ func (c *Client) HostOverview(ctx context.Context, endpoint string, includeImage
 	if err := json.Unmarshal([]byte(out), &info); err != nil {
 		return HostOverview{}, fmt.Errorf("decode docker info: %w", err)
 	}
-	// Query the numeric daemon capacity values directly as an authoritative
-	// fallback/override. This avoids CLI JSON-template variations where MemTotal
-	// can otherwise be missing or represented inconsistently.
-	if raw, e := c.run(ctx, endpoint, "info", "--format", "{{json .MemTotal}}"); e == nil {
-		if v := parseMemoryValue(raw); v > 0 {
-			info.MemTotal = v
+	// Docker info JSON normally includes MemTotal/NCPU. Only perform extra
+	// round-trips when a daemon/CLI combination omitted those values. This is
+	// important for high-latency remote Docker endpoints.
+	if info.MemTotal <= 0 {
+		if raw, e := c.run(ctx, endpoint, "info", "--format", "{{json .MemTotal}}"); e == nil {
+			if v := parseMemoryValue(raw); v > 0 {
+				info.MemTotal = v
+			}
 		}
 	}
-	if raw, e := c.run(ctx, endpoint, "info", "--format", "{{.NCPU}}"); e == nil {
-		if v, pe := strconv.Atoi(strings.TrimSpace(raw)); pe == nil && v > 0 {
-			info.NCPU = v
+	if info.NCPU <= 0 {
+		if raw, e := c.run(ctx, endpoint, "info", "--format", "{{.NCPU}}"); e == nil {
+			if v, pe := strconv.Atoi(strings.TrimSpace(raw)); pe == nil && v > 0 {
+				info.NCPU = v
+			}
 		}
 	}
 	images, err := c.imageInventory(ctx, endpoint)
@@ -882,12 +1072,13 @@ func (c *Client) HostOverview(ctx context.Context, endpoint string, includeImage
 			o.ImagesDangling++
 		}
 	}
-	if total, reclaimable, exact := c.imageDiskUsage(ctx, endpoint); exact {
-		o.ImageDiskBytes, o.ImageReclaimableBytes, o.ImageDiskExact = total, reclaimable, true
+	imageTotal, imageReclaimable, imageExact, buildTotal, buildReclaimable := c.diskUsage(ctx, endpoint)
+	if imageExact {
+		o.ImageDiskBytes, o.ImageReclaimableBytes, o.ImageDiskExact = imageTotal, imageReclaimable, true
 	} else {
 		o.ImageDiskBytes, o.ImageReclaimableBytes, o.ImageDiskExact = virtualTotal, virtualUnused, false
 	}
-	o.BuildCacheBytes, o.BuildCacheReclaimable = c.buildCacheDiskUsage(ctx, endpoint)
+	o.BuildCacheBytes, o.BuildCacheReclaimable = buildTotal, buildReclaimable
 	cpu, usedMem, statsLimit, statsAvailable, statsErr := c.aggregateContainerStats(ctx, endpoint)
 	o.MemoryTotalBytes, o.MemorySource, o.MemoryDiagnostic = chooseMemoryTotal(info.MemTotal, statsLimit)
 	o.ContainerCPUPercent, o.ContainerMemoryBytes, o.ContainerStatsAvailable, o.ContainerStatsError = cpu, usedMem, statsAvailable, statsErr
@@ -910,11 +1101,21 @@ func parsePruneReclaimed(output string) int64 {
 }
 
 func (c *Client) PruneUnusedImages(ctx context.Context, endpoint string, protected map[string]bool) (ImagePruneResult, error) {
-	before, err := c.HostOverview(ctx, endpoint, true)
+	return c.PruneUnusedImagesWithProgress(ctx, endpoint, protected, nil)
+}
+
+func (c *Client) PruneUnusedImagesWithProgress(ctx context.Context, endpoint string, protected map[string]bool, progress CleanupProgress) (ImagePruneResult, error) {
+	if progress != nil {
+		progress(0, 0, "Inventorying images")
+	}
+	invCtx, invCancel := context.WithTimeout(ctx, cleanupInventoryTimeout(endpoint))
+	before, err := c.HostOverview(invCtx, endpoint, true)
+	invCancel()
 	if err != nil {
 		return ImagePruneResult{}, err
 	}
 	result := ImagePruneResult{BeforeUnused: before.ImagesUnused, BeforeReclaimable: before.ImageReclaimableBytes}
+	eligible := make([]ImageSummary, 0)
 	for _, img := range before.Images {
 		if !img.Unused {
 			continue
@@ -923,18 +1124,38 @@ func (c *Client) PruneUnusedImages(ctx context.Context, endpoint string, protect
 			result.ProtectedImages++
 			continue
 		}
-		if _, err := c.run(ctx, endpoint, "image", "rm", "-f", img.ID); err != nil {
+		eligible = append(eligible, img)
+	}
+	if progress != nil {
+		progress(0, len(eligible), fmt.Sprintf("Removing unused images · 0/%d", len(eligible)))
+	}
+	for i, img := range eligible {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		itemCtx, itemCancel := context.WithTimeout(ctx, cleanupObjectTimeout(endpoint))
+		_, err := c.run(itemCtx, endpoint, "image", "rm", "-f", img.ID)
+		itemCancel()
+		if err != nil {
 			result.FailedImages++
 			if c.Logger != nil {
 				c.Logger.Warn("unused image cleanup skipped image", "endpoint", endpoint, "image", img.ID, "error", err)
 			}
-			continue
+		} else {
+			result.RemovedImages++
 		}
-		result.RemovedImages++
+		if progress != nil {
+			progress(i+1, len(eligible), fmt.Sprintf("Removing unused images · %d/%d", i+1, len(eligible)))
+		}
 	}
-	after, err := c.HostOverview(ctx, endpoint, false)
+	if progress != nil {
+		progress(len(eligible), len(eligible), "Refreshing image inventory")
+	}
+	refreshCtx, refreshCancel := context.WithTimeout(ctx, cleanupInventoryTimeout(endpoint))
+	after, err := c.HostOverview(refreshCtx, endpoint, false)
+	refreshCancel()
 	if err != nil {
-		return ImagePruneResult{}, err
+		return result, err
 	}
 	if before.ImageReclaimableBytes > after.ImageReclaimableBytes {
 		result.ReclaimedBytes = before.ImageReclaimableBytes - after.ImageReclaimableBytes
@@ -951,36 +1172,56 @@ func (c *Client) NetworkInventory(ctx context.Context, endpoint string) ([]Netwo
 		return nil, err
 	}
 	ids := strings.Fields(out)
-	result := make([]NetworkSummary, 0, len(ids))
-	for _, id := range ids {
-		inspectOut, e := c.run(ctx, endpoint, "network", "inspect", id)
-		if e != nil {
-			if c.Logger != nil {
-				c.Logger.Warn("network inspect failed", "endpoint", endpoint, "network", id, "error", e)
+	if len(ids) == 0 {
+		return []NetworkSummary{}, nil
+	}
+	type networkInspectRow struct {
+		ID         string                     `json:"Id"`
+		Name       string                     `json:"Name"`
+		Driver     string                     `json:"Driver"`
+		Scope      string                     `json:"Scope"`
+		Created    string                     `json:"Created"`
+		Internal   bool                       `json:"Internal"`
+		Ingress    bool                       `json:"Ingress"`
+		Containers map[string]json.RawMessage `json:"Containers"`
+	}
+	rows := make([]networkInspectRow, 0, len(ids))
+	for start := 0; start < len(ids); start += dockerInspectBatchSize {
+		end := start + dockerInspectBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		inspectOut, batchErr := c.run(ctx, endpoint, append([]string{"network", "inspect"}, batch...)...)
+		if batchErr == nil {
+			var decoded []networkInspectRow
+			if jsonErr := json.Unmarshal([]byte(inspectOut), &decoded); jsonErr == nil {
+				rows = append(rows, decoded...)
+				continue
 			}
-			continue
 		}
-		var rows []struct {
-			ID         string                     `json:"Id"`
-			Name       string                     `json:"Name"`
-			Driver     string                     `json:"Driver"`
-			Scope      string                     `json:"Scope"`
-			Created    string                     `json:"Created"`
-			Internal   bool                       `json:"Internal"`
-			Ingress    bool                       `json:"Ingress"`
-			Containers map[string]json.RawMessage `json:"Containers"`
+		// One broken network/plugin should not hide the rest. Fall back only for
+		// the failed batch; normal hosts use one inspect request for many networks.
+		for _, id := range batch {
+			oneOut, oneErr := c.run(ctx, endpoint, "network", "inspect", id)
+			if oneErr != nil {
+				if c.Logger != nil {
+					c.Logger.Warn("network inspect failed", "endpoint", endpoint, "network", id, "error", oneErr)
+				}
+				continue
+			}
+			var decoded []networkInspectRow
+			if json.Unmarshal([]byte(oneOut), &decoded) == nil && len(decoded) > 0 {
+				rows = append(rows, decoded[0])
+			}
 		}
-		if json.Unmarshal([]byte(inspectOut), &rows) != nil || len(rows) == 0 {
-			continue
-		}
-		r := rows[0]
+	}
+	result := make([]NetworkSummary, 0, len(rows))
+	for _, r := range rows {
 		name := strings.TrimSpace(r.Name)
 		system := name == "bridge" || name == "host" || name == "none" || name == "docker_gwbridge" || name == c.WorkerNetwork || name == "watchtower-ui-internal" || r.Ingress || strings.EqualFold(strings.TrimSpace(r.Scope), "swarm")
 		refs := len(r.Containers)
-		result = append(result, NetworkSummary{
-			ID: idOr(r.ID, id), Name: name, Driver: r.Driver, Scope: r.Scope, CreatedAt: r.Created,
-			Internal: r.Internal, Ingress: r.Ingress, InUse: refs > 0, RefCount: refs, System: system, Unused: refs == 0 && !system,
-		})
+		result = append(result, NetworkSummary{ID: r.ID, Name: name, Driver: r.Driver, Scope: r.Scope, CreatedAt: r.Created, Internal: r.Internal, Ingress: r.Ingress, InUse: refs > 0, RefCount: refs, System: system, Unused: refs == 0 && !system})
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].System != result[j].System {
@@ -1002,11 +1243,21 @@ func idOr(primary, fallback string) string {
 }
 
 func (c *Client) PruneUnusedNetworks(ctx context.Context, endpoint string, protected map[string]bool) (NetworkPruneResult, error) {
-	networks, err := c.NetworkInventory(ctx, endpoint)
+	return c.PruneUnusedNetworksWithProgress(ctx, endpoint, protected, nil)
+}
+
+func (c *Client) PruneUnusedNetworksWithProgress(ctx context.Context, endpoint string, protected map[string]bool, progress CleanupProgress) (NetworkPruneResult, error) {
+	if progress != nil {
+		progress(0, 0, "Inventorying networks")
+	}
+	invCtx, invCancel := context.WithTimeout(ctx, cleanupInventoryTimeout(endpoint))
+	networks, err := c.NetworkInventory(invCtx, endpoint)
+	invCancel()
 	if err != nil {
 		return NetworkPruneResult{}, err
 	}
 	result := NetworkPruneResult{RemovedNetworks: []string{}, FailedNetworks: []string{}}
+	eligible := make([]NetworkSummary, 0)
 	for _, n := range networks {
 		if !n.Unused || n.System {
 			continue
@@ -1015,25 +1266,63 @@ func (c *Client) PruneUnusedNetworks(ctx context.Context, endpoint string, prote
 			result.ProtectedNetworks++
 			continue
 		}
-		if _, e := c.run(ctx, endpoint, "network", "rm", n.ID); e != nil {
+		eligible = append(eligible, n)
+	}
+	if progress != nil {
+		progress(0, len(eligible), fmt.Sprintf("Removing unused networks · 0/%d", len(eligible)))
+	}
+	for i, n := range eligible {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		itemCtx, itemCancel := context.WithTimeout(ctx, cleanupObjectTimeout(endpoint))
+		_, e := c.run(itemCtx, endpoint, "network", "rm", n.ID)
+		itemCancel()
+		if e != nil {
 			result.FailedNetworks = append(result.FailedNetworks, n.Name)
 			if c.Logger != nil {
 				c.Logger.Warn("unused network cleanup skipped network", "endpoint", endpoint, "network", n.Name, "error", e)
 			}
-			continue
+		} else {
+			result.RemovedNetworks = append(result.RemovedNetworks, n.Name)
 		}
-		result.RemovedNetworks = append(result.RemovedNetworks, n.Name)
+		if progress != nil {
+			progress(i+1, len(eligible), fmt.Sprintf("Removing unused networks · %d/%d", i+1, len(eligible)))
+		}
 	}
 	return result, nil
 }
 
 func (c *Client) PruneBuildCache(ctx context.Context, endpoint string) (BuildCachePruneResult, error) {
-	before, beforeReclaimable := c.buildCacheDiskUsage(ctx, endpoint)
-	out, err := c.run(ctx, endpoint, "builder", "prune", "-a", "-f")
+	return c.PruneBuildCacheWithProgress(ctx, endpoint, nil)
+}
+
+func (c *Client) PruneBuildCacheWithProgress(ctx context.Context, endpoint string, progress CleanupProgress) (BuildCachePruneResult, error) {
+	if progress != nil {
+		progress(0, 0, "Measuring build cache")
+	}
+	invCtx, invCancel := context.WithTimeout(ctx, cleanupInventoryTimeout(endpoint))
+	before, beforeReclaimable := c.buildCacheDiskUsage(invCtx, endpoint)
+	invCancel()
+	if progress != nil {
+		progress(0, 0, "Pruning build cache")
+	}
+	pruneTimeout := 5 * time.Minute
+	if remoteEndpoint(endpoint) {
+		pruneTimeout = 15 * time.Minute
+	}
+	pruneCtx, pruneCancel := context.WithTimeout(ctx, pruneTimeout)
+	out, err := c.run(pruneCtx, endpoint, "builder", "prune", "-a", "-f")
+	pruneCancel()
 	if err != nil {
 		return BuildCachePruneResult{}, err
 	}
-	after, afterReclaimable := c.buildCacheDiskUsage(ctx, endpoint)
+	if progress != nil {
+		progress(0, 0, "Refreshing build cache usage")
+	}
+	refreshCtx, refreshCancel := context.WithTimeout(ctx, cleanupInventoryTimeout(endpoint))
+	after, afterReclaimable := c.buildCacheDiskUsage(refreshCtx, endpoint)
+	refreshCancel()
 	reclaimed := parsePruneReclaimed(out)
 	if reclaimed == 0 && before > after {
 		reclaimed = before - after
@@ -1127,6 +1416,14 @@ func (c *Client) ImagePlatform(ctx context.Context, endpoint, image string) (Ima
 	if image == "" {
 		return ImagePlatform{}, fmt.Errorf("image reference is empty")
 	}
+	key := endpoint + "\x00" + image
+	c.platformMu.Lock()
+	if hit, ok := c.platformCache[key]; ok && time.Since(hit.At) < 5*time.Minute {
+		p := hit.Platform
+		c.platformMu.Unlock()
+		return p, nil
+	}
+	c.platformMu.Unlock()
 	out, err := c.run(ctx, endpoint, "image", "inspect", image, "--format", "{{json .}}")
 	if err != nil {
 		return ImagePlatform{}, err
@@ -1146,7 +1443,14 @@ func (c *Client) ImagePlatform(ctx context.Context, endpoint, image string) (Ima
 	if strings.TrimSpace(raw.OS) == "" || strings.TrimSpace(raw.Architecture) == "" {
 		return ImagePlatform{}, fmt.Errorf("local image platform is unavailable")
 	}
-	return ImagePlatform{OS: strings.TrimSpace(raw.OS), Architecture: strings.TrimSpace(raw.Architecture), Variant: strings.TrimSpace(raw.Variant), ImageID: strings.TrimSpace(raw.ID)}, nil
+	p := ImagePlatform{OS: strings.TrimSpace(raw.OS), Architecture: strings.TrimSpace(raw.Architecture), Variant: strings.TrimSpace(raw.Variant), ImageID: strings.TrimSpace(raw.ID)}
+	c.platformMu.Lock()
+	c.platformCache[key] = cachedPlatform{Platform: p, At: time.Now()}
+	if p.ImageID != "" {
+		c.platformCache[endpoint+"\x00"+p.ImageID] = cachedPlatform{Platform: p, At: time.Now()}
+	}
+	c.platformMu.Unlock()
+	return p, nil
 }
 
 func normalizeRepoName(v string) string {
@@ -1437,28 +1741,57 @@ func (w *EventWatcher) Start(parent context.Context, c *Client, store *db.Store,
 	w.mu.Unlock()
 	go func() {
 		defer func() { w.mu.Lock(); delete(w.cancel, host.ID); w.mu.Unlock() }()
+		backoff := 3 * time.Second
+		wait := func(d time.Duration) bool {
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-t.C:
+				return true
+			}
+		}
 		for ctx.Err() == nil {
 			cmd := c.cmd(ctx, host.Endpoint, "events", "--format", "{{json .}}")
 			stdout, err := cmd.StdoutPipe()
 			if err != nil {
-				time.Sleep(5 * time.Second)
+				if !wait(backoff) {
+					return
+				}
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
 				continue
 			}
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 			if err := cmd.Start(); err != nil {
 				c.Logger.Warn("docker event stream start failed", "host", host.Name, "error", err)
-				time.Sleep(10 * time.Second)
+				if !wait(backoff) {
+					return
+				}
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
 				continue
 			}
 			scanner := bufio.NewScanner(stdout)
+			received := false
 			for scanner.Scan() {
+				received = true
+				backoff = 3 * time.Second
 				_ = store.AddDockerEvent(context.Background(), host.ID, scanner.Text())
 			}
 			_ = cmd.Wait()
 			if ctx.Err() == nil {
-				c.Logger.Warn("docker event stream disconnected", "host", host.Name, "stderr", strings.TrimSpace(stderr.String()))
-				time.Sleep(10 * time.Second)
+				c.Logger.Warn("docker event stream disconnected; reconnecting", "host", host.Name, "retry_in", backoff.String(), "stderr", strings.TrimSpace(stderr.String()))
+				if !wait(backoff) {
+					return
+				}
+				if !received && backoff < 30*time.Second {
+					backoff *= 2
+				}
 			}
 		}
 	}()

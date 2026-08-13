@@ -9,12 +9,13 @@ RUN npm run build
 FROM golang:1.23-alpine AS go-build
 WORKDIR /src
 COPY go.mod ./
+COPY VERSION ./VERSION
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/vibewatch ./cmd/server
+RUN VIBEWATCH_VERSION="$(cat VERSION)" && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$VIBEWATCH_VERSION" -o /out/vibewatch ./cmd/server
 
 FROM alpine:3.20
-ARG VIBEWATCH_VERSION=0.8.0
+ARG VIBEWATCH_VERSION=0.9.1
 LABEL org.opencontainers.image.title="Vibewatch" \
       org.opencontainers.image.version="$VIBEWATCH_VERSION" \
       org.opencontainers.image.description="Multi-host Docker update control powered by Watchtower"

@@ -510,13 +510,26 @@ func (a *App) restoreContainerRuntime(ctx context.Context, endpoint string, c in
 func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) {
 	ctx := a.ctx
 	started := time.Now()
-	_ = a.Store.StartJob(ctx, jobID)
+	if !a.beginAsyncJob(ctx, jobID) {
+		return
+	}
+	leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, jobID, hist.HostID, hist.ContainerName, "rollback-legacy")
+	if leaseErr != nil {
+		a.failJob(jobID, leaseErr)
+		return
+	}
+	stopHB := a.startLeaseHeartbeat(ctx, leaseKey, leaseOwner, 0)
+	defer stopHB()
+	defer a.Store.ReleaseOperationLease(context.Background(), leaseKey, leaseOwner)
 	a.jobProgress(ctx, jobID, 10, "Loading recovery snapshot")
 	h, err := a.Store.Host(ctx, hist.HostID)
 	if err != nil {
 		a.failJob(jobID, err)
 		return
 	}
+	opCtx, opCancel := context.WithTimeout(a.ctx, dockerOperationTimeout(h.Endpoint, 20*time.Minute, 35*time.Minute))
+	defer opCancel()
+	ctx = opCtx
 	path, _, err := a.findSnapshotForHistory(hist)
 	if err != nil {
 		a.failJob(jobID, err)
@@ -590,7 +603,9 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 				fallbackImage = currentContainer.ImageID
 			}
 			if fallbackImage != "" {
-				_ = a.restoreContainerRuntime(context.Background(), h.Endpoint, current, fallbackImage)
+				fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 8*time.Minute, 15*time.Minute))
+				_ = a.restoreContainerRuntime(fallbackCtx, h.Endpoint, current, fallbackImage)
+				fallbackCancel()
 			}
 		}
 	}
@@ -620,13 +635,37 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor, trigger string) error {
 	ctx := a.ctx
 	started := time.Now()
-	_ = a.Store.StartJob(ctx, jobID)
-	a.jobProgress(ctx, jobID, 8, "Loading restore point")
+	if !a.beginAsyncJob(ctx, jobID) {
+		return fmt.Errorf("rollback job was cancelled before execution")
+	}
+	if trigger != "automatic" {
+		leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, jobID, rp.HostID, rp.ContainerName, "rollback")
+		if leaseErr != nil {
+			a.failJob(jobID, leaseErr)
+			return leaseErr
+		}
+		stopHB := a.startLeaseHeartbeat(ctx, leaseKey, leaseOwner, 0)
+		defer stopHB()
+		defer a.Store.ReleaseOperationLease(context.Background(), leaseKey, leaseOwner)
+	}
+	a.jobProgress(ctx, jobID, 8, "Validating restore point integrity")
+	integrityCtx, integrityCancel := context.WithTimeout(ctx, 3*time.Minute)
+	integrity := a.validateRestorePointIntegrity(integrityCtx, rp)
+	integrityCancel()
+	if integrity.Status == "expired" || integrity.Status == "degraded" {
+		err := fmt.Errorf("restore point integrity is %s; rollback blocked before destructive work", integrity.Status)
+		a.failJob(jobID, err)
+		return err
+	}
+	a.jobProgress(ctx, jobID, 10, "Loading restore point")
 	h, err := a.Store.Host(ctx, rp.HostID)
 	if err != nil {
 		a.failJob(jobID, err)
 		return err
 	}
+	opCtx, opCancel := context.WithTimeout(a.ctx, dockerOperationTimeout(h.Endpoint, 20*time.Minute, 35*time.Minute))
+	defer opCancel()
+	ctx = opCtx
 	path, _, err := a.findSnapshotByID(rp.HostID, rp.SnapshotID, rp.ContainerName)
 	if err != nil {
 		_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "expired", err.Error())
@@ -711,7 +750,11 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Current container is missing or cannot be inspected; restoring directly from restore point")
 	}
 	if safetyRef != "" {
-		defer func() { _, _ = a.Docker.Run(context.Background(), h.Endpoint, "image", "rm", safetyRef) }()
+		defer func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+			defer cleanupCancel()
+			_, _ = a.Docker.Run(cleanupCtx, h.Endpoint, "image", "rm", safetyRef)
+		}()
 	}
 	recoverSafety := func() error {
 		if safetyRef == "" || strings.TrimSpace(current.Name) == "" {
@@ -720,17 +763,19 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 		// Any dependent rebound during a partial rollback must be stopped before
 		// the safety parent is recreated, otherwise it would again retain a stale
 		// network namespace reference.
-		stopDependentsBestEffort(context.Background(), a, h.Endpoint, rollbackExecutionDeps)
-		fallback := a.prepareRuntimeRestoreRef(context.Background(), h.Endpoint, safetyRef, current.Config.Image)
-		if fallbackErr := a.restoreContainerRuntime(context.Background(), h.Endpoint, current, fallback); fallbackErr != nil {
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 10*time.Minute, 20*time.Minute))
+		defer recoveryCancel()
+		stopDependentsBestEffort(recoveryCtx, a, h.Endpoint, rollbackExecutionDeps)
+		fallback := a.prepareRuntimeRestoreRef(recoveryCtx, h.Endpoint, safetyRef, current.Config.Image)
+		if fallbackErr := a.restoreContainerRuntime(recoveryCtx, h.Endpoint, current, fallback); fallbackErr != nil {
 			return fallbackErr
 		}
 		if len(currentDependencyCtx) > 0 {
-			parent, inspectErr := a.inspectOne(context.Background(), rp.HostID, rp.ContainerName)
+			parent, inspectErr := a.inspectOne(recoveryCtx, rp.HostID, rp.ContainerName)
 			if inspectErr != nil {
 				return fmt.Errorf("safety parent restored but could not be inspected for dependent rebinding: %w", inspectErr)
 			}
-			if depRestoreErr := a.recreateNetworkNamespaceDependents(context.Background(), jobID, rp.HostID, rp.ContainerName, parent.ID, currentDependencyCtx); depRestoreErr != nil {
+			if depRestoreErr := a.recreateNetworkNamespaceDependents(recoveryCtx, jobID, rp.HostID, rp.ContainerName, parent.ID, currentDependencyCtx); depRestoreErr != nil {
 				return fmt.Errorf("safety parent restored but dependent rebinding failed: %w", depRestoreErr)
 			}
 		}
@@ -809,6 +854,25 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 			return err
 		}
 	}
+	rollbackVerification := a.runCustomVerification(ctx, rp.HostID, rp.ContainerName, trigger, actor, jobID)
+	rollbackVerificationJSON := "[]"
+	if bs, e := json.Marshal(rollbackVerification); e == nil {
+		rollbackVerificationJSON = string(bs)
+	}
+	if rollbackVerification.Status == verificationStatusFailed {
+		err = fmt.Errorf("post-rollback custom verification failed: %s", rollbackVerification.Error)
+		a.jobProgress(ctx, jobID, 100, "Rollback verification failed")
+		_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+		_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+		_ = a.Store.Audit(ctx, actor, "rollback.verification.failed", rp.HostID, rp.ContainerName, err.Error())
+		_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: rp.HostID, ContainerName: rp.ContainerName, Action: "rollback", Trigger: trigger, Actor: actor, Status: "failed", FromVersion: currentVersion.Installed, ToVersion: rp.FromVersion, FromImageRef: currentContainer.Image, ToImageRef: rp.OriginalImageRef, FromDigest: currentContainer.ImageID, ToDigest: rp.OriginalImageID, SnapshotID: rp.SnapshotID, RestorePointID: rp.ID, DurationMS: time.Since(started).Milliseconds(), Error: err.Error(), DependencyCount: len(rollbackExecutionDeps), DependencyStatus: func() string {
+			if len(rollbackExecutionDeps) > 0 {
+				return "success"
+			}
+			return "none"
+		}(), DependencyDetails: dependencyNames(rollbackExecutionDeps), VerificationStatus: rollbackVerification.Status, VerificationDetails: rollbackVerificationJSON})
+		return err
+	}
 	_, _, _ = a.check(ctx, rp.HostID, rp.ContainerName, "post-rollback")
 	if snoozed := a.snoozeLatestAfterRollback(ctx, rp.HostID, rp.ContainerName, rp.TargetDigest); snoozed != "" {
 		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "rollback", "Update digest snoozed after rollback: "+snoozed)
@@ -826,7 +890,7 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 			return "success"
 		}
 		return "none"
-	}(), DependencyDetails: dependencyNames(rollbackExecutionDeps)})
+	}(), DependencyDetails: dependencyNames(rollbackExecutionDeps), VerificationStatus: rollbackVerification.Status, VerificationDetails: rollbackVerificationJSON})
 	return nil
 }
 
@@ -887,6 +951,10 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 403, "system-managed containers cannot be rolled back here")
 			return
 		}
+		if chainID, reserved := a.chainReservation(rp.HostID, rp.ContainerName); reserved {
+			writeErr(w, 409, fmt.Sprintf("container is reserved by active update chain #%d", chainID))
+			return
+		}
 		active, _ := a.Store.HasActiveJob(r.Context(), rp.HostID, rp.ContainerName)
 		if active {
 			writeErr(w, 409, "another operation is already running for this container")
@@ -922,6 +990,10 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 	managed, _ := a.systemManagedContainer(hist.ContainerName)
 	if managed {
 		writeErr(w, 403, "system-managed containers cannot be rolled back here")
+		return
+	}
+	if chainID, reserved := a.chainReservation(hist.HostID, hist.ContainerName); reserved {
+		writeErr(w, 409, fmt.Sprintf("container is reserved by active update chain #%d", chainID))
 		return
 	}
 	active, _ := a.Store.HasActiveJob(r.Context(), hist.HostID, hist.ContainerName)

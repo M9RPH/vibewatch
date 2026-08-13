@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/watchtower-ui/watchtower-ui/internal/dockercli"
 )
 
 const networkNamespaceDependencyType = "network_namespace"
@@ -85,21 +87,41 @@ func (a *App) discoverNetworkNamespaceDependents(ctx context.Context, hostID int
 	if err != nil {
 		return inspectContainer{}, nil, err
 	}
-	deps := make([]networkNamespaceDependencyRuntime, 0)
+	candidates := make([]dockercli.Container, 0, len(containers))
+	candidateIDs := make([]string, 0, len(containers))
 	for _, c := range containers {
 		if c.Name == targetName || (target.ID != "" && c.ID == target.ID) {
 			continue
 		}
-		raw, inspectErr := a.Docker.InspectContainersRaw(ctx, h.Endpoint, c.ID)
+		candidates = append(candidates, c)
+		candidateIDs = append(candidateIDs, c.ID)
+	}
+	inspected := []inspectContainer{}
+	if len(candidateIDs) > 0 {
+		raw, inspectErr := a.Docker.InspectContainersRaw(ctx, h.Endpoint, candidateIDs...)
 		if inspectErr != nil {
+			return inspectContainer{}, nil, fmt.Errorf("batch inspect possible namespace dependents: %w", inspectErr)
+		}
+		if inspectErr = json.Unmarshal(raw, &inspected); inspectErr != nil {
+			return inspectContainer{}, nil, fmt.Errorf("decode possible namespace dependents: %w", inspectErr)
+		}
+	}
+	deps := make([]networkNamespaceDependencyRuntime, 0)
+	for _, c := range candidates {
+		var depInspect inspectContainer
+		found := false
+		for _, x := range inspected {
+			if sameContainerIdentity(c.ID, x) || sameContainerIdentity(c.Name, x) {
+				depInspect = x
+				found = true
+				break
+			}
+		}
+		if !found {
 			// Missing a single container during the pre-update scan could hide an
 			// actual namespace dependency. Fail closed rather than recreating the
 			// parent without a complete dependency graph.
-			return inspectContainer{}, nil, fmt.Errorf("inspect possible namespace dependent %s: %w", c.Name, inspectErr)
-		}
-		depInspect, inspectErr := decodeInspectOne(raw)
-		if inspectErr != nil {
-			return inspectContainer{}, nil, fmt.Errorf("decode possible namespace dependent %s: %w", c.Name, inspectErr)
+			return inspectContainer{}, nil, fmt.Errorf("possible namespace dependent %s was not returned by Docker batch inspect", c.Name)
 		}
 		ref, ok := containerNamespaceRef(depInspect.HostConfig.NetworkMode)
 		if !ok {
@@ -182,6 +204,10 @@ func (a *App) attachDependencySnapshots(ctx context.Context, hostID int64, paren
 	if err != nil {
 		return nil, err
 	}
+	h, err := a.Store.Host(ctx, hostID)
+	if err != nil {
+		return nil, err
+	}
 	// A stack snapshot may contain several dependents. Track coverage so we
 	// create at most one extra snapshot for a backup unit and reuse it for all
 	// dependents contained in that unit. This also avoids unnecessary retention
@@ -198,7 +224,9 @@ func (a *App) attachDependencySnapshots(ctx context.Context, hostID int64, paren
 			deps[i].SnapshotID = snapshotID
 			continue
 		}
-		snap, snapErr := a.createSnapshotForContainer(ctx, hostID, deps[i].SourceContainer, "before-dependency-recreate")
+		snapshotCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 60*time.Second, 3*time.Minute))
+		snap, snapErr := a.createSnapshotForContainer(snapshotCtx, hostID, deps[i].SourceContainer, "before-dependency-recreate")
+		cancel()
 		if snapErr != nil {
 			return nil, fmt.Errorf("dependency %s recovery snapshot: %w", deps[i].SourceContainer, snapErr)
 		}
