@@ -701,3 +701,376 @@ button, input, select { font: inherit; }
 .wt-cleanup-progress.is-failed .wt-op-bar { background: #ef4444; }
 .wt-cleanup-progress.is-done .wt-op-bar::after,
 .wt-cleanup-progress.is-failed .wt-op-bar::after { display: none; }
+
+/* V0.9.2.6 progressive disclosure / container UX ------------------------- */
+.wt-quick-filters { display:flex; flex-wrap:wrap; gap:.5rem; }
+.wt-filter-chip { display:inline-flex; align-items:center; gap:.45rem; min-height:34px; border:1px solid var(--wt-border); border-radius:999px; background:var(--wt-surface); padding:.3rem .65rem; color:var(--wt-muted); font-size:.7rem; font-weight:650; transition:background-color .14s ease,border-color .14s ease,color .14s ease; }
+.wt-filter-chip:hover { background:var(--wt-surface-hover); color:var(--wt-text-2); }
+.wt-filter-chip.is-active { border-color:rgba(59,130,246,.5); background:rgba(59,130,246,.11); color:var(--wt-text-2); }
+.wt-container-filterbar { display:grid; grid-template-columns:minmax(220px,1.4fr) minmax(140px,.7fr) minmax(160px,.85fr) minmax(170px,.8fr) minmax(150px,.7fr); gap:.55rem; border-bottom:1px solid var(--wt-border); padding:.8rem 1rem; background:var(--wt-surface); }
+.wt-table.wt-table-containers { min-width:980px; table-layout:fixed; }
+.wt-table-containers col.wt-col-container { width:23%; }
+.wt-table-containers col.wt-col-context { width:16%; }
+.wt-table-containers col.wt-col-image-state { width:19%; }
+.wt-table-containers col.wt-col-policy { width:11%; }
+.wt-table-containers col.wt-col-actions-compact { width:13%; }
+.wt-link { color:var(--wt-text-2); text-decoration:underline; text-decoration-color:transparent; text-underline-offset:3px; transition:text-decoration-color .14s ease,color .14s ease; }
+.wt-link:hover { color:#60a5fa; text-decoration-color:rgba(96,165,250,.55); }
+.wt-primary-actions { position:relative; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) 34px; gap:.35rem; margin-left:auto; width:100%; max-width:220px; align-items:center; }
+.wt-more-menu { position:relative; overflow:visible; }
+.wt-more-trigger { display:grid; min-height:30px; cursor:pointer; list-style:none; place-items:center; border:1px solid var(--wt-border); border-radius:.45rem; background:var(--wt-surface); color:var(--wt-muted); font-size:1rem; line-height:1; user-select:none; }
+.wt-more-trigger::-webkit-details-marker { display:none; }
+.wt-more-trigger:hover { background:var(--wt-surface-hover); color:var(--wt-text-2); }
+.wt-more-menu[open] .wt-more-trigger { border-color:rgba(59,130,246,.45); background:rgba(59,130,246,.08); color:var(--wt-text-2); }
+.wt-more-popover { position:absolute; z-index:40; right:0; top:calc(100% + .4rem); width:230px; overflow:hidden; border:1px solid var(--wt-border); border-radius:.75rem; background:var(--wt-surface); padding:.35rem; box-shadow:0 18px 45px rgba(0,0,0,.28); text-align:left; }
+.wt-menu-action { display:block; width:100%; border:0; border-radius:.5rem; background:transparent; padding:.58rem .65rem; color:var(--wt-text-2); font-size:.72rem; text-align:left; transition:background-color .12s ease,color .12s ease; }
+.wt-menu-action:hover:not(:disabled) { background:var(--wt-surface-hover); }
+.wt-menu-action:disabled { cursor:not-allowed; color:var(--wt-subtle); opacity:.5; }
+.wt-menu-action.is-danger { color:#fca5a5; }
+:root[data-theme="light"] .wt-menu-action.is-danger { color:#b91c1c; }
+.wt-menu-separator { height:1px; margin:.25rem .15rem; background:var(--wt-border-soft); }
+.wt-detail-panel,.wt-detail-section { border:1px solid var(--wt-border-soft); border-radius:.8rem; background:var(--wt-surface-muted); padding:.9rem; }
+.wt-detail-label { color:var(--wt-subtle); font-size:.625rem; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+.wt-detail-value { margin-top:.25rem; color:var(--wt-text-2); font-size:1rem; font-weight:650; }
+.wt-detail-section-title { margin-bottom:.75rem; color:var(--wt-text-2); font-size:.8rem; font-weight:700; }
+.wt-disclosure-list { display:grid; gap:.65rem; }
+.wt-disclosure-card { overflow:hidden; border:1px solid var(--wt-border); border-radius:.9rem; background:var(--wt-surface); }
+.wt-disclosure-summary { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(120px,.6fr) minmax(140px,.7fr) auto; gap:.8rem; align-items:center; cursor:pointer; list-style:none; padding:.85rem 1rem; }
+.wt-disclosure-summary::-webkit-details-marker { display:none; }
+.wt-disclosure-card[open] .wt-disclosure-summary { border-bottom:1px solid var(--wt-border-soft); background:var(--wt-surface-muted); }
+.wt-disclosure-body { padding:1rem; }
+.wt-disclosure-chevron { color:var(--wt-subtle); transition:transform .16s ease; }
+.wt-disclosure-card[open] .wt-disclosure-chevron { transform:rotate(180deg); }
+
+@media (max-width: 1100px) {
+  .wt-container-filterbar { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .wt-container-filterbar > :first-child { grid-column:1/-1; }
+  .wt-table.wt-table-containers { min-width:900px; }
+}
+@media (max-width: 700px) {
+  .wt-container-filterbar { grid-template-columns:1fr; }
+  .wt-container-filterbar > :first-child { grid-column:auto; }
+  .wt-disclosure-summary { grid-template-columns:minmax(0,1fr) auto; }
+  .wt-disclosure-summary > .wt-disclosure-secondary { display:none; }
+}
+.wt-table-containers tbody td:last-child { position:relative; overflow:visible; }
+.wt-more-popover { top:auto; bottom:calc(100% + .4rem); }
+
+/* V0.9.2.6 layout consistency / side-drawer UX --------------------------- */
+:root { --wt-content-x: 1rem; }
+
+/* Controls that sit above tables/disclosure lists share the exact same
+   horizontal inset as the first/last table header and cell. */
+.wt-section-filterbar,
+.wt-disclosure-heading {
+  padding: .9rem var(--wt-content-x);
+  border-bottom: 1px solid var(--wt-border);
+  background: var(--wt-surface);
+}
+.wt-disclosure-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .8rem;
+}
+.wt-quick-filters {
+  padding-inline: var(--wt-content-x);
+}
+.wt-container-filterbar {
+  padding-inline: var(--wt-content-x);
+}
+.wt-table thead th:first-child,
+.wt-table tbody td:first-child { padding-left: var(--wt-content-x); }
+.wt-table thead th:last-child,
+.wt-table tbody td:last-child { padding-right: var(--wt-content-x); }
+
+/* Flush disclosure lists behave like compact tables: one common outer
+   border, aligned headings, no cumulative nested-card indentation. */
+.wt-disclosure-list-flush { gap: 0; }
+.wt-disclosure-list-flush .wt-disclosure-card {
+  border-width: 0 0 1px 0;
+  border-radius: 0;
+}
+.wt-disclosure-list-flush .wt-disclosure-card:last-child { border-bottom: 0; }
+.wt-disclosure-list-flush .wt-disclosure-summary { padding-inline: var(--wt-content-x); }
+.wt-disclosure-list-flush .wt-disclosure-body { padding-inline: var(--wt-content-x); }
+
+/* Host/stack hierarchy: labels are deliberately quieter than values so the
+   user can distinguish physical host, Compose stack and service at a glance. */
+.wt-context-block { display: grid; gap: .3rem; min-width: 0; }
+.wt-context-line { display: grid; grid-template-columns: 3.2rem minmax(0,1fr) auto; align-items: center; gap: .35rem; min-width: 0; }
+.wt-context-key { color: var(--wt-subtle); font-size: .58rem; font-weight: 750; letter-spacing: .055em; text-transform: uppercase; }
+.wt-context-value { min-width: 0; overflow: hidden; color: var(--wt-text-2); font-size: .69rem; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.wt-context-stack { color: #93c5fd; }
+:root[data-theme="light"] .wt-context-stack { color: #1d4ed8; }
+
+/* Ellipsis triggers are shared by container rows and dashboard host cards. */
+.wt-more-trigger {
+  width: 34px;
+  min-width: 34px;
+  height: 32px;
+  padding: 0;
+}
+.wt-host-more { flex: 0 0 auto; }
+
+/* The old popover remains styled for backwards-compatible markup in older
+   cached bundles, but V0.9.2.6 routes container/host ellipsis actions into
+   the shared right-side Drawer instead. */
+
+@media (max-width: 700px) {
+  .wt-context-line { grid-template-columns: 2.9rem minmax(0,1fr); }
+  .wt-context-line .wt-badge { grid-column: 2; }
+  .wt-disclosure-heading { align-items: flex-start; }
+}
+
+/* V0.9.2.7 alignment pass ------------------------------------------------- */
+/* Containers: filter cells use the exact same six-column proportions as the
+   table underneath. No free-running filter widths beside the table columns. */
+.wt-container-filterbar {
+  display: grid;
+  grid-template-columns: 23fr 16fr 19fr 18fr 11fr 13fr;
+  gap: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--wt-border);
+  background: var(--wt-surface);
+}
+.wt-filter-cell {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  padding: .55rem .75rem;
+}
+.wt-filter-cell:first-child { padding-left: var(--wt-content-x); }
+.wt-filter-cell:last-child { padding-right: var(--wt-content-x); justify-content: flex-end; }
+.wt-filter-context-pair {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0,.9fr) minmax(0,1.1fr);
+  gap: .35rem;
+}
+.wt-filter-cell-muted {
+  color: var(--wt-subtle);
+  font-size: .625rem;
+  line-height: .9rem;
+}
+.wt-filter-cell-count {
+  color: var(--wt-subtle);
+  font-size: .625rem;
+  font-weight: 700;
+  letter-spacing: .055em;
+  text-transform: uppercase;
+}
+
+/* Host -> stack -> service is a visual tree instead of three equal key/value
+   rows. The hierarchy is visible without relying on font weight alone. */
+.wt-context-tree { min-width: 0; display: grid; gap: .4rem; }
+.wt-context-host { min-width: 0; display: grid; grid-template-columns: 8px minmax(0,1fr); gap: .4rem; align-items: center; }
+.wt-context-node-dot { width: 6px; height: 6px; border-radius: 999px; background: #60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,.10); }
+.wt-context-node-label { color: var(--wt-subtle); font-size: .54rem; line-height: .72rem; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
+.wt-context-node-value { min-width: 0; overflow: hidden; color: var(--wt-text-2); font-size: .69rem; line-height: .95rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.wt-context-branch { position: relative; min-width: 0; margin-left: 3px; padding-left: .8rem; border-left: 1px solid var(--wt-border); display: grid; gap: .35rem; }
+.wt-context-branch::before { content: ''; position: absolute; left: 0; top: .58rem; width: .55rem; border-top: 1px solid var(--wt-border); }
+.wt-context-stack-row { min-width: 0; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: .35rem; align-items: center; }
+.wt-context-service-row { min-width: 0; display: grid; grid-template-columns: 2.9rem minmax(0,1fr); gap: .35rem; align-items: center; }
+.wt-context-standalone { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+
+/* Disclosure-based views now behave like real tables: the header and every
+   summary row share the same explicit grid. */
+.wt-disclosure-table-head {
+  display: grid;
+  gap: 0;
+  align-items: center;
+  min-height: 38px;
+  border-bottom: 1px solid var(--wt-border);
+  background: var(--wt-table-head);
+  padding-inline: var(--wt-content-x);
+  color: var(--wt-subtle);
+  font-size: .625rem;
+  font-weight: 700;
+  letter-spacing: .075em;
+  text-transform: uppercase;
+}
+.wt-disclosure-table-head > span,
+.wt-disclosure-summary > * { min-width: 0; }
+.wt-rollback-grid { grid-template-columns: minmax(0,2.2fr) minmax(145px,.95fr) minmax(170px,1.05fr) minmax(190px,1.05fr); }
+.wt-chain-config-grid { grid-template-columns: minmax(0,1.6fr) minmax(125px,.72fr) minmax(135px,.78fr) minmax(105px,.55fr); }
+.wt-chain-history-grid { grid-template-columns: minmax(0,1.6fr) minmax(125px,.72fr) minmax(145px,.84fr) minmax(100px,.52fr); }
+.wt-disclosure-summary.wt-rollback-grid,
+.wt-disclosure-summary.wt-chain-config-grid,
+.wt-disclosure-summary.wt-chain-history-grid {
+  gap: 0;
+  padding-inline: var(--wt-content-x);
+}
+.wt-disclosure-table-head > span,
+.wt-disclosure-summary.wt-rollback-grid > *,
+.wt-disclosure-summary.wt-chain-config-grid > *,
+.wt-disclosure-summary.wt-chain-history-grid > * {
+  padding-right: .75rem;
+}
+.wt-disclosure-table-head > span:last-child,
+.wt-disclosure-summary.wt-rollback-grid > *:last-child,
+.wt-disclosure-summary.wt-chain-config-grid > *:last-child,
+.wt-disclosure-summary.wt-chain-history-grid > *:last-child { padding-right: 0; }
+
+/* Rollback filters share the same four-column grid as the rows below. */
+.wt-rollback-filter-grid {
+  display: grid;
+  grid-template-columns: minmax(0,2.2fr) minmax(145px,.95fr) minmax(170px,1.05fr) minmax(190px,1.05fr);
+  gap: 0;
+  border-bottom: 1px solid var(--wt-border);
+  background: var(--wt-surface);
+}
+
+@media (max-width: 1180px) {
+  .wt-container-filterbar { min-width: 980px; }
+  .wt-filter-context-pair { grid-template-columns: 1fr; }
+  .wt-rollback-filter-grid,
+  .wt-disclosure-table-head.wt-rollback-grid,
+  .wt-disclosure-summary.wt-rollback-grid { min-width: 900px; }
+}
+@media (max-width: 760px) {
+  .wt-disclosure-table-head { display: none; }
+  .wt-disclosure-summary.wt-rollback-grid,
+  .wt-disclosure-summary.wt-chain-config-grid,
+  .wt-disclosure-summary.wt-chain-history-grid { grid-template-columns: minmax(0,1fr) auto; gap: .65rem; }
+  .wt-disclosure-summary.wt-rollback-grid > .wt-disclosure-secondary,
+  .wt-disclosure-summary.wt-chain-config-grid > .wt-disclosure-secondary,
+  .wt-disclosure-summary.wt-chain-history-grid > .wt-disclosure-secondary { display: none; }
+  .wt-rollback-filter-grid { grid-template-columns: 1fr; }
+  .wt-rollback-filter-grid .wt-filter-cell { padding-inline: var(--wt-content-x); }
+}
+
+/* V0.9.2.7 compact Containers hotfix: remove Status / Attention as a dedicated
+   column. Runtime remains the state dot; config status lives below the container
+   identity; verification details stay in the drawer. Filters and table use the
+   exact same six-column proportions. */
+.wt-container-filterbar {
+  grid-template-columns: 24fr 12fr 21fr 23fr 10fr 10fr;
+}
+.wt-table.wt-table-containers { min-width: 980px; }
+.wt-table-containers col.wt-col-container { width: 24%; }
+.wt-table-containers col.wt-col-host { width: 12%; }
+.wt-table-containers col.wt-col-stack { width: 21%; }
+.wt-table-containers col.wt-col-image-state { width: 23%; }
+.wt-table-containers col.wt-col-policy { width: 10%; }
+.wt-table-containers col.wt-col-actions-compact { width: 10%; }
+.wt-primary-actions {
+  grid-template-columns: 32px 32px 34px;
+  justify-content: end;
+  max-width: 108px;
+}
+.wt-table-icon-btn {
+  width: 32px !important;
+  min-width: 32px !important;
+  min-height: 32px !important;
+  height: 32px !important;
+  padding: 0 !important;
+  border-radius: .45rem !important;
+}
+.wt-table-icon-btn svg { width: 16px; height: 16px; }
+@media (max-width: 1180px) {
+  .wt-container-filterbar { min-width: 980px; }
+}
+
+/* V0.9.2.7 UI hotfix ------------------------------------------------------- */
+/* Container action progress must stay inside the compact Actions column. */
+.wt-table-containers .wt-op-progress {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  padding: .42rem .45rem;
+  text-align: left;
+}
+.wt-table-containers .wt-op-progress > div { min-width: 0; }
+.wt-table-containers .wt-op-progress .wt-op-track { width: 100%; }
+.wt-table-containers tbody td:last-child { min-width: 0; }
+
+/* Preflight gets a wider, wrapping layout instead of clipping long source,
+   detail, mount and dependency text. */
+.wt-preflight-live {
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .75rem;
+  background: var(--wt-surface-muted);
+  padding: .75rem .85rem;
+}
+.wt-table.wt-preflight-table {
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
+}
+.wt-preflight-table col.wt-preflight-status { width: 11%; }
+.wt-preflight-table col.wt-preflight-check { width: 19%; }
+.wt-preflight-table col.wt-preflight-source { width: 14%; }
+.wt-preflight-table col.wt-preflight-duration { width: 9%; }
+.wt-preflight-table col.wt-preflight-description { width: 47%; }
+.wt-preflight-table th,
+.wt-preflight-table td {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  white-space: normal;
+  vertical-align: top !important;
+}
+
+/* The chain editor now lives in the narrower right column, so member controls
+   use a compact vertical layout rather than overflowing a desktop-width grid. */
+.wt-chain-member-grid {
+  display: grid;
+  grid-template-columns: 36px minmax(0,1fr);
+  gap: .5rem;
+  min-width: 0;
+}
+.wt-chain-member-grid > :nth-child(n+3) { grid-column: 1 / -1; }
+
+@media (max-width: 760px) {
+  .wt-preflight-table col.wt-preflight-status { width: 15%; }
+  .wt-preflight-table col.wt-preflight-check { width: 21%; }
+  .wt-preflight-table col.wt-preflight-source { width: 17%; }
+  .wt-preflight-table col.wt-preflight-duration { width: 12%; }
+  .wt-preflight-table col.wt-preflight-description { width: 35%; }
+}
+
+.wt-table-containers .wt-op-progress > div:last-child > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+/* V0.9.2.7 UI refinement: structured container drawer actions and uniform
+   safety badges. Keep this visual-only; update/rollback behavior is unchanged. */
+.wt-safety-badges { align-items: center; }
+.wt-safety-badges > button { display: inline-flex; align-items: stretch; }
+.wt-safety-badges .wt-badge { min-height: 24px; align-items: center; }
+.wt-container-action-group {
+  border: 1px solid var(--wt-border-soft);
+  border-radius: .8rem;
+  background: var(--wt-surface-muted);
+  padding: .9rem;
+}
+.wt-container-action-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .75rem;
+  margin-bottom: .75rem;
+}
+.wt-container-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0,1fr));
+  gap: .5rem;
+}
+.wt-container-drawer-action {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  justify-content: center;
+  text-align: center;
+}
+.wt-container-action-wide { grid-column: 1 / -1; }
+@media (max-width: 520px) {
+  .wt-container-action-grid { grid-template-columns: 1fr; }
+  .wt-container-action-wide { grid-column: auto; }
+}

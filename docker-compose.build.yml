@@ -1,0 +1,19 @@
+# Optional source-build overlay for developers. The default docker-compose.yml
+# intentionally consumes the published GHCR image so normal installations do
+# not require a local toolchain.
+services:
+  vibewatch-runtime-migrate:
+    image: "vibewatch:0.9.2.7"
+    build:
+      context: .
+      args:
+        VIBEWATCH_VERSION: "0.9.2.7"
+
+  vibewatch:
+    image: "vibewatch:0.9.2.7"
+    build:
+      context: .
+      args:
+        VIBEWATCH_VERSION: "0.9.2.7"
+    environment:
+      WTUI_APP_IMAGE: "vibewatch:0.9.2.7"

@@ -1,4 +1,38 @@
-# Vibewatch V0.9.1 Architecture
+# Vibewatch V0.9.2.7 Architecture
+
+
+## V0.9.2.7 UI information architecture
+
+V0.9.2.7 does not introduce a new update/rollback execution path. The UI standardizes table/control alignment and extends the right-side Drawer pattern from containers to Dashboard hosts. The existing API pipeline, transaction state machine, TLS/mTLS host transport and recovery model remain unchanged.
+
+The only schema change is additive metadata on `version_cache`: `update_kind` stores the informational Major/Minor/Patch/Image classification derived from readable version labels, and `security_update` records an explicit security classification only when matching release metadata contains security/CVE wording. These fields never replace digest-based update detection.
+
+## V0.9.2 secure host connectivity and release pipeline
+
+V0.9.2 deliberately keeps the existing central-controller/central-worker architecture. No remote Vibewatch agent or alternate update engine is introduced. Docker host transport is normalized at the Docker CLI boundary so inventory, Preflight, Config Snapshots, Restore Points, cleanup, events, rollback and workers all inherit the same connection behavior.
+
+### Docker connection model
+
+- `unix://...` → local socket.
+- `tcp://...` → legacy/plain Docker TCP.
+- `tls://host:2376` → Vibewatch's persisted marker for verified Docker TLS/mTLS. Before invoking Docker, the client maps it to `tcp://host:2376` and adds `--tlsverify`, CA, client certificate and client private-key flags.
+- TLS material is stored under `/data/host-tls/<endpoint-hash>/` with directory mode 0700 and file mode 0600. It is never returned as part of the Host object and is not copied into the support bundle.
+- Remote Watchtower workers remain sibling containers on the controller Docker daemon. For TLS hosts the worker receives `DOCKER_HOST`, `DOCKER_TLS_VERIFY=1`, `DOCKER_CERT_PATH` and a read-only mount containing only that host's credential directory. Existing TCP and local worker behavior is unchanged.
+- Certificate rotation recreates the worker so the next worker process receives the updated material. TLS daemon provisioning itself remains an operator responsibility.
+
+### Backup bundle model
+
+The existing transaction-consistent SQLite backup function remains the only database snapshot primitive. V0.9.2 wraps that artifact in an Owner-only portable ZIP manifest together with the registry-credential encryption key and TLS/mTLS client material when they exist. Validation checks manifest format, DB SHA256, SQLite integrity and included credential material. Restore is intentionally absent; no live database replacement path is introduced.
+
+### Diagnostics and exports
+
+`Why didn't this update?` is a read-only projection of existing persisted state (effective policy/chain ownership, Automations, snooze/cache, jobs, leases, host reachability and latest Preflight). It does not perform an update check or mutate Docker. Export endpoints query the same stores used by the UI and apply the same RBAC/host filtering before returning JSON/CSV/TXT.
+
+### CI/CD and package structure
+
+The normal Compose deployment consumes the pinned GHCR image. `docker-compose.build.yml` is an explicit developer overlay for local builds. CI executes Go, frontend, Docker-build, migration/unit and Docker integration/NetEm gates before the publish workflow can build multi-architecture GHCR images. The release repository keeps an empty but complete `/data` skeleton through `.gitkeep` exceptions while excluding actual databases, credential material, backups and logs.
+
+No SQLite migration is introduced by V0.9.2.
 
 ## V0.9.1 asynchronous cleanup execution
 

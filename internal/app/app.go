@@ -68,12 +68,14 @@ type App struct {
 	chainReserved map[string]int64
 }
 type updateRequest struct {
-	JobID         int64
-	TransactionID int64
-	HostID        int64
-	Container     string
-	Trigger       string
-	Actor         string
+	JobID           int64
+	TransactionID   int64
+	HostID          int64
+	Container       string
+	Trigger         string
+	Actor           string
+	PreviewProgress func(percent int, stage string)
+	PreviewCheck    func(check PreflightCheck)
 }
 
 type ContainerView struct {
@@ -90,12 +92,18 @@ type ContainerView struct {
 }
 
 type hostInput struct {
-	Name     string `json:"name"`
-	Endpoint string `json:"endpoint"`
-	Enabled  bool   `json:"enabled"`
+	Name           string `json:"name"`
+	Endpoint       string `json:"endpoint"`
+	Enabled        bool   `json:"enabled"`
+	ConnectionType string `json:"connection_type"`
+	TLSCA          string `json:"tls_ca"`
+	TLSCert        string `json:"tls_cert"`
+	TLSKey         string `json:"tls_key"`
 }
 type HostView struct {
 	db.Host
+	ConnectionType          string                `json:"connection_type"`
+	TLSConfigured           bool                  `json:"tls_configured"`
 	Worker                  dockercli.WorkerState `json:"worker"`
 	DockerReachable         bool                  `json:"docker_reachable"`
 	DockerReachabilityKnown bool                  `json:"docker_reachability_known"`
@@ -452,6 +460,9 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("PUT /api/system/settings", a.handleSystemSettings)
 	protected.HandleFunc("POST /api/system/worker-update", a.handleWorkerUpdate)
 	protected.HandleFunc("POST /api/system/backup", a.handleSystemBackup)
+	protected.HandleFunc("GET /api/system/backups", a.handleSystemBackups)
+	protected.HandleFunc("POST /api/system/backups", a.handleSystemBackups)
+	protected.HandleFunc("/api/system/backups/", a.handleSystemBackupSubroutes)
 	protected.HandleFunc("GET /api/system/self-update", a.handleSelfUpdate)
 	protected.HandleFunc("POST /api/system/self-update", a.handleSelfUpdate)
 	// Legacy V0.1 schedule endpoints remain readable for diagnostics only.
@@ -460,6 +471,7 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("GET /api/docker-events", a.handleDockerEvents)
 	protected.HandleFunc("GET /api/logs/application", a.handleApplicationLogs)
 	protected.HandleFunc("GET /api/logs/pushover", a.handlePushoverLogs)
+	protected.HandleFunc("/api/export/", a.handleExport)
 	protected.HandleFunc("GET /api/container-backups", a.handleContainerBackups)
 	protected.HandleFunc("GET /api/container-backups/download-all", a.handleContainerBackupDownloadAll)
 	protected.HandleFunc("POST /api/container-backups/snapshot", a.handleContainerBackupSnapshot)
@@ -623,6 +635,8 @@ func (a *App) handleHosts(w http.ResponseWriter, r *http.Request) {
 			health := a.hostHealthView(h.ID)
 			views[i] = HostView{
 				Host:                    h,
+				ConnectionType:          dockercli.ConnectionType(h.Endpoint),
+				TLSConfigured:           a.Docker.TLSConfigured(h.Endpoint),
 				Worker:                  a.Docker.WorkerState(r.Context(), h.ID),
 				DockerReachable:         health.Reachable,
 				DockerReachabilityKnown: health.Known,
@@ -641,9 +655,24 @@ func (a *App) handleHosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in hostInput
-	if json.NewDecoder(r.Body).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.Endpoint) == "" {
+	if json.NewDecoder(io.LimitReader(r.Body, 512*1024)).Decode(&in) != nil || strings.TrimSpace(in.Name) == "" {
 		writeErr(w, 400, "name and endpoint are required")
 		return
+	}
+	endpoint, endpointErr := normalizeHostEndpoint(in.ConnectionType, in.Endpoint)
+	if endpointErr != nil {
+		writeErr(w, 400, endpointErr.Error())
+		return
+	}
+	if dockercli.ConnectionType(endpoint) == "tls" && !a.isOwner(r) {
+		writeErr(w, http.StatusForbidden, "TLS/mTLS Docker host credentials can only be configured by the owner")
+		return
+	}
+	if dockercli.ConnectionType(endpoint) == "tls" {
+		if err := validateTLSCredentials(in.TLSCA, in.TLSCert, in.TLSKey); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
 	}
 	token, tokenErr := randomToken(32)
 	if tokenErr != nil {
@@ -651,17 +680,26 @@ func (a *App) handleHosts(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "failed to generate worker API token")
 		return
 	}
-	id, err := a.Store.CreateHost(r.Context(), strings.TrimSpace(in.Name), strings.TrimSpace(in.Endpoint), token, db.Bool(in.Enabled))
+	id, err := a.Store.CreateHost(r.Context(), strings.TrimSpace(in.Name), endpoint, token, db.Bool(in.Enabled))
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if dockercli.ConnectionType(endpoint) == "tls" {
+		if err := a.saveHostTLSCredentials(endpoint, in.TLSCA, in.TLSCert, in.TLSKey); err != nil {
+			_ = a.Store.DeleteHost(context.Background(), id)
+			_ = a.removeHostTLSCredentials(endpoint)
+			writeErr(w, 500, "TLS credentials could not be persisted: "+err.Error())
+			return
+		}
+	}
+	in.TLSCA, in.TLSCert, in.TLSKey = "", "", ""
 	h, _ := a.Store.Host(r.Context(), id)
 	if h.Enabled {
 		a.Events.Start(a.ctx, a.Docker, a.Store, h)
 		go a.startHostWorker(h, "host-created")
 	}
-	_ = a.Store.Audit(r.Context(), a.actor(r), "host.create", id, "", in.Endpoint)
+	_ = a.Store.Audit(r.Context(), a.actor(r), "host.create", id, "", fmt.Sprintf("connection=%s endpoint=%s", dockercli.ConnectionType(endpoint), endpoint))
 	writeJSON(w, 201, h)
 }
 
@@ -783,14 +821,51 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 		if !a.requireAdmin(w, r) {
 			return
 		}
+		hostBeforeDelete, _ := a.Store.Host(r.Context(), id)
 		a.Events.Stop(id)
 		_ = a.Docker.RemoveWorker(context.Background(), id)
 		if err := a.Store.DeleteHost(r.Context(), id); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		if dockercli.ConnectionType(hostBeforeDelete.Endpoint) == "tls" {
+			_ = a.removeHostTLSCredentials(hostBeforeDelete.Endpoint)
+		}
 		_ = a.Store.Audit(r.Context(), a.actor(r), "host.delete", id, "", "")
 		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "tls" && r.Method == http.MethodPut {
+		if !a.requireOwner(w, r) {
+			return
+		}
+		h, e := a.Store.Host(r.Context(), id)
+		if e != nil {
+			writeErr(w, 404, "host not found")
+			return
+		}
+		if dockercli.ConnectionType(h.Endpoint) != "tls" {
+			writeErr(w, 409, "host is not configured for TLS/mTLS")
+			return
+		}
+		var in struct {
+			TLSCA   string `json:"tls_ca"`
+			TLSCert string `json:"tls_cert"`
+			TLSKey  string `json:"tls_key"`
+		}
+		if json.NewDecoder(io.LimitReader(r.Body, 512*1024)).Decode(&in) != nil {
+			writeErr(w, 400, "invalid json")
+			return
+		}
+		if err := a.saveHostTLSCredentials(h.Endpoint, in.TLSCA, in.TLSCert, in.TLSKey); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		_ = a.Docker.RemoveWorker(context.Background(), id)
+		go a.startHostWorker(h, "tls-credentials-rotated")
+		a.scheduleHostProbe(h, true)
+		_ = a.Store.Audit(r.Context(), a.actor(r), "host.tls.rotate", id, "", "TLS/mTLS client credentials replaced")
+		writeJSON(w, 200, map[string]any{"ok": true, "tls_configured": true})
 		return
 	}
 	if len(parts) == 2 && parts[1] == "test" && r.Method == http.MethodPost {
@@ -850,6 +925,10 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "containers" && r.Method == http.MethodGet {
 		a.handleContainers(w, r, id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "why-update" && r.Method == http.MethodGet {
+		a.handleWhyUpdate(w, r, id)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "check" && r.Method == http.MethodPost {
@@ -1558,6 +1637,73 @@ func versionStale(v string) bool {
 	t, e := time.Parse(time.RFC3339, v)
 	return e != nil || time.Since(t) > time.Hour
 }
+func updateVersionParts(v string) ([3]int, bool) {
+	v = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V"))
+	if v == "" {
+		return [3]int{}, false
+	}
+	// Accept common semver-ish tags such as 1.2.3, 1.2.3-r1 or 1.2.
+	// Classification is informational only; digest comparison stays authoritative.
+	parts := strings.SplitN(v, ".", 4)
+	if len(parts) < 2 {
+		return [3]int{}, false
+	}
+	var out [3]int
+	for i := 0; i < 3; i++ {
+		if i >= len(parts) {
+			out[i] = 0
+			continue
+		}
+		part := parts[i]
+		end := 0
+		for end < len(part) && part[end] >= '0' && part[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return [3]int{}, false
+		}
+		n, err := strconv.Atoi(part[:end])
+		if err != nil {
+			return [3]int{}, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func classifyVersionChange(installed, latest string) string {
+	oldV, okOld := updateVersionParts(installed)
+	newV, okNew := updateVersionParts(latest)
+	if !okOld || !okNew {
+		return "unknown"
+	}
+	if oldV[0] != newV[0] {
+		return "major"
+	}
+	if oldV[1] != newV[1] {
+		return "minor"
+	}
+	if oldV[2] != newV[2] {
+		return "patch"
+	}
+	return "image"
+}
+
+func explicitSecurityRelease(name, body string) bool {
+	text := strings.ToLower(strings.TrimSpace(name + "\n" + body))
+	for _, marker := range []string{"cve-", "security update", "security release", "security fix", "security fixes", "security vulnerability", "vulnerability fix", "vulnerability fixes"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameReleaseVersion(a, b string) bool {
+	norm := func(v string) string { return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V")) }
+	return norm(a) != "" && norm(a) == norm(b)
+}
+
 func (a *App) refreshVersion(ctx context.Context, hostID int64, container, image, repo, installed, installedSource string, platforms ...registry.Platform) {
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
@@ -1569,6 +1715,10 @@ func (a *App) refreshVersion(ctx context.Context, hostID int64, container, image
 	v.ReleaseRepo = repo
 	v.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 	v.Error = ""
+	v.SecurityUpdate = db.Bool(false)
+	v.UpdateKind = ""
+
+	registryResolved := false
 	// The registry image that Watchtower actually follows is authoritative for
 	// the readable target version when it publishes OCI version metadata.
 	if a.Registry != nil && strings.TrimSpace(image) != "" {
@@ -1582,24 +1732,33 @@ func (a *App) refreshVersion(ctx context.Context, hostID int64, container, image
 		if err == nil && rv.Version != "" {
 			v.Latest = strings.TrimPrefix(strings.TrimSpace(rv.Version), "v")
 			v.LatestSource = rv.Source
-			_ = a.Store.SaveVersion(context.Background(), v)
-			return
+			registryResolved = true
 		} else if err != nil {
 			v.Error = err.Error()
 		}
 	}
-	// GitHub release metadata remains a useful fallback and supplies patch notes.
+
+	// GitHub release metadata remains a useful fallback and is also the only
+	// source from which Vibewatch labels an update as Security. We deliberately
+	// require explicit release wording/CVE metadata; a patch version alone is
+	// never presented as a security update.
 	if strings.TrimSpace(repo) != "" {
 		rel, err := a.Releases.Latest(ctx, repo)
 		if err == nil {
-			v.Latest = strings.TrimPrefix(strings.TrimSpace(rel.TagName), "v")
-			v.LatestSource = "github-release"
-			v.PublishedAt = rel.PublishedAt
+			if !registryResolved {
+				v.Latest = strings.TrimPrefix(strings.TrimSpace(rel.TagName), "v")
+				v.LatestSource = "github-release"
+			}
+			if sameReleaseVersion(rel.TagName, v.Latest) {
+				v.PublishedAt = rel.PublishedAt
+				v.SecurityUpdate = db.Bool(explicitSecurityRelease(rel.Name, rel.Body))
+			}
 			v.Error = ""
-		} else if v.Error == "" {
+		} else if !registryResolved && v.Error == "" {
 			v.Error = err.Error()
 		}
 	}
+	v.UpdateKind = classifyVersionChange(v.Installed, v.Latest)
 	_ = a.Store.SaveVersion(context.Background(), v)
 }
 

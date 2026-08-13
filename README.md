@@ -1,6 +1,37 @@
-# Vibewatch V0.9.1
+# Vibewatch V0.9.2.7
 
 A central multi-host Docker update controller using the Nicholas Fedor Watchtower fork as an intentionally passive update worker.
+
+
+## V0.9.2.7 UX consolidation
+
+V0.9.2.7 continues the V0.9.2 progressive-disclosure UX work without changing the transaction, rollback, TLS/mTLS or CI/CD execution architecture. The focus is visual alignment and clearer context while retaining every existing operation.
+
+- Containers, Container Rollback and Update Chains share consistent horizontal insets so filters, headings and row content line up.
+- Container and Dashboard host ellipsis actions use the same right-side details drawer pattern.
+- Host / Stack / Service, Runtime / Verification / Config and update availability are labeled explicitly instead of relying on typography alone.
+- Readable version metadata is classified as Major / Minor / Patch; a Security badge is shown only when matching release metadata explicitly identifies a security/CVE fix. Digest comparison remains authoritative.
+- Configured Chains and Chain History sit side-by-side on wide layouts while remaining stacked responsively.
+- SQLite receives two additive `version_cache` columns (`update_kind`, `security_update`); existing installations migrate automatically with no manual reconfiguration.
+
+## V0.9.2 secure connectivity and release hardening
+
+V0.9.2 keeps the V0.9 transactional update/rollback architecture intact and hardens how Vibewatch is connected, installed, backed up and diagnosed.
+
+- **Docker TLS/mTLS hosts:** in addition to the local Unix socket and legacy TCP endpoints, an Owner can add a preconfigured Docker Engine through `tls://host:2376` with CA certificate, client certificate and client private key. The controller Docker CLI and the centrally managed Watchtower worker use the same verified TLS connection. No SSH Docker transport, Vibewatch agent or automatic TLS daemon reconfiguration is introduced in this release.
+- **Connection visibility:** Hosts and Dashboard show whether a Docker host is Local, TCP or TLS/mTLS. TLS credentials are stored as mode-0600 files under `/data/host-tls`, are never serialized through normal host APIs/support bundles, and can be rotated by the Owner.
+- **Official GHCR installation:** the default Compose file consumes `ghcr.io/m9rph/vibewatch:0.9.2.7`; local source builds use the separate `docker-compose.build.yml` overlay. The publishing workflow validates the application before producing `linux/amd64` and `linux/arm64` images.
+- **CI quality gates:** pushes/PRs run Go tests/vet/build, a real frontend production build, Docker image smoke build, release data-skeleton validation and Docker integration/NetEm regression tests. Container publication is gated by the same core checks.
+- **Portable Owner backup bundles:** Settings can create/download/delete/validate a complete Vibewatch bundle containing a transaction-consistent SQLite snapshot, registry-credential encryption key when present, and configured Docker TLS/mTLS client material. Bundles are explicitly marked sensitive. Restore is deliberately deferred to a dedicated future reliability release.
+- **Exports:** Update History, Jobs, Audit, Docker Events and Pushover delivery history can be exported as JSON/CSV; the Application Log can be exported as text. Existing role/host visibility rules are reused for exports.
+- **Why didn't this update?:** Containers expose a read-only diagnostic that explains effective policy/Stack Chain ownership, scheduler availability, snooze state, active jobs/leases, Docker reachability, digest state and the latest blocking Preflight result without triggering a registry pull or Docker mutation.
+- **Release layout:** the source/release package now always contains the tracked `/data` directory skeleton (`backups`, `backups/bundles`, `backups/containers`, `logs`, `host-tls`). The project `.gitignore` is based on the current repository version while explicitly retaining only those empty-directory markers.
+- **Sidebar polish:** navigation remains vertically scrollable when required, horizontal overflow is suppressed in expanded/collapsed modes, and Buy Me a Coffee is available alongside Discord/GitHub.
+- **No SQLite migration:** TLS credential files and backup bundles live under the existing persistent `/data` root and no v0.9.2 database schema changes are required.
+
+### Upgrade to V0.9.2
+
+Keep the existing complete `/data` directory and `.env`. The official deployment path is now the published GHCR image, so a normal pinned upgrade is `docker compose pull && docker compose up -d`. Existing local-source deployments can still build with the supplied developer overlay. No manual reconfiguration is required for existing Local/TCP hosts.
 
 ## V0.9.1 cleanup reliability
 
@@ -297,47 +328,59 @@ Existing User accounts can be opened with **Edit permissions**. Host groups and 
 
 ## Installation
 
-```bash
-cp .env.example .env
-# edit .env
-mkdir -p data
-# Optional: set WTUI_DATA_PATH=/opt/vibewatch-data for a stable external host path
-docker compose up -d --build
-```
-
-Open `http://SERVER:8085` (or `WTUI_PORT`). Login name for the Owner is `admin`. Initially the password is `WTUI_ADMIN_PASSWORD`; after changing it under Users → Managed accounts, the persistent Vibewatch password takes precedence.
-
-### Upgrade to V0.8.5
-
-Copy the existing **entire `data/` directory** and `.env` into the V0.8.5 project directory and rebuild normally. V0.8.5 does not add a SQLite migration; existing V0.8.4.2 hosts, groups, chains, verification profiles, Restore Points, snapshots, policies, users and history remain compatible.
-
-### Upgrade to V0.8.4.2
-
-Copy the existing **entire `data/` directory** and `.env` into the V0.8.4.2 project directory, then run:
+### Recommended: published GHCR image
 
 ```bash
-docker compose up -d --build
+git clone https://github.com/M9RPH/vibewatch.git
+cd vibewatch
+./scripts/generate-env.sh
+docker compose pull
+docker compose up -d
 ```
 
-V0.8.4.2 applies an additive Update Chain migration: `update_chains` receives `scope_type`, `scope_key` and `policy_mode`, and `update_chain_steps` receives `current_action` (`skip` by default). Existing V0.8.4/V0.8.4.1 chains automatically become `Custom Chain` entries with inherited per-container policy behavior; no existing chain steps, chain history, policies or automations are discarded. New stack-scoped chains can instead own a single Manual/Auto Update/Excluded policy for all detected members of that Compose stack. Upgrades coming from V0.8.3.2 or older also receive the V0.8.4 verification/preflight/chain migrations. Keep the complete `/data` directory, including `registry-credentials.key` when private registry credentials are configured.
+Alternatively copy `.env.example` to `.env` and edit the values manually. The default Compose file is pinned to:
 
-### Upgrade to V0.8.4.1
+```text
+ghcr.io/m9rph/vibewatch:0.9.2.7
+```
 
-V0.8.4.1 used the V0.8.4 SQLite schema. When upgrading through V0.8.4.2 the additive stack-chain columns are applied automatically; no manual migration step is required.
+The persistent application state remains under `${WTUI_DATA_PATH:-./data}`. Keep the **complete** data directory across upgrades, including `registry-credentials.key`, `host-tls/`, backups and logs when present. Open `http://SERVER:8085` (or `WTUI_PORT`). The initial Owner login is `admin` with `WTUI_ADMIN_PASSWORD`; after changing the password under Users, the persistent account password takes precedence.
 
-### Upgrade to V0.8.3.2
+### Developer/source build
 
-Copy the existing **entire `data/` directory** and `.env` into the V0.8.3.2 project directory, then run:
+The normal Compose file intentionally contains no local build instruction. To build the checked-out source instead of consuming GHCR:
 
 ```bash
-docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-V0.8.3.2 is backward-compatible with the V0.8.2.1/V0.8.2/V0.8.1/V0.8.0 data directory (and therefore the earlier supported upgrade chain). No new SQLite migration is required for V0.8.3.2; existing hosts, users, groups, policies, automations, Pushover settings, recovery snapshots, Restore Points, Config Drift baselines and logs remain compatible. Existing pre-V0.8.0 history remains available through the legacy image/config rollback path while V0.8.x updates create full restore points. Keep the entire `/data` directory when upgrading. Once private registry credentials are configured, `/data/registry-credentials.key` is required together with `vibewatch.db`; do not migrate only the database file. Database backups created by Vibewatch also preserve a companion registry-key copy when one exists.
+Equivalent Make targets are `make run` for the official image and `make run-local` for a source build.
 
-## Publishing later
+### Docker host connection types
 
-The included GitHub Actions workflow builds `linux/amd64` and `linux/arm64` images and publishes to GHCR on `main`/`v*` pushes. The default branch also receives `latest`, making it suitable as the future `WTUI_APP_IMAGE` self-update channel.
+Vibewatch supports three connection modes:
+
+- **Local Socket:** `unix:///var/run/docker.sock`
+- **Remote TCP (legacy/insecure):** e.g. `tcp://192.168.1.20:2375`; use only on a trusted/protected network such as a VPN.
+- **TLS/mTLS:** e.g. `tls://docker.example:2376`. The Docker daemon must already be configured for TLS client authentication. Under Hosts, the Owner supplies the CA certificate, client certificate and matching client private key in PEM format. Vibewatch performs verified Docker CLI connections and passes the same credential set read-only to the centrally managed worker.
+
+V0.9.2 intentionally does **not** add SSH Docker endpoints, a Vibewatch agent or a TLS Quick Setup that modifies the remote Docker daemon. Existing SSH Quick Setup remains only the legacy workflow for configuring TCP/2375.
+
+### Vibewatch backup bundles
+
+Owner Settings retain the existing raw SQLite snapshot action and add complete application backup bundles. A bundle contains `vibewatch.db`, a manifest/checksum, the registry-credential encryption key when configured and TLS/mTLS host credential material when configured. It can be downloaded, deleted and validated (ZIP structure, SHA256, SQLite integrity and credential material). Because it contains secrets, handle the ZIP as a credential backup. `.env` is intentionally not included.
+
+**Restore is not implemented in V0.9.2.** This is deliberate: a safe restore needs its own transaction/restart compatibility path instead of replacing a live database from inside a normal request.
+
+### CI/CD and published images
+
+`.github/workflows/ci.yml` is the quality gate for pushes and pull requests: Go tests/vet/controller build, frontend dependency install and production build, release directory validation, Docker image build, Docker integration tests and the NetEm/VPN regression suite. `.github/workflows/container.yml` validates again before publishing multi-architecture `linux/amd64` and `linux/arm64` images to `ghcr.io/m9rph/vibewatch` on `main` and version tags.
+
+The default Compose installation therefore needs no Go/Node toolchain on the Docker host.
+
+### Export and diagnostics
+
+History, Jobs and the structured Logs pages expose direct export actions. Exports reuse existing RBAC and host filtering. The Containers page also exposes **Why?**, a read-only explanation of why a container is current, blocked, snoozed, manual-only, waiting for another operation or controlled by an Update Chain/Automation.
 
 ## Current limitations
 
@@ -348,4 +391,5 @@ The included GitHub Actions workflow builds `linux/amd64` and `linux/arm64` imag
 - Custom HTTP/HTTPS/TCP verification runs from the Vibewatch controller network namespace. Targets must therefore be reachable from the controller; HTTPS uses normal certificate validation and V0.8.4 does not add an insecure-TLS bypass.
 - Remote Docker Engine APIs do not provide a universally reliable way to stat arbitrary host bind paths or the host filesystem's free capacity. Preflight reports those unverifiable remote conditions as explicit warnings rather than false green checks; missing Docker volumes, manifest/platform failures and recovery-preparation failures remain blocking.
 - Update Chains bind optionally to an existing Automation policy run and therefore reuse its cron schedule, host/group target and pause state. V0.8.3.2 had no separate persisted duration-style maintenance-window model, so V0.8.4 does not introduce a parallel maintenance-window subsystem. A controller restart marks an active chain failed instead of attempting an ambiguous automatic resume; retained Restore Points/history remain available for operator recovery.
-- The application self-update path only becomes meaningful once the controller itself is deployed from a registry image rather than a locally built tag.
+- The official GHCR deployment can participate in Vibewatch self-update metadata normally. A developer deployment built as the local `vibewatch:0.9.2.7` tag intentionally has no external registry source unless `WTUI_APP_IMAGE` is changed to a published image.
+- TLS/mTLS workers require the controller `/data` mount to be a normal bind mount or a Docker volume capable of read-only `volume-subpath` mounting. The supplied official Compose installation uses the supported bind-mount layout.

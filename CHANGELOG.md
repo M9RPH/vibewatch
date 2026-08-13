@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.9.2.7
+
+- Refined the Containers table proportions: the Image column is narrower and Stack / Service gets more room while filter/table alignment stays exact.
+- Rebalanced Update Chains so the Create/Edit editor gets more horizontal room and Configured Chains / Chain History remain the primary left column.
+- Reworded Preflight help text as user-facing safety guidance and retained the immediate live progress stream.
+- Reworked container drawer actions into two consistent action groups with equal-size controls, and normalized Safety & Verification badge height.
+- Corrected remaining visible/default V0.9.2.6 strings to the unchanged V0.9.2.7 release line.
+- Containers UX hotfix: removed the dedicated **Status / Attention** column; runtime remains the state dot, Config status is shown beneath the container identity, and Verification status remains available in the details drawer.
+- Containers table/filter alignment now uses a wider six-column grid: Container, Host, Stack / Service, Image, Policy and Actions.
+- Compact row actions now use a check icon for **Check**, a download/update icon for **Update**, and the existing ellipsis for the details drawer; accessible labels/tooltips are retained.
+
+- UI hotfix: restored dedicated **Host** and **Stack / Service** columns on the Containers page; filters now align to the same seven-column grid.
+
+
+- UI alignment pass: Containers filter controls now use the exact same six-column proportions as the table below.
+- Host / Stack / Service context redesigned as a visible hierarchy rather than equal-weight label rows.
+- Container Rollback now has explicit aligned table headers; filters, headers and expandable restore-point summaries share one grid.
+- Configured Chains and Chain History now have explicit aligned table headers and matching row grids while retaining progressive disclosure.
+- No update, rollback, policy, transaction or database logic changed.
+
+## 0.9.2.6
+
+- Unified table/filter alignment across Containers, Container Rollback and Update Chains; control insets now match table/disclosure headings and rows.
+- Container row ellipsis now opens the existing right-side detail drawer instead of a floating action popover.
+- Dashboard host cards remain compact and use the same ellipsis + right-side drawer pattern for full host metrics, inventory and cleanup actions.
+- Host / Stack presentation now clearly distinguishes Host, Stack and Service instead of relying on font weight alone.
+- Image update wording is consistently `Update available`.
+- Added informational update classification: Major, Minor and Patch are derived from readable version metadata; Security is shown only when matching release metadata explicitly identifies a security/CVE fix. Digest comparison remains authoritative.
+- Status/Attention badges now include their domain (`Runtime`, `Verification`, `Config`) so `Not configured` is no longer ambiguous.
+- Container Rollback disclosure rows and filters share a single aligned shell.
+- Configured Chains and Chain History are displayed side-by-side on wide screens and use aligned compact disclosure shells.
+- Added additive `version_cache.update_kind` and `version_cache.security_update` migration; existing databases remain backward-compatible.
+
+
+## 0.9.2.5
+
+- Consolidated per-container row actions to `Check`, `Update` and a contextual `More` menu while preserving queued/running operation progress and cancellation.
+- Added a right-side Container Details drawer for image/digest metadata, placement, policy, verification, config drift, restore-point integrity and secondary actions.
+- Added quick filters for Needs Attention, Updates, Snoozed, Config Drift and Chain Managed containers and reduced the main container table to a clearer six-column information hierarchy.
+- Converted Configured Chains, Chain History and Container Rollback records to compact expandable disclosure cards so detailed ordering, recovery and transaction information is shown on demand.
+- Simplified Jobs to a compact execution overview while keeping full persisted pipeline/job details in the existing row detail view.
+- This is a UX-only release: no SQLite migration and no changes to the V0.9 transactional update, rollback, TLS/mTLS or CI/CD architecture.
+
+## 0.9.2
+
+- Added Owner-managed Docker TLS/mTLS host connections without changing the central controller/worker architecture. `tls://` endpoints are executed with Docker `--tlsverify` plus per-host CA/client certificate/private-key files; centrally managed workers receive the same credentials through a host-specific read-only mount. Existing Local Socket and TCP behavior remains compatible; SSH Docker transport and TLS Quick Setup are intentionally deferred.
+- Added TLS/mTLS connection badges to Hosts/Dashboard and Owner-only certificate rotation. TLS secret material is stored under persistent `/data/host-tls` with restrictive filesystem permissions and is excluded from normal Host API/support-bundle serialization.
+- Switched the default Compose deployment to the pinned published image `ghcr.io/m9rph/vibewatch:0.9.2`; added `docker-compose.build.yml` plus Make targets for explicit local source builds.
+- Added a CI quality-gate workflow covering Go tests/vet/build, real frontend production build, Docker image build, release data-skeleton validation, Docker integration tests and the NetEm/VPN regression suite. Container publishing is validation-gated and produces `linux/amd64`/`linux/arm64` GHCR images.
+- Added complete Owner backup bundles with transaction-consistent SQLite state, manifest/SHA256, registry-credential encryption key and configured Docker TLS/mTLS credential material. Bundles can be listed, downloaded, deleted and validated; restore is deliberately not implemented in this release.
+- Added RBAC-aware JSON/CSV exports for Update History, Jobs, Audit, Docker Events and Pushover deliveries plus TXT export for the Admin/Owner Application Log.
+- Added the read-only `Why didn't this update?` diagnostic on Containers, explaining effective policy/Stack Chain ownership, Automation availability, host reachability, active jobs/leases, snoozed/current digest state and the latest blocking Preflight result without triggering Docker/registry mutation.
+- Prevented horizontal Sidebar scrolling in expanded/collapsed modes and added Buy Me a Coffee alongside the existing Discord/GitHub links.
+- Restored the complete tracked release data skeleton (`data`, backups/bundles/containers, logs and host-tls) and based `.gitignore` on the supplied current repository file with only `.gitkeep` exceptions needed to preserve those directories.
+- Added v0.9.2 regression coverage for endpoint normalization, unsupported SSH rejection, PEM client-certificate validation, backup filename traversal protection and Docker TLS CLI argument construction.
+- No SQLite schema migration is required.
+
 ## 0.9.1
 
 - Added persistent asynchronous Dashboard cleanup jobs for Images, anonymous Volumes, Networks and Build Cache. Cleanup is no longer tied to the browser/reverse-proxy request lifecycle, so a long-running remote/VPN cleanup continues server-side even when the initiating HTTP connection closes.

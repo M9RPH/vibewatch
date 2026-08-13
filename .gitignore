@@ -13,6 +13,16 @@ scripts/.env
 # Runtime data
 data/*
 !data/.gitkeep
+!data/backups/
+!data/backups/.gitkeep
+!data/backups/bundles/
+!data/backups/bundles/.gitkeep
+!data/backups/containers/
+!data/backups/containers/.gitkeep
+!data/logs/
+!data/logs/.gitkeep
+!data/host-tls/
+!data/host-tls/.gitkeep
 
 # Databases
 *.db
@@ -24,7 +34,12 @@ data/*
 # Generated backups / snapshots
 backups/
 snapshots/
-data/backups/
+data/backups/*
+!data/backups/.gitkeep
+!data/backups/bundles/
+!data/backups/bundles/.gitkeep
+!data/backups/containers/
+!data/backups/containers/.gitkeep
 data/snapshots/
 
 *.tar
@@ -36,7 +51,12 @@ data/snapshots/
 *.log
 *.jsonl
 logs/
-data/logs/
+data/logs/*
+!data/logs/.gitkeep
+
+# TLS/mTLS client material
+data/host-tls/*
+!data/host-tls/.gitkeep
 
 # Go build artifacts
 /vibewatch

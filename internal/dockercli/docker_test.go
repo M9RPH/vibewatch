@@ -869,3 +869,93 @@ func TestV091CleanupTimeoutsGiveRemoteHostsLongerBudget(t *testing.T) {
 		t.Fatal("remote cleanup object timeout should exceed local timeout")
 	}
 }
+
+func TestV092TLSConnectionUsesDockerTLSVerifyFlags(t *testing.T) {
+	c := New(slog.Default())
+	c.Binary = "docker"
+	c.HostTLSRoot = t.TempDir()
+	endpoint := "tls://docker.example:2376"
+	dir := c.TLSCredentialDir(endpoint)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ca.pem", "cert.pem", "key.pem"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !c.TLSConfigured(endpoint) {
+		t.Fatal("TLS credential set should be detected")
+	}
+	cmd := c.cmd(context.Background(), endpoint, "version")
+	joined := strings.Join(cmd.Args, " ")
+	for _, want := range []string{"--tlsverify", "--tlscacert " + filepath.Join(dir, "ca.pem"), "--tlscert " + filepath.Join(dir, "cert.pem"), "--tlskey " + filepath.Join(dir, "key.pem"), "--host tcp://docker.example:2376", "version"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("command missing %q: %s", want, joined)
+		}
+	}
+	if ConnectionType(endpoint) != "tls" {
+		t.Fatalf("connection type = %q", ConnectionType(endpoint))
+	}
+}
+
+func TestV092TLSWorkerReceivesReadOnlyCredentialMount(t *testing.T) {
+	dir := t.TempDir()
+	containerDataDir := filepath.Join(dir, "container-data")
+	hostDataDir := filepath.Join(dir, "host-data")
+	if err := os.MkdirAll(containerDataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  "network inspect "*) exit 0 ;;
+  "inspect -f "*) exit 1 ;;
+  "rm -f "*) exit 0 ;;
+  "inspect vibewatch --format "*) printf '%s\n' '[{"Type":"bind","Source":"` + hostDataDir + `","Destination":"` + containerDataDir + `","RW":true}]'; exit 0 ;;
+  "run "*) echo fake-container-id; exit 0 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c := New(slog.Default())
+	c.Binary = script
+	c.DataDir = containerDataDir
+	c.HostTLSRoot = filepath.Join(containerDataDir, "host-tls")
+	c.ControllerName = "vibewatch"
+	endpoint := "tls://docker.example:2376"
+	credDir := c.TLSCredentialDir(endpoint)
+	if err := os.MkdirAll(credDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ca.pem", "cert.pem", "key.pem"} {
+		if err := os.WriteFile(filepath.Join(credDir, name), []byte("present"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := c.EnsureWorker(context.Background(), db.Host{ID: 92, Endpoint: endpoint, WorkerToken: "secret-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	expectedHostCredDir := filepath.Join(hostDataDir, "host-tls", filepath.Base(credDir))
+	for _, want := range []string{
+		"DOCKER_HOST=tcp://docker.example:2376",
+		"DOCKER_TLS_VERIFY=1",
+		"DOCKER_CERT_PATH=/vibewatch-docker-tls",
+		"type=bind,src=" + expectedHostCredDir + ",dst=/vibewatch-docker-tls,readonly",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("worker invocation missing %q:\n%s", want, text)
+		}
+	}
+}

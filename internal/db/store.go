@@ -142,6 +142,8 @@ type VersionInfo struct {
 	InstalledSource string `json:"installed_source"`
 	Latest          string `json:"latest_version"`
 	LatestSource    string `json:"latest_source"`
+	UpdateKind      string `json:"update_kind"`
+	SecurityUpdate  Bool   `json:"security_update"`
 	ReleaseRepo     string `json:"release_repo"`
 	PublishedAt     string `json:"published_at"`
 	CheckedAt       string `json:"checked_at"`
@@ -457,7 +459,7 @@ CREATE TABLE IF NOT EXISTS job_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, job_i
 CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, cron TEXT NOT NULL, action TEXT NOT NULL, host_id INTEGER NOT NULL, containers TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, host_id INTEGER NOT NULL DEFAULT 0, container_name TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS version_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, installed_version TEXT NOT NULL DEFAULT '', installed_source TEXT NOT NULL DEFAULT '', latest_version TEXT NOT NULL DEFAULT '', latest_source TEXT NOT NULL DEFAULT '', release_repo TEXT NOT NULL DEFAULT '', published_at TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
+CREATE TABLE IF NOT EXISTS version_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, installed_version TEXT NOT NULL DEFAULT '', installed_source TEXT NOT NULL DEFAULT '', latest_version TEXT NOT NULL DEFAULT '', latest_source TEXT NOT NULL DEFAULT '', update_kind TEXT NOT NULL DEFAULT '', security_update INTEGER NOT NULL DEFAULT 0, release_repo TEXT NOT NULL DEFAULT '', published_at TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
 CREATE TABLE IF NOT EXISTS automations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, cron TEXT NOT NULL, target_type TEXT NOT NULL DEFAULT 'host', target_id INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS host_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS host_group_members (group_id INTEGER NOT NULL, host_id INTEGER NOT NULL, PRIMARY KEY(group_id,host_id));
@@ -489,6 +491,15 @@ CREATE INDEX IF NOT EXISTS idx_update_transactions_status ON update_transactions
 	// Safe migrations for databases created by older Vibewatch releases.
 	if err := s.exec(ctx, "ALTER TABLE version_cache ADD COLUMN latest_source TEXT NOT NULL DEFAULT '';"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
+	}
+
+	for _, stmt := range []string{
+		"ALTER TABLE version_cache ADD COLUMN update_kind TEXT NOT NULL DEFAULT '';",
+		"ALTER TABLE version_cache ADD COLUMN security_update INTEGER NOT NULL DEFAULT 0;",
+	} {
+		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
 	}
 	if err := s.exec(ctx, "ALTER TABLE notification_settings ADD COLUMN pushover_app_token TEXT NOT NULL DEFAULT '';"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
@@ -960,7 +971,7 @@ func (s *Store) FinishJob(ctx context.Context, id int64, status, summary, errMsg
 	return s.exec(ctx, fmt.Sprintf(`UPDATE jobs SET status=%s,finished_at=%s,summary_json=%s,error=%s WHERE id=%d;`, q(status), q(now()), q(summary), q(errMsg), id))
 }
 func (s *Store) Jobs(ctx context.Context, limit int) ([]Job, error) {
-	if limit < 1 || limit > 500 {
+	if limit < 1 || limit > 5000 {
 		limit = 100
 	}
 	var x []Job
@@ -1039,7 +1050,7 @@ func (s *Store) AddUpdateHistory(ctx context.Context, x UpdateHistory) (int64, e
 	return id, err
 }
 func (s *Store) UpdateHistory(ctx context.Context, limit int, hostID int64, container string) ([]UpdateHistory, error) {
-	if limit < 1 || limit > 1000 {
+	if limit < 1 || limit > 5000 {
 		limit = 250
 	}
 	where := []string{"1=1"}
@@ -1400,7 +1411,7 @@ func (s *Store) Audit(ctx context.Context, actor, action string, hostID int64, c
 	return s.exec(ctx, fmt.Sprintf(`INSERT INTO audit_events(ts,actor,action,host_id,container_name,details) VALUES(%s,%s,%s,%d,%s,%s); DELETE FROM audit_events WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT %d);`, q(now()), q(actor), q(action), hostID, q(container), q(details), auditRetention))
 }
 func (s *Store) Audits(ctx context.Context, limit int) ([]Audit, error) {
-	if limit < 1 || limit > 500 {
+	if limit < 1 || limit > 5000 {
 		limit = 100
 	}
 	var x []Audit
@@ -1490,7 +1501,7 @@ func (s *Store) trimDockerEventsLocked(keep int) error {
 
 func (s *Store) DockerEvents(ctx context.Context, hostID int64, limit int) ([]DockerEvent, error) {
 	_ = ctx
-	if limit < 1 || limit > 1000 {
+	if limit < 1 || limit > 5000 {
 		limit = 200
 	}
 	s.eventMu.Lock()
@@ -1607,7 +1618,7 @@ func (s *Store) Backup(ctx context.Context, dest string) error {
 
 func (s *Store) Version(ctx context.Context, hostID int64, name string) (VersionInfo, error) {
 	var x []VersionInfo
-	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,container_name,installed_version,installed_source,latest_version,latest_source,release_repo,published_at,checked_at,error FROM version_cache WHERE host_id=%d AND container_name=%s`, hostID, q(name)), &x)
+	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,container_name,installed_version,installed_source,latest_version,latest_source,update_kind,security_update,release_repo,published_at,checked_at,error FROM version_cache WHERE host_id=%d AND container_name=%s`, hostID, q(name)), &x)
 	if err != nil {
 		return VersionInfo{}, err
 	}
@@ -1617,7 +1628,7 @@ func (s *Store) Version(ctx context.Context, hostID int64, name string) (Version
 	return x[0], nil
 }
 func (s *Store) SaveVersion(ctx context.Context, v VersionInfo) error {
-	return s.exec(ctx, fmt.Sprintf(`INSERT INTO version_cache(host_id,container_name,installed_version,installed_source,latest_version,latest_source,release_repo,published_at,checked_at,error) VALUES(%d,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(host_id,container_name) DO UPDATE SET installed_version=excluded.installed_version,installed_source=excluded.installed_source,latest_version=excluded.latest_version,latest_source=excluded.latest_source,release_repo=excluded.release_repo,published_at=excluded.published_at,checked_at=excluded.checked_at,error=excluded.error;`, v.HostID, q(v.ContainerName), q(v.Installed), q(v.InstalledSource), q(v.Latest), q(v.LatestSource), q(v.ReleaseRepo), q(v.PublishedAt), q(v.CheckedAt), q(v.Error)))
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO version_cache(host_id,container_name,installed_version,installed_source,latest_version,latest_source,update_kind,security_update,release_repo,published_at,checked_at,error) VALUES(%d,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%s) ON CONFLICT(host_id,container_name) DO UPDATE SET installed_version=excluded.installed_version,installed_source=excluded.installed_source,latest_version=excluded.latest_version,latest_source=excluded.latest_source,update_kind=excluded.update_kind,security_update=excluded.security_update,release_repo=excluded.release_repo,published_at=excluded.published_at,checked_at=excluded.checked_at,error=excluded.error;`, v.HostID, q(v.ContainerName), q(v.Installed), q(v.InstalledSource), q(v.Latest), q(v.LatestSource), q(v.UpdateKind), b(v.SecurityUpdate), q(v.ReleaseRepo), q(v.PublishedAt), q(v.CheckedAt), q(v.Error)))
 }
 
 func (s *Store) Automations(ctx context.Context) ([]Automation, error) {
@@ -1886,7 +1897,7 @@ func (s *Store) AddNotificationDelivery(ctx context.Context, x NotificationDeliv
 }
 
 func (s *Store) NotificationDeliveries(ctx context.Context, userID *int64, limit int) ([]NotificationDelivery, error) {
-	if limit <= 0 || limit > 1000 {
+	if limit <= 0 || limit > 5000 {
 		limit = 250
 	}
 	where := ""

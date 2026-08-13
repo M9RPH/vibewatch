@@ -46,6 +46,7 @@ type PreflightResult struct {
 	Blocked     int              `json:"blocked"`
 	Summary     string           `json:"summary"`
 	lastCheckAt time.Time
+	onCheck     func(PreflightCheck)
 }
 
 type preflightPrepared struct {
@@ -83,7 +84,11 @@ func (r *PreflightResult) add(key, status, title, description, detail string) {
 		duration = now.Sub(r.lastCheckAt).Milliseconds()
 	}
 	r.lastCheckAt = now
-	r.Checks = append(r.Checks, PreflightCheck{Key: key, Status: status, Title: title, Description: description, Detail: detail, Source: preflightCheckSource(key), DurationMS: duration, Blocking: status == preflightRed})
+	check := PreflightCheck{Key: key, Status: status, Title: title, Description: description, Detail: detail, Source: preflightCheckSource(key), DurationMS: duration, Blocking: status == preflightRed}
+	r.Checks = append(r.Checks, check)
+	if r.onCheck != nil {
+		r.onCheck(check)
+	}
 	if status == preflightYellow {
 		r.Warnings++
 	}
@@ -143,6 +148,9 @@ func formatGB(n int64) string {
 }
 
 func (a *App) preflightProgress(ctx context.Context, req updateRequest, percent int, stage string) {
+	if req.PreviewProgress != nil {
+		req.PreviewProgress(percent, stage)
+	}
 	if req.JobID > 0 {
 		a.jobProgress(ctx, req.JobID, percent, "Preflight · "+stage)
 	}
@@ -160,7 +168,7 @@ func (a *App) transitionPreflightTransaction(ctx context.Context, req updateRequ
 }
 
 func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare bool) (PreflightResult, preflightPrepared) {
-	result := PreflightResult{HostID: req.HostID, Container: req.Container, StartedAt: time.Now().UTC().Format(time.RFC3339), Prepared: prepare, Checks: []PreflightCheck{}, lastCheckAt: time.Now()}
+	result := PreflightResult{HostID: req.HostID, Container: req.Container, StartedAt: time.Now().UTC().Format(time.RFC3339), Prepared: prepare, Checks: []PreflightCheck{}, lastCheckAt: time.Now(), onCheck: req.PreviewCheck}
 	prepared := preflightPrepared{}
 	if req.JobID > 0 {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "preflight", "update preflight started")
@@ -452,6 +460,46 @@ func (a *App) handleUpdatePreflight(w http.ResponseWriter, r *http.Request, host
 		writeErr(w, 409, "container is excluded; change its policy before updating it")
 		return
 	}
-	res, _ := a.runUpdatePreflight(r.Context(), updateRequest{HostID: hostID, Container: container, Trigger: "manual-preview", Actor: a.actor(r)}, false)
-	writeJSON(w, 200, res)
+
+	if r.URL.Query().Get("stream") != "1" {
+		res, _ := a.runUpdatePreflight(r.Context(), updateRequest{HostID: hostID, Container: container, Trigger: "manual-preview", Actor: a.actor(r)}, false)
+		writeJSON(w, 200, res)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming preflight is not supported by this server")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	send := func(event string, payload any) {
+		bs, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, bs)
+		flusher.Flush()
+	}
+
+	send("progress", map[string]any{"percent": 5, "stage": "Starting preflight"})
+	req := updateRequest{
+		HostID:    hostID,
+		Container: container,
+		Trigger:   "manual-preview",
+		Actor:     a.actor(r),
+		PreviewProgress: func(percent int, stage string) {
+			send("progress", map[string]any{"percent": percent, "stage": stage})
+		},
+		PreviewCheck: func(check PreflightCheck) {
+			send("check", check)
+		},
+	}
+	res, _ := a.runUpdatePreflight(r.Context(), req, false)
+	send("result", res)
 }

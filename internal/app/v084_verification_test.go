@@ -87,3 +87,34 @@ func TestVerificationStateTracksEffectiveProfileFreshness(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestClassifyVersionChange(t *testing.T) {
+	cases := []struct {
+		old  string
+		new  string
+		want string
+	}{
+		{"1.2.3", "2.0.0", "major"},
+		{"1.2.3", "1.3.0", "minor"},
+		{"1.2.3", "1.2.4", "patch"},
+		{"1.2.3", "1.2.3", "image"},
+		{"latest", "latest", "unknown"},
+	}
+	for _, tc := range cases {
+		if got := classifyVersionChange(tc.old, tc.new); got != tc.want {
+			t.Fatalf("classifyVersionChange(%q,%q)=%q want %q", tc.old, tc.new, got, tc.want)
+		}
+	}
+}
+
+func TestExplicitSecurityReleaseRequiresExplicitMetadata(t *testing.T) {
+	if !explicitSecurityRelease("Security release", "Fixes CVE-2026-1234") {
+		t.Fatal("explicit security release should be detected")
+	}
+	if !explicitSecurityRelease("Bugfix release", "Includes a security fix for authentication") {
+		t.Fatal("explicit security wording should be detected")
+	}
+	if explicitSecurityRelease("Patch release", "Several bug fixes and performance improvements") {
+		t.Fatal("ordinary patch release must not be labeled as security")
+	}
+}

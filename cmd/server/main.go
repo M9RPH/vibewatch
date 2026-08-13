@@ -125,6 +125,9 @@ func main() {
 		logger.Info("legacy Docker event history moved to bounded JSONL store", "events", migrated)
 	}
 	d := dockercli.New(logger)
+	d.HostTLSRoot = filepath.Join(data, "host-tls")
+	d.ControllerName = env("WTUI_CONTAINER_NAME", "vibewatch")
+	d.DataDir = data
 	d.WorkerImage = env("WTUI_WATCHTOWER_IMAGE", "nickfedor/watchtower:latest")
 	d.WorkerNetwork = env("WTUI_WORKER_NETWORK", "vibewatch-internal")
 	d.WorkerPort = env("WTUI_WORKER_PORT", "8080")

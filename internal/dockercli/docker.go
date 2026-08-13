@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -20,16 +22,19 @@ import (
 )
 
 type Client struct {
-	Binary        string
-	Logger        *slog.Logger
-	WorkerImage   string
-	WorkerNetwork string
-	WorkerPort    string
-	WorkerVersion string
-	labelMu       sync.Mutex
-	labelCache    map[string]cachedLabels
-	platformMu    sync.Mutex
-	platformCache map[string]cachedPlatform
+	Binary         string
+	HostTLSRoot    string
+	ControllerName string
+	DataDir        string
+	Logger         *slog.Logger
+	WorkerImage    string
+	WorkerNetwork  string
+	WorkerPort     string
+	WorkerVersion  string
+	labelMu        sync.Mutex
+	labelCache     map[string]cachedLabels
+	platformMu     sync.Mutex
+	platformCache  map[string]cachedPlatform
 }
 
 type cachedLabels struct {
@@ -197,13 +202,65 @@ type EventWatcher struct {
 }
 
 func New(logger *slog.Logger) *Client {
-	return &Client{Binary: "docker", Logger: logger, WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.5", labelCache: map[string]cachedLabels{}, platformCache: map[string]cachedPlatform{}}
+	return &Client{Binary: "docker", Logger: logger, HostTLSRoot: "/data/host-tls", ControllerName: "vibewatch", DataDir: "/data", WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.5", labelCache: map[string]cachedLabels{}, platformCache: map[string]cachedPlatform{}}
+}
+
+func ConnectionType(endpoint string) string {
+	v := strings.ToLower(strings.TrimSpace(endpoint))
+	switch {
+	case strings.HasPrefix(v, "tls://"):
+		return "tls"
+	case strings.HasPrefix(v, "unix://") || v == "":
+		return "local"
+	default:
+		return "tcp"
+	}
+}
+
+func dockerEndpoint(endpoint string) string {
+	v := strings.TrimSpace(endpoint)
+	if strings.HasPrefix(strings.ToLower(v), "tls://") {
+		return "tcp://" + v[len("tls://"):]
+	}
+	return v
+}
+
+func tlsEndpointKey(endpoint string) string {
+	n := strings.ToLower(strings.TrimSpace(endpoint))
+	sum := sha256.Sum256([]byte(n))
+	return fmt.Sprintf("%x", sum[:12])
+}
+
+func (c *Client) TLSCredentialDir(endpoint string) string {
+	root := strings.TrimSpace(c.HostTLSRoot)
+	if root == "" {
+		root = "/data/host-tls"
+	}
+	return filepath.Join(root, tlsEndpointKey(endpoint))
+}
+
+func (c *Client) TLSConfigured(endpoint string) bool {
+	if ConnectionType(endpoint) != "tls" {
+		return false
+	}
+	dir := c.TLSCredentialDir(endpoint)
+	for _, name := range []string{"ca.pem", "cert.pem", "key.pem"} {
+		st, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || st.IsDir() || st.Size() == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) cmd(ctx context.Context, endpoint string, args ...string) *exec.Cmd {
-	full := make([]string, 0, len(args)+2)
-	if endpoint != "" {
-		full = append(full, "--host", endpoint)
+	full := make([]string, 0, len(args)+10)
+	if strings.TrimSpace(endpoint) != "" {
+		if ConnectionType(endpoint) == "tls" {
+			dir := c.TLSCredentialDir(endpoint)
+			full = append(full, "--tlsverify", "--tlscacert", filepath.Join(dir, "ca.pem"), "--tlscert", filepath.Join(dir, "cert.pem"), "--tlskey", filepath.Join(dir, "key.pem"))
+		}
+		full = append(full, "--host", dockerEndpoint(endpoint))
 	}
 	full = append(full, args...)
 	return exec.CommandContext(ctx, c.Binary, full...)
@@ -1607,7 +1664,7 @@ func (c *Client) EnsureWorker(ctx context.Context, host db.Host) (string, error)
 	// local-host (unscoped) Watchtower instance therefore will not treat scoped
 	// remote workers as competing unscoped instances, while remote workers still
 	// scan the complete target host normally.
-	if !strings.HasPrefix(host.Endpoint, "unix://") {
+	if ConnectionType(host.Endpoint) != "local" {
 		args = append(args, "--label", fmt.Sprintf("com.centurylinklabs.watchtower.scope=vibewatch-worker-%d", host.ID))
 	}
 	args = append(args,
@@ -1620,10 +1677,36 @@ func (c *Client) EnsureWorker(ctx context.Context, host db.Host) (string, error)
 		"-e", "WATCHTOWER_UPDATE_ON_START=false",
 		"-e", "WATCHTOWER_CLEANUP=false",
 	)
-	if strings.HasPrefix(host.Endpoint, "unix://") {
+	if ConnectionType(host.Endpoint) == "local" {
 		args = append(args, "-v", "/var/run/docker.sock:/var/run/docker.sock")
+	} else if ConnectionType(host.Endpoint) == "tls" {
+		if !c.TLSConfigured(host.Endpoint) {
+			return "", fmt.Errorf("TLS credentials are incomplete for host %d", host.ID)
+		}
+		mount, mounted, mountErr := c.ContainerMount(ctx, c.ControllerName, c.DataDir)
+		if mountErr != nil || !mounted {
+			if mountErr != nil {
+				return "", fmt.Errorf("resolve controller data mount for TLS worker: %w", mountErr)
+			}
+			return "", fmt.Errorf("controller data directory is not mounted; TLS worker cannot access client certificates safely")
+		}
+		rel, relErr := filepath.Rel(filepath.Clean(c.DataDir), filepath.Clean(c.TLSCredentialDir(host.Endpoint)))
+		if relErr != nil || rel == "." || strings.HasPrefix(rel, "..") {
+			return "", fmt.Errorf("invalid TLS credential directory")
+		}
+		containerTLSPath := "/vibewatch-docker-tls"
+		switch strings.ToLower(strings.TrimSpace(mount.Type)) {
+		case "bind":
+			source := filepath.Join(mount.Source, rel)
+			args = append(args, "--mount", "type=bind,src="+source+",dst="+containerTLSPath+",readonly")
+		case "volume":
+			args = append(args, "--mount", "type=volume,src="+mount.Source+",dst="+containerTLSPath+",readonly,volume-subpath="+filepath.ToSlash(rel))
+		default:
+			return "", fmt.Errorf("unsupported controller /data mount type %q for TLS worker", mount.Type)
+		}
+		args = append(args, "-e", "DOCKER_HOST="+dockerEndpoint(host.Endpoint), "-e", "DOCKER_TLS_VERIFY=1", "-e", "DOCKER_CERT_PATH="+containerTLSPath)
 	} else {
-		args = append(args, "-e", "DOCKER_HOST="+host.Endpoint)
+		args = append(args, "-e", "DOCKER_HOST="+dockerEndpoint(host.Endpoint))
 	}
 	args = append(args, c.WorkerImage)
 	if _, err := c.run(ctx, "", args...); err != nil {
