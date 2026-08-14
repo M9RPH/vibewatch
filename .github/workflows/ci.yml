@@ -30,6 +30,11 @@ jobs:
           grep -q '^VIBEWATCH_ADMIN_PASSWORD=' .env.example
           grep -q '^VIBEWATCH_SESSION_SECRET=' .env.example
           if grep -q '^WTUI_' .env.example; then echo "legacy WTUI variables must not be canonical in .env.example"; exit 1; fi
+      - name: Release Compose sanity
+        run: |
+          cmp -s compose.yml docker-compose.yml
+          grep -q 'ghcr.io/m9rph/vibewatch:0.9.5' compose.yml
+          grep -q 'ghcr.io/m9rph/vibewatch:0.9.5' .env.example
       - name: Build controller
         run: go build -trimpath -ldflags "-X main.version=$(cat VERSION)" ./cmd/server
       - uses: actions/setup-node@v4

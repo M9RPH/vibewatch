@@ -4,6 +4,14 @@ All notable public changes to Vibewatch are documented here.
 
 ## 0.9.5
 
+### Distribution
+
+- Added an official release Compose file (`compose.yml`) for source-free installations.
+- Release tags now publish `linux/amd64` and `linux/arm64` images to `ghcr.io/m9rph/vibewatch`.
+- Container publishing only occurs for a version-matching `vX.Y.Z` tag after release validation and Docker integration tests pass.
+- Added OCI source/license metadata so the GHCR package can be associated cleanly with the Vibewatch repository.
+
+
 - Fixed Git release packaging so runtime data skeleton `.gitkeep` files under `data/backups/` and `data/logs/` are tracked correctly instead of being shadowed by broad ignore rules.
 
 ### Recovery and crash safety

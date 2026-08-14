@@ -18,7 +18,10 @@ FROM alpine:3.20
 ARG VIBEWATCH_VERSION=0.9.5
 LABEL org.opencontainers.image.title="Vibewatch" \
       org.opencontainers.image.version="$VIBEWATCH_VERSION" \
-      org.opencontainers.image.description="Multi-host Docker update control powered by Watchtower"
+      org.opencontainers.image.description="Self-hosted Docker update and recovery platform" \
+      org.opencontainers.image.source="https://github.com/M9RPH/vibewatch" \
+      org.opencontainers.image.url="https://github.com/M9RPH/vibewatch" \
+      org.opencontainers.image.licenses="MIT"
 RUN apk add --no-cache ca-certificates tzdata sqlite docker-cli openssh-client sshpass && addgroup -S vibewatch && adduser -S -G vibewatch vibewatch
 WORKDIR /app
 COPY --from=go-build /out/vibewatch /usr/local/bin/vibewatch

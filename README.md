@@ -43,55 +43,59 @@ Vibewatch has powerful Docker permissions. Access to a Docker Engine is effectiv
 
 ## Installation
 
-### 1. Get the release
+### Docker Compose (recommended)
 
-Clone the repository or download the source archive for the release, then enter the project directory.
+A source checkout is **not required**. Release images are published to GitHub Container Registry for `linux/amd64` and `linux/arm64`.
+
+Create a directory and download only the release Compose file and environment template:
 
 ```bash
-cd vibewatch
-cp .env.example .env
+mkdir -p vibewatch && cd vibewatch
+curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/.env.example
 ```
 
-### 2. Configure `.env`
-
-At minimum, change:
+Set at least these two values in `.env`:
 
 ```dotenv
 VIBEWATCH_ADMIN_PASSWORD=replace-with-a-strong-password
 VIBEWATCH_SESSION_SECRET=replace-with-a-long-random-secret
 ```
 
-A session secret can be generated with:
+Generate a session secret with:
 
 ```bash
 openssl rand -hex 32
 ```
 
-The default persistent data directory is `./data`. Keep `VIBEWATCH_DATA_PATH` stable across upgrades.
-
-### 3. Start Vibewatch
+Then start Vibewatch:
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-Open:
+Open `http://<docker-host>:8085`. The initial Owner username is `admin`.
+
+The official Compose file uses the release-pinned image:
 
 ```text
-http://<docker-host>:8085
+ghcr.io/m9rph/vibewatch:0.9.5
 ```
 
-The initial Owner username is `admin` and the password is the value of `VIBEWATCH_ADMIN_PASSWORD`.
+You can also copy `compose.yml` directly into a Portainer Stack and provide the `VIBEWATCH_*` variables through Portainer's environment settings.
 
-### 4. Add Docker hosts
+### Build from source
 
-The local Docker socket is available to Vibewatch through the supplied Compose file. Additional hosts can be added from **Hosts** in the UI.
+Cloning the repository is only required for development or a local source build:
 
-For remote Docker Engines:
-
-- prefer `tls://host:2376` with CA/client certificates;
-- legacy `tcp://host:2375` is supported but is unencrypted and should only be used on a trusted, isolated network.
+```bash
+git clone https://github.com/M9RPH/vibewatch.git
+cd vibewatch
+cp .env.example scripts/.env
+cd scripts
+docker compose --env-file .env -f ../docker-compose.yml -f ../docker-compose.build.yml up -d --build
+```
 
 ## Updating Vibewatch
 

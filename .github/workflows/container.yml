@@ -1,65 +1,139 @@
-name: Build and publish container
+name: Publish release container
+
 on:
   push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
+    tags:
+      - 'v*.*.*'
+
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: container-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   validate:
+    name: Validate release source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify tag matches VERSION
+        shell: bash
+        run: |
+          version="$(cat VERSION)"
+          test "${GITHUB_REF_NAME}" = "v${version}" || {
+            echo "Tag ${GITHUB_REF_NAME} does not match VERSION=${version}"
+            exit 1
+          }
+
+      - name: Verify Compose release files stay in sync
+        run: cmp -s compose.yml docker-compose.yml
+
       - name: Install SQLite CLI
         run: sudo apt-get update && sudo apt-get install -y sqlite3
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -count=1 ./...
-      - run: go vet ./...
+
+      - name: Go tests
+        run: go test -count=1 ./...
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Build controller
+        run: go build -trimpath -ldflags "-X main.version=$(cat VERSION)" ./cmd/server
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - working-directory: web
+
+      - name: Install frontend dependencies
+        working-directory: web
         run: npm install --no-audit --no-fund
-      - working-directory: web
+
+      - name: Build frontend
+        working-directory: web
         run: npm run build
 
-  build:
-    needs: validate
+      - name: Docker image build smoke test
+        run: docker build --build-arg VIBEWATCH_VERSION="$(cat VERSION)" -t vibewatch-release-smoke:${{ github.sha }} .
+
+  docker-integration:
+    name: Docker integration tests
     runs-on: ubuntu-latest
+    needs: validate
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install SQLite CLI
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Docker integration smoke tests
+        run: ./scripts/test-integration.sh
+
+      - name: Install NetEm prerequisites
+        run: sudo apt-get update && sudo apt-get install -y iproute2
+
+      - name: NetEm ~50 ms RTT regression
+        run: sudo env VIBEWATCH_NETEM_LOSS=0% ./scripts/test-netem.sh
+
+  publish:
+    name: Publish GHCR multi-arch image
+    runs-on: ubuntu-latest
+    needs: [validate, docker-integration]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
       - id: app_version
+        name: Read release version
         shell: bash
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract image metadata
         id: meta
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/m9rph/vibewatch
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha
-      - uses: docker/build-push-action@v6
+            type=raw,value=latest
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VIBEWATCH_VERSION=${{ steps.app_version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,8 +1,8 @@
 # Installation and upgrades
 
-## Supported installation
+## Recommended installation: Docker Compose + GHCR
 
-The recommended installation is Docker Compose using the published GHCR image.
+Vibewatch release images are published to GitHub Container Registry for `linux/amd64` and `linux/arm64`. A Git clone and local Go/Node build are not required for a normal installation.
 
 ### Requirements
 
@@ -11,13 +11,15 @@ The recommended installation is Docker Compose using the published GHCR image.
 - a persistent directory for Vibewatch `/data`
 - local Docker socket access for the controller host
 
-### Install
+### Quick install without cloning the repository
 
 ```bash
-cp .env.example .env
+mkdir -p vibewatch && cd vibewatch
+curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/.env.example
 ```
 
-Set at least:
+Edit `.env` and set at least:
 
 ```dotenv
 VIBEWATCH_ADMIN_PASSWORD=<strong-password>
@@ -30,7 +32,7 @@ Generate a session secret if needed:
 openssl rand -hex 32
 ```
 
-Start:
+Start Vibewatch:
 
 ```bash
 docker compose pull
@@ -45,6 +47,27 @@ Initial Owner login:
 username: admin
 password: VIBEWATCH_ADMIN_PASSWORD from .env
 ```
+
+The v0.9.5 Compose file is pinned to:
+
+```text
+ghcr.io/m9rph/vibewatch:0.9.5
+```
+
+A public GHCR image can be pulled anonymously; no GitHub login is required on the Docker host.
+
+## Portainer Stack
+
+The same `compose.yml` can be pasted into **Stacks → Add stack** in Portainer. Set the required `VIBEWATCH_*` values in Portainer's stack environment before deploying.
+
+At minimum provide:
+
+```dotenv
+VIBEWATCH_ADMIN_PASSWORD=<strong-password>
+VIBEWATCH_SESSION_SECRET=<long-random-secret>
+```
+
+The local Docker socket bind in the Compose file gives Vibewatch access to the Docker Engine hosting the controller.
 
 ## Persistence
 
@@ -68,26 +91,33 @@ TLS/mTLS is recommended for remote Docker Engines. Port 2375 is unencrypted and 
 
 ## Upgrade
 
-The release Compose file is version-pinned. To upgrade after replacing the repository/Compose files with the new release:
+Each release Compose file is version-pinned. For a normal upgrade, update `VIBEWATCH_APP_IMAGE` in `.env` to the new release tag and run:
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
+Alternatively replace `compose.yml` with the file from the new release before running the same commands.
+
 Vibewatch applies additive SQLite migrations on startup.
 
 Before a major upgrade, keep an independent copy of your Vibewatch data directory. Owner Settings can also create a portable Vibewatch backup bundle.
 
-## Local source build
+## Build from source
 
-Development/source builds can use the build overlay:
+Development/source builds use the repository build overlay:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+git clone https://github.com/M9RPH/vibewatch.git
+cd vibewatch
+cp .env.example scripts/.env
+cd scripts
+docker compose --env-file .env -f ../docker-compose.yml -f ../docker-compose.build.yml up -d --build
 ```
 
-The public release image remains the recommended deployment path.
+The published GHCR image remains the recommended deployment path.
+
 ## Upgrading from legacy `WTUI_*` variables
 
 Vibewatch v0.9.5 uses `VIBEWATCH_*` as the canonical environment-variable prefix. Existing installations do **not** need to rewrite their live `.env` immediately: the pre-rebrand `WTUI_*` names remain accepted as compatibility fallbacks.
@@ -105,4 +135,3 @@ WTUI_APP_IMAGE        -> VIBEWATCH_APP_IMAGE
 ```
 
 If both names are present, the `VIBEWATCH_*` value wins.
-

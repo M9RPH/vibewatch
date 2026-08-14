@@ -94,27 +94,3 @@ Thumbs.db
 
 # Internal development/context documentation
 .vibewatch-internal/
-
-# Runtime data: never inspect or commit instance-specific content
-/data/*
-!/data/.gitkeep
-!/data/backups/
-!/data/logs/
-!/data/host-tls/
-
-/data/backups/*
-!/data/backups/.gitkeep
-!/data/backups/bundles/
-!/data/backups/containers/
-
-/data/backups/bundles/**
-!/data/backups/bundles/.gitkeep
-
-/data/backups/containers/**
-!/data/backups/containers/.gitkeep
-
-/data/logs/**
-!/data/logs/.gitkeep
-
-/data/host-tls/**
-!/data/host-tls/.gitkeep

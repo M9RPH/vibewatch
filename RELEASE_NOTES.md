@@ -37,3 +37,16 @@ ghcr.io/m9rph/vibewatch:0.9.5
 ## Notes
 
 Vibewatch remains pre-1.0 software. Review unattended update policies and keep independent backups of critical application data.
+
+## Docker Compose / GHCR installation
+
+Vibewatch v0.9.5 can be installed without cloning or building the source tree. The release workflow publishes multi-architecture images for `linux/amd64` and `linux/arm64` to `ghcr.io/m9rph/vibewatch`. The repository includes an official `compose.yml` pinned to this release.
+
+```bash
+mkdir -p vibewatch && cd vibewatch
+curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/.env.example
+nano .env
+docker compose pull
+docker compose up -d
+```
