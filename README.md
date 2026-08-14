@@ -12,6 +12,40 @@ Instead of only asking whether a new image exists, Vibewatch builds an update pi
 
 The **watch** part also reflects Vibewatch's roots in the Watchtower ecosystem. Vibewatch uses the Nicholas Fedor Watchtower fork as its passive update worker, while Vibewatch itself provides the UI, orchestration, Preflight, Verification, restore-point and rollback logic. The project is open about its AI-assisted development because the tools used to build it are part of how ideas can move from concept to working implementation faster.
 
+## Screenshots
+
+A quick look at the current Vibewatch interface. The screenshots below show a real multi-host setup and the areas used for day-to-day update management, recovery and automation.
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" alt="Vibewatch dashboard" width="49%">
+  <img src="docs/screenshots/containers.png" alt="Container overview" width="49%">
+</p>
+<p align="center"><sub>Dashboard · Container inventory and update state</sub></p>
+
+<p align="center">
+  <img src="docs/screenshots/hosts.png" alt="Docker hosts and groups" width="49%">
+  <img src="docs/screenshots/rollback.png" alt="Container rollback and restore points" width="49%">
+</p>
+<p align="center"><sub>Hosts & groups · Restore points and rollback</sub></p>
+
+<p align="center">
+  <img src="docs/screenshots/update-chains.png" alt="Update Chains" width="49%">
+  <img src="docs/screenshots/automation.png" alt="Automation schedules" width="49%">
+</p>
+<p align="center"><sub>Ordered Update Chains · Policy and cleanup automation</sub></p>
+
+<p align="center">
+  <img src="docs/screenshots/jobs.png" alt="Execution jobs" width="49%">
+  <img src="docs/screenshots/history.png" alt="Update and rollback history" width="49%">
+</p>
+<p align="center"><sub>Execution jobs · Human-readable update and rollback history</sub></p>
+
+<p align="center">
+  <img src="docs/screenshots/logs.png" alt="Diagnostics and logs" width="49%">
+  <img src="docs/screenshots/users.png" alt="Users and permissions" width="49%">
+</p>
+<p align="center"><sub>Diagnostics & audit logs · Users and permissions</sub></p>
+
 ## What Vibewatch does
 
 - Manage multiple Docker Engine hosts from one web UI.
