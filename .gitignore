@@ -32,7 +32,7 @@ data/*
 *.sqlite3
 
 # Generated backups / snapshots
-backups/
+/backups/
 snapshots/
 data/backups/*
 !data/backups/.gitkeep
@@ -50,7 +50,7 @@ data/snapshots/
 # Logs
 *.log
 *.jsonl
-logs/
+/logs/
 data/logs/*
 !data/logs/.gitkeep
 
@@ -94,3 +94,29 @@ Thumbs.db
 
 # Internal development/context documentation
 .vibewatch-internal/
+
+# Vibewatch runtime data - never commit live instance data
+!data/
+data/*
+
+!data/.gitkeep
+!data/backups/
+!data/logs/
+!data/host-tls/
+
+data/backups/*
+!data/backups/.gitkeep
+!data/backups/bundles/
+!data/backups/containers/
+
+data/backups/bundles/*
+!data/backups/bundles/.gitkeep
+
+data/backups/containers/*
+!data/backups/containers/.gitkeep
+
+data/logs/*
+!data/logs/.gitkeep
+
+data/host-tls/*
+!data/host-tls/.gitkeep

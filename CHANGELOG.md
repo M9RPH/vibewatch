@@ -4,6 +4,8 @@ All notable public changes to Vibewatch are documented here.
 
 ## 0.9.5
 
+- Fixed Git release packaging so runtime data skeleton `.gitkeep` files under `data/backups/` and `data/logs/` are tracked correctly instead of being shadowed by broad ignore rules.
+
 ### Recovery and crash safety
 
 - Added Chain-level crash recovery. Running Chain jobs are no longer blindly failed during controller startup; child update transactions are reconciled first and the Chain is reconstructed from recorded step/job state.
