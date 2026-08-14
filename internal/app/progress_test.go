@@ -1,7 +1,7 @@
 package app
 
 import (
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 	"testing"
 )
 

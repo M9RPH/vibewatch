@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 func TestNormalizeChainInputOrdersSteps(t *testing.T) {

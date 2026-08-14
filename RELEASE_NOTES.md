@@ -13,6 +13,9 @@ v0.9.5 is a reliability release focused on **crash-safe update recovery**.
 - Recovery GC removes orphaned Vibewatch helper containers on idle hosts.
 - Container Rollback adds **Cleanup unusable** for expired/degraded recovery artifacts while protecting Ready and transaction-referenced restore points.
 - Public README/architecture/docs have been rewritten for the GitHub release.
+- The canonical environment prefix is now `VIBEWATCH_*`; existing `WTUI_*` values continue to work as upgrade fallbacks.
+- The Go module path now matches the public repository: `github.com/m9rph/vibewatch`.
+- Fixed persisted Restore Point JSON hydration for dependency metadata and Data Protection manifests, including the GitHub Actions `TestDependencyMetadataRoundTrip` failure.
 
 ## Upgrade
 

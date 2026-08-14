@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 type updateWhyReason struct {

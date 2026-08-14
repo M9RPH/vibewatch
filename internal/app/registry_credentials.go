@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/registry"
+	"github.com/m9rph/vibewatch/internal/registry"
 )
 
 type registryCredentialInput struct {

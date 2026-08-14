@@ -19,15 +19,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/auth"
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
-	"github.com/watchtower-ui/watchtower-ui/internal/dockercli"
-	"github.com/watchtower-ui/watchtower-ui/internal/notify"
-	"github.com/watchtower-ui/watchtower-ui/internal/registry"
-	"github.com/watchtower-ui/watchtower-ui/internal/releases"
-	"github.com/watchtower-ui/watchtower-ui/internal/scheduler"
-	"github.com/watchtower-ui/watchtower-ui/internal/sshsetup"
-	"github.com/watchtower-ui/watchtower-ui/internal/watchtower"
+	"github.com/m9rph/vibewatch/internal/auth"
+	"github.com/m9rph/vibewatch/internal/db"
+	"github.com/m9rph/vibewatch/internal/dockercli"
+	"github.com/m9rph/vibewatch/internal/notify"
+	"github.com/m9rph/vibewatch/internal/registry"
+	"github.com/m9rph/vibewatch/internal/releases"
+	"github.com/m9rph/vibewatch/internal/scheduler"
+	"github.com/m9rph/vibewatch/internal/sshsetup"
+	"github.com/m9rph/vibewatch/internal/watchtower"
 )
 
 type Config struct {
@@ -2941,7 +2941,7 @@ func (a *App) handleUsers(w http.ResponseWriter, r *http.Request) {
 	username := strings.TrimSpace(in.Username)
 	// ID 0 is reserved for the environment/bootstrap Owner. Changing its
 	// password creates a persistent hash in /data; from then on that hash takes
-	// precedence over WTUI_ADMIN_PASSWORD without trying to rewrite .env.
+	// precedence over the bootstrap environment password without trying to rewrite .env.
 	if role == "owner" || (in.ID == 0 && strings.EqualFold(username, "admin")) {
 		if !owner {
 			writeErr(w, 403, "only the owner can change the owner account")
@@ -3929,7 +3929,7 @@ func (a *App) handleSelfUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(a.Cfg.AppImage) == "" {
-		writeErr(w, 409, "self update is not configured; set WTUI_APP_IMAGE to the published registry image")
+		writeErr(w, 409, "self update is not configured; set VIBEWATCH_APP_IMAGE to the published registry image")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)

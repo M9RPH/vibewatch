@@ -327,6 +327,24 @@ type RestorePoint struct {
 	DataBytes           int64  `json:"data_bytes"`
 }
 
+// UnmarshalJSON hydrates database-only restore-point JSON fields from
+// sqlite3 -json output while their json:"-" tags keep raw dependency/data
+// manifests out of public API responses.
+func (r *RestorePoint) UnmarshalJSON(data []byte) error {
+	type restorePointAlias RestorePoint
+	aux := struct {
+		*restorePointAlias
+		DependenciesJSON string `json:"dependencies_json"`
+		DataManifestJSON string `json:"data_manifest_json"`
+	}{restorePointAlias: (*restorePointAlias)(r)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	r.DependenciesJSON = aux.DependenciesJSON
+	r.DataManifestJSON = aux.DataManifestJSON
+	return nil
+}
+
 type DataProtectionProfile struct {
 	HostID     int64  `json:"host_id"`
 	ScopeType  string `json:"scope_type"`

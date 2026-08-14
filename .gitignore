@@ -60,6 +60,7 @@ data/host-tls/*
 
 # Go build artifacts
 /vibewatch
+/server
 /bin/
 dist/
 *.exe
@@ -71,6 +72,7 @@ coverage.out
 coverage.html
 
 # Frontend dependencies / build output
+*.tsbuildinfo
 node_modules/
 web/node_modules/
 web/dist/

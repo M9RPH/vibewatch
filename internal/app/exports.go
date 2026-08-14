@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 func exportFilename(kind, ext string) string {

@@ -1,3 +1,3 @@
-module github.com/watchtower-ui/watchtower-ui
+module github.com/m9rph/vibewatch
 
 go 1.23

@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 type Client struct {

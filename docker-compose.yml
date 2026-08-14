@@ -1,5 +1,5 @@
 x-vibewatch-image: &vibewatch-image
-  image: "${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}"
+  image: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}}"
 
 services:
   # Compatibility bridge for upgrades from the pre-Vibewatch Docker runtime
@@ -28,21 +28,23 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     ports:
-      - "${WTUI_PORT:-8085}:8080"
+      - "${VIBEWATCH_PORT:-${WTUI_PORT:-8085}}:8080"
     environment:
       TZ: "${TZ:-Europe/Berlin}"
-      WTUI_ADMIN_PASSWORD: "${WTUI_ADMIN_PASSWORD:?Set WTUI_ADMIN_PASSWORD in .env}"
-      WTUI_SESSION_SECRET: "${WTUI_SESSION_SECRET:?Set WTUI_SESSION_SECRET in .env}"
-      WTUI_LOG_LEVEL: "${WTUI_LOG_LEVEL:-INFO}"
-      WTUI_WATCHTOWER_IMAGE: "${WTUI_WATCHTOWER_IMAGE:-nickfedor/watchtower:latest}"
-      WTUI_WORKER_NETWORK: "vibewatch-internal"
-      WTUI_APP_IMAGE: "${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}"
-      WTUI_CONTAINER_NAME: "vibewatch"
+      # Canonical VIBEWATCH_* names. Existing WTUI_* values in older .env files
+      # remain accepted through the interpolation fallbacks below.
+      VIBEWATCH_ADMIN_PASSWORD: "${VIBEWATCH_ADMIN_PASSWORD:-${WTUI_ADMIN_PASSWORD:?Set VIBEWATCH_ADMIN_PASSWORD in .env}}"
+      VIBEWATCH_SESSION_SECRET: "${VIBEWATCH_SESSION_SECRET:-${WTUI_SESSION_SECRET:?Set VIBEWATCH_SESSION_SECRET in .env}}"
+      VIBEWATCH_LOG_LEVEL: "${VIBEWATCH_LOG_LEVEL:-${WTUI_LOG_LEVEL:-INFO}}"
+      VIBEWATCH_WATCHTOWER_IMAGE: "${VIBEWATCH_WATCHTOWER_IMAGE:-${WTUI_WATCHTOWER_IMAGE:-nickfedor/watchtower:latest}}"
+      VIBEWATCH_WORKER_NETWORK: "vibewatch-internal"
+      VIBEWATCH_APP_IMAGE: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}}"
+      VIBEWATCH_CONTAINER_NAME: "vibewatch"
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       # Legacy migration only; V0.4.8+ sends with each account's own App Token + User Key.
       PUSHOVER_APP_TOKEN: "${PUSHOVER_APP_TOKEN:-}"
     volumes:
-      - "${WTUI_DATA_PATH:-./data}:/data"
+      - "${VIBEWATCH_DATA_PATH:-${WTUI_DATA_PATH:-./data}}:/data"
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - vibewatch-internal

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 func TestVerificationHTTPStatusAndContent(t *testing.T) {

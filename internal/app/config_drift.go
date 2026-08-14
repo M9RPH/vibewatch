@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
-	"github.com/watchtower-ui/watchtower-ui/internal/dockercli"
+	"github.com/m9rph/vibewatch/internal/db"
+	"github.com/m9rph/vibewatch/internal/dockercli"
 )
 
 type ConfigDriftChange struct {

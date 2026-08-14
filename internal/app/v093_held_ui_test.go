@@ -3,7 +3,7 @@ package app
 import (
 	"testing"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 func TestV093AutomationHoldVisibility(t *testing.T) {

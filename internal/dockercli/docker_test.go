@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 func TestEnsureWorkerUsesValidHTTPAPIEndpoints(t *testing.T) {

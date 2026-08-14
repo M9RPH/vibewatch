@@ -22,6 +22,14 @@ All notable public changes to Vibewatch are documented here.
 - Added dedicated documentation for installation, update pipeline, verification, Data Protection/rollback, Update Chains, automation and security.
 - Internal development/context notes are no longer part of the public repository package.
 
+### Release preparation hotfix
+
+- Renamed the canonical environment-variable prefix from legacy `WTUI_*` to `VIBEWATCH_*`. Existing `WTUI_*` values remain accepted as fallbacks, so current installations do not need an immediate `.env` migration.
+- Rebranded the Go module path to `github.com/m9rph/vibewatch` so CI/build output no longer exposes the pre-Vibewatch project name.
+- Fixed SQLite JSON hydration for restore-point dependency metadata and Data Protection manifests. The raw JSON remains hidden from public API serialization. This fixes `TestDependencyMetadataRoundTrip` in GitHub Actions and ensures persisted recovery metadata is available after DB reads.
+- Added the public explanation of the Vibewatch name and its AI-assisted development workflow.
+- Internal engineering/context notes remain in `.vibewatch-internal/`, which is excluded from Git and Docker build contexts.
+
 ### Compatibility
 
 - Existing databases migrate automatically with additive Update Chain recovery metadata and Recovery GC counters.

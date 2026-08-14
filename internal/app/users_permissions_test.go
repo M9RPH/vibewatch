@@ -3,8 +3,8 @@ package app
 import (
 	"testing"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/auth"
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/auth"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 func TestManagedUserVisibilityHierarchy(t *testing.T) {

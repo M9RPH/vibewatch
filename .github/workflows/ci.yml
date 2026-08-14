@@ -21,9 +21,15 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Go tests
-        run: go test ./...
+        run: go test -count=1 ./...
       - name: Go vet
         run: go vet ./...
+      - name: Release naming sanity
+        run: |
+          test "$(head -n 1 go.mod)" = "module github.com/m9rph/vibewatch"
+          grep -q '^VIBEWATCH_ADMIN_PASSWORD=' .env.example
+          grep -q '^VIBEWATCH_SESSION_SECRET=' .env.example
+          if grep -q '^WTUI_' .env.example; then echo "legacy WTUI variables must not be canonical in .env.example"; exit 1; fi
       - name: Build controller
         run: go build -trimpath -ldflags "-X main.version=$(cat VERSION)" ./cmd/server
       - uses: actions/setup-node@v4

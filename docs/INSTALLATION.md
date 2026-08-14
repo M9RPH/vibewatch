@@ -20,8 +20,8 @@ cp .env.example .env
 Set at least:
 
 ```dotenv
-WTUI_ADMIN_PASSWORD=<strong-password>
-WTUI_SESSION_SECRET=<long-random-secret>
+VIBEWATCH_ADMIN_PASSWORD=<strong-password>
+VIBEWATCH_SESSION_SECRET=<long-random-secret>
 ```
 
 Generate a session secret if needed:
@@ -43,7 +43,7 @@ Initial Owner login:
 
 ```text
 username: admin
-password: WTUI_ADMIN_PASSWORD from .env
+password: VIBEWATCH_ADMIN_PASSWORD from .env
 ```
 
 ## Persistence
@@ -88,3 +88,21 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 The public release image remains the recommended deployment path.
+## Upgrading from legacy `WTUI_*` variables
+
+Vibewatch v0.9.5 uses `VIBEWATCH_*` as the canonical environment-variable prefix. Existing installations do **not** need to rewrite their live `.env` immediately: the pre-rebrand `WTUI_*` names remain accepted as compatibility fallbacks.
+
+For a planned cleanup, rename variables one-for-one:
+
+```text
+WTUI_PORT             -> VIBEWATCH_PORT
+WTUI_DATA_PATH        -> VIBEWATCH_DATA_PATH
+WTUI_ADMIN_PASSWORD   -> VIBEWATCH_ADMIN_PASSWORD
+WTUI_SESSION_SECRET   -> VIBEWATCH_SESSION_SECRET
+WTUI_LOG_LEVEL        -> VIBEWATCH_LOG_LEVEL
+WTUI_WATCHTOWER_IMAGE -> VIBEWATCH_WATCHTOWER_IMAGE
+WTUI_APP_IMAGE        -> VIBEWATCH_APP_IMAGE
+```
+
+If both names are present, the `VIBEWATCH_*` value wins.
+

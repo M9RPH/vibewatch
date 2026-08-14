@@ -10,15 +10,15 @@ if [ -z "$password" ]; then
 fi
 secret=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 cat > .env <<EOT
-WTUI_PORT=8085
+VIBEWATCH_PORT=8085
 TZ=Europe/Berlin
-WTUI_DATA_PATH=./data
-WTUI_ADMIN_PASSWORD=$password
-WTUI_SESSION_SECRET=$secret
-WTUI_LOG_LEVEL=INFO
-WTUI_WATCHTOWER_IMAGE=nickfedor/watchtower:latest
+VIBEWATCH_DATA_PATH=./data
+VIBEWATCH_ADMIN_PASSWORD=$password
+VIBEWATCH_SESSION_SECRET=$secret
+VIBEWATCH_LOG_LEVEL=INFO
+VIBEWATCH_WATCHTOWER_IMAGE=nickfedor/watchtower:latest
 GITHUB_TOKEN=
-WTUI_APP_IMAGE=
+VIBEWATCH_APP_IMAGE=ghcr.io/m9rph/vibewatch:0.9.5
 EOT
 chmod 600 .env
 echo ".env created"

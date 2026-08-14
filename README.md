@@ -6,6 +6,12 @@ Instead of only asking whether a new image exists, Vibewatch builds an update pi
 
 > **Project status:** v0.9.5 is a pre-1.0 release. It is intended for homelab and self-hosted Docker environments where operators are comfortable reviewing Docker permissions, update policies and recovery behavior before enabling unattended updates.
 
+## Why the name Vibewatch?
+
+**Vibewatch** combines **vibe coding** with **Watchtower**. AI-assisted programming is an intentional part of the development workflow: it helps turn ideas into testable software quickly, while the resulting behavior is still reviewed and exercised against real Docker environments.
+
+The **watch** part also reflects Vibewatch's roots in the Watchtower ecosystem. Vibewatch uses the Nicholas Fedor Watchtower fork as its passive update worker, while Vibewatch itself provides the UI, orchestration, Preflight, Verification, restore-point and rollback logic. The project is open about its AI-assisted development because the tools used to build it are part of how ideas can move from concept to working implementation faster.
+
 ## What Vibewatch does
 
 - Manage multiple Docker Engine hosts from one web UI.
@@ -51,8 +57,8 @@ cp .env.example .env
 At minimum, change:
 
 ```dotenv
-WTUI_ADMIN_PASSWORD=replace-with-a-strong-password
-WTUI_SESSION_SECRET=replace-with-a-long-random-secret
+VIBEWATCH_ADMIN_PASSWORD=replace-with-a-strong-password
+VIBEWATCH_SESSION_SECRET=replace-with-a-long-random-secret
 ```
 
 A session secret can be generated with:
@@ -61,7 +67,7 @@ A session secret can be generated with:
 openssl rand -hex 32
 ```
 
-The default persistent data directory is `./data`. Keep `WTUI_DATA_PATH` stable across upgrades.
+The default persistent data directory is `./data`. Keep `VIBEWATCH_DATA_PATH` stable across upgrades.
 
 ### 3. Start Vibewatch
 
@@ -76,7 +82,7 @@ Open:
 http://<docker-host>:8085
 ```
 
-The initial Owner username is `admin` and the password is the value of `WTUI_ADMIN_PASSWORD`.
+The initial Owner username is `admin` and the password is the value of `VIBEWATCH_ADMIN_PASSWORD`.
 
 ### 4. Add Docker hosts
 

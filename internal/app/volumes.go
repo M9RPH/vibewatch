@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
+	"github.com/m9rph/vibewatch/internal/db"
 )
 
 func (a *App) handleHostVolumes(w http.ResponseWriter, r *http.Request, hostID int64) {

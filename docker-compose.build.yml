@@ -16,4 +16,4 @@ services:
       args:
         VIBEWATCH_VERSION: "0.9.5"
     environment:
-      WTUI_APP_IMAGE: "vibewatch:0.9.5"
+      VIBEWATCH_APP_IMAGE: "vibewatch:0.9.5"

@@ -14,16 +14,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/watchtower-ui/watchtower-ui/internal/app"
-	"github.com/watchtower-ui/watchtower-ui/internal/auth"
-	"github.com/watchtower-ui/watchtower-ui/internal/db"
-	"github.com/watchtower-ui/watchtower-ui/internal/dockercli"
-	logx "github.com/watchtower-ui/watchtower-ui/internal/logging"
-	"github.com/watchtower-ui/watchtower-ui/internal/notify"
-	"github.com/watchtower-ui/watchtower-ui/internal/registry"
-	"github.com/watchtower-ui/watchtower-ui/internal/releases"
-	"github.com/watchtower-ui/watchtower-ui/internal/sshsetup"
-	"github.com/watchtower-ui/watchtower-ui/internal/watchtower"
+	"github.com/m9rph/vibewatch/internal/app"
+	"github.com/m9rph/vibewatch/internal/auth"
+	"github.com/m9rph/vibewatch/internal/db"
+	"github.com/m9rph/vibewatch/internal/dockercli"
+	logx "github.com/m9rph/vibewatch/internal/logging"
+	"github.com/m9rph/vibewatch/internal/notify"
+	"github.com/m9rph/vibewatch/internal/registry"
+	"github.com/m9rph/vibewatch/internal/releases"
+	"github.com/m9rph/vibewatch/internal/sshsetup"
+	"github.com/m9rph/vibewatch/internal/watchtower"
 )
 
 var version = "dev"
@@ -33,6 +33,22 @@ func env(k, d string) string {
 		return v
 	}
 	return d
+}
+
+// vibewatchEnv prefers the canonical VIBEWATCH_* variable while retaining
+// the pre-rebrand WTUI_* name as a compatibility fallback. This keeps
+// existing installations working while new .env files use Vibewatch-native
+// names.
+func vibewatchEnv(name, legacy, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+	if legacy != "" {
+		if v := strings.TrimSpace(os.Getenv(legacy)); v != "" {
+			return v
+		}
+	}
+	return fallback
 }
 func trimStartupBackups(dir string, keep int) {
 	entries, err := os.ReadDir(dir)
@@ -56,8 +72,8 @@ func trimStartupBackups(dir string, keep int) {
 }
 
 func main() {
-	data := env("WTUI_DATA_DIR", "/data")
-	logger, _, err := logx.New(filepath.Join(data, "logs", "app.log"), env("WTUI_LOG_LEVEL", "INFO"))
+	data := vibewatchEnv("VIBEWATCH_DATA_DIR", "WTUI_DATA_DIR", "/data")
+	logger, _, err := logx.New(filepath.Join(data, "logs", "app.log"), vibewatchEnv("VIBEWATCH_LOG_LEVEL", "WTUI_LOG_LEVEL", "INFO"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -126,20 +142,20 @@ func main() {
 	}
 	d := dockercli.New(logger)
 	d.HostTLSRoot = filepath.Join(data, "host-tls")
-	d.ControllerName = env("WTUI_CONTAINER_NAME", "vibewatch")
+	d.ControllerName = vibewatchEnv("VIBEWATCH_CONTAINER_NAME", "WTUI_CONTAINER_NAME", "vibewatch")
 	d.DataDir = data
-	d.WorkerImage = env("WTUI_WATCHTOWER_IMAGE", "nickfedor/watchtower:latest")
-	d.WorkerNetwork = env("WTUI_WORKER_NETWORK", "vibewatch-internal")
-	d.WorkerPort = env("WTUI_WORKER_PORT", "8080")
-	secret := env("WTUI_SESSION_SECRET", "")
+	d.WorkerImage = vibewatchEnv("VIBEWATCH_WATCHTOWER_IMAGE", "WTUI_WATCHTOWER_IMAGE", "nickfedor/watchtower:latest")
+	d.WorkerNetwork = vibewatchEnv("VIBEWATCH_WORKER_NETWORK", "WTUI_WORKER_NETWORK", "vibewatch-internal")
+	d.WorkerPort = vibewatchEnv("VIBEWATCH_WORKER_PORT", "WTUI_WORKER_PORT", "8080")
+	secret := vibewatchEnv("VIBEWATCH_SESSION_SECRET", "WTUI_SESSION_SECRET", "")
 	if secret == "" {
 		b := make([]byte, 32)
 		_, _ = rand.Read(b)
 		secret = hex.EncodeToString(b)
-		logger.Warn("WTUI_SESSION_SECRET is not set; sessions will reset after restart")
+		logger.Warn("VIBEWATCH_SESSION_SECRET is not set; sessions will reset after restart")
 	}
-	secure := strings.EqualFold(env("WTUI_SECURE_COOKIE", "false"), "true")
-	ownerEnvPassword := env("WTUI_ADMIN_PASSWORD", "")
+	secure := strings.EqualFold(vibewatchEnv("VIBEWATCH_SECURE_COOKIE", "WTUI_SECURE_COOKIE", "false"), "true")
+	ownerEnvPassword := vibewatchEnv("VIBEWATCH_ADMIN_PASSWORD", "WTUI_ADMIN_PASSWORD", "")
 	ownerOverrideHash := store.Setting(context.Background(), "owner_password_hash", "")
 	authPassword := ownerEnvPassword
 	if authPassword == "" && ownerOverrideHash != "" {
@@ -149,7 +165,7 @@ func main() {
 	}
 	authm := auth.New(authPassword, secret, secure)
 	if !authm.Enabled() {
-		logger.Warn("authentication is disabled; set WTUI_ADMIN_PASSWORD before exposing the UI")
+		logger.Warn("authentication is disabled; set VIBEWATCH_ADMIN_PASSWORD before exposing the UI")
 	}
 	// V0.4.5 migration: Pushover credentials are now fully per-account. If an
 	// older installation had a shared application token, import it once into
@@ -177,10 +193,10 @@ func main() {
 	if legacyPersistentToken != "" && strings.TrimSpace(ownerNotifications.PushoverAppToken) != "" {
 		_ = store.SetSetting(context.Background(), "pushover_app_token", "")
 	}
-	a := app.New(app.Config{DataDir: data, WebDir: env("WTUI_WEB_DIR", "/app/web"), Timezone: env("TZ", "Europe/Berlin"), Version: version, AppImage: env("WTUI_APP_IMAGE", ""), ControllerName: env("WTUI_CONTAINER_NAME", "vibewatch")}, store, d, watchtower.New(), releases.New(), registry.New(), notify.NewPushover(), sshsetup.New(data), logger, authm)
+	a := app.New(app.Config{DataDir: data, WebDir: vibewatchEnv("VIBEWATCH_WEB_DIR", "WTUI_WEB_DIR", "/app/web"), Timezone: env("TZ", "Europe/Berlin"), Version: version, AppImage: vibewatchEnv("VIBEWATCH_APP_IMAGE", "WTUI_APP_IMAGE", ""), ControllerName: vibewatchEnv("VIBEWATCH_CONTAINER_NAME", "WTUI_CONTAINER_NAME", "vibewatch")}, store, d, watchtower.New(), releases.New(), registry.New(), notify.NewPushover(), sshsetup.New(data), logger, authm)
 	a.Start()
 	defer a.Stop()
-	srv := &http.Server{Addr: env("WTUI_LISTEN", ":8080"), Handler: a.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+	srv := &http.Server{Addr: vibewatchEnv("VIBEWATCH_LISTEN", "WTUI_LISTEN", ":8080"), Handler: a.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		logger.Info("vibewatch started", "addr", srv.Addr, "version", version)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
