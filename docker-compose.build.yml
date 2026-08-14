@@ -3,17 +3,17 @@
 # not require a local toolchain.
 services:
   vibewatch-runtime-migrate:
-    image: "vibewatch:0.9.2.7"
+    image: "vibewatch:0.9.5"
     build:
       context: .
       args:
-        VIBEWATCH_VERSION: "0.9.2.7"
+        VIBEWATCH_VERSION: "0.9.5"
 
   vibewatch:
-    image: "vibewatch:0.9.2.7"
+    image: "vibewatch:0.9.5"
     build:
       context: .
       args:
-        VIBEWATCH_VERSION: "0.9.2.7"
+        VIBEWATCH_VERSION: "0.9.5"
     environment:
-      WTUI_APP_IMAGE: "vibewatch:0.9.2.7"
+      WTUI_APP_IMAGE: "vibewatch:0.9.5"

@@ -109,6 +109,31 @@ func verificationStateForProfile(profile VerificationProfileView, state db.Verif
 	return state
 }
 
+func (a *App) effectiveVerificationState(ctx context.Context, hostID int64, container string, profile VerificationProfileView) db.VerificationState {
+	if profile.ScopeType == "stack" && strings.TrimSpace(profile.ScopeKey) != "" {
+		x, err := a.Store.VerificationScopeState(ctx, hostID, "stack", profile.ScopeKey)
+		if err != nil {
+			x = db.VerificationScopeState{HostID: hostID, ScopeType: "stack", ScopeKey: profile.ScopeKey, Status: verificationStatusNotConfigured, DetailsJSON: "[]"}
+		}
+		state := db.VerificationState{HostID: hostID, ContainerName: container, ScopeType: "stack", ScopeKey: profile.ScopeKey, Status: x.Status, DetailsJSON: x.DetailsJSON, CheckedAt: x.CheckedAt, Error: x.Error}
+		return verificationStateForProfile(profile, state)
+	}
+	state, err := a.Store.VerificationState(ctx, hostID, container)
+	if err != nil {
+		state = db.VerificationState{HostID: hostID, ContainerName: container, Status: verificationStatusNotConfigured, DetailsJSON: "[]"}
+	}
+	state.ScopeType = profile.ScopeType
+	state.ScopeKey = profile.ScopeKey
+	return verificationStateForProfile(profile, state)
+}
+
+func (a *App) saveVerificationStateForProfile(ctx context.Context, profile VerificationProfileView, hostID int64, container, status, detailsJSON, checkedAt, errText string) error {
+	if profile.ScopeType == "stack" && strings.TrimSpace(profile.ScopeKey) != "" {
+		return a.Store.SaveVerificationScopeState(ctx, db.VerificationScopeState{HostID: hostID, ScopeType: "stack", ScopeKey: profile.ScopeKey, Status: status, DetailsJSON: detailsJSON, CheckedAt: checkedAt, Error: errText})
+	}
+	return a.Store.SaveVerificationState(ctx, db.VerificationState{HostID: hostID, ContainerName: container, Status: status, DetailsJSON: detailsJSON, CheckedAt: checkedAt, Error: errText})
+}
+
 func (a *App) effectiveVerificationProfile(ctx context.Context, hostID int64, container string) (VerificationProfileView, error) {
 	if x, err := a.Store.VerificationProfile(ctx, hostID, "container", container); err == nil {
 		return verificationProfileView(x, false), nil
@@ -246,7 +271,7 @@ func (a *App) runCustomVerification(ctx context.Context, hostID int64, container
 	}
 	profile, _ := a.effectiveVerificationProfile(ctx, hostID, container)
 	if !profile.Configured {
-		result := VerificationResult{Status: verificationStatusNotConfigured, Configured: false, CheckResult: []VerificationCheckResult{}, StartedAt: time.Now().UTC().Format(time.RFC3339), FinishedAt: time.Now().UTC().Format(time.RFC3339)}
+		result := VerificationResult{Status: verificationStatusNotConfigured, Configured: false, CheckResult: []VerificationCheckResult{}, StartedAt: time.Now().UTC().Format(time.RFC3339Nano), FinishedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 		bs, _ := json.Marshal(result.CheckResult)
 		_ = a.Store.SaveVerificationState(context.Background(), db.VerificationState{HostID: hostID, ContainerName: container, Status: verificationStatusNotConfigured, DetailsJSON: string(bs), CheckedAt: result.FinishedAt})
 		txID := int64(0)
@@ -259,12 +284,12 @@ func (a *App) runCustomVerification(ctx context.Context, hostID int64, container
 		return result
 	}
 	verificationStarted := time.Now()
-	result := VerificationResult{Status: verificationStatusRunning, Configured: true, ScopeType: profile.ScopeType, ScopeKey: profile.ScopeKey, StartedAt: verificationStarted.UTC().Format(time.RFC3339), CheckResult: make([]VerificationCheckResult, 0, len(profile.Checks))}
+	result := VerificationResult{Status: verificationStatusRunning, Configured: true, ScopeType: profile.ScopeType, ScopeKey: profile.ScopeKey, StartedAt: verificationStarted.UTC().Format(time.RFC3339Nano), CheckResult: make([]VerificationCheckResult, 0, len(profile.Checks))}
 	if jobID > 0 {
 		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "verify", fmt.Sprintf("custom verification started (%s:%s, %d check(s))", profile.ScopeType, profile.ScopeKey, len(profile.Checks)))
 	}
 	_ = a.Store.Audit(context.Background(), actor, "verification.started", hostID, container, fmt.Sprintf("scope=%s:%s checks=%d", profile.ScopeType, profile.ScopeKey, len(profile.Checks)))
-	_ = a.Store.SaveVerificationState(context.Background(), db.VerificationState{HostID: hostID, ContainerName: container, Status: verificationStatusRunning, DetailsJSON: "[]", CheckedAt: result.StartedAt})
+	_ = a.saveVerificationStateForProfile(context.Background(), profile, hostID, container, verificationStatusRunning, "[]", result.StartedAt, "")
 	if profile.StartDelaySeconds > 0 {
 		select {
 		case <-ctx.Done():
@@ -308,10 +333,10 @@ func (a *App) runCustomVerification(ctx context.Context, hostID int64, container
 	if result.Status != verificationStatusFailed {
 		result.Status = verificationStatusVerified
 	}
-	result.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	result.DurationMS = time.Since(verificationStarted).Milliseconds()
 	bs, _ := json.Marshal(result.CheckResult)
-	_ = a.Store.SaveVerificationState(context.Background(), db.VerificationState{HostID: hostID, ContainerName: container, Status: result.Status, DetailsJSON: string(bs), CheckedAt: result.FinishedAt, Error: result.Error})
+	_ = a.saveVerificationStateForProfile(context.Background(), profile, hostID, container, result.Status, string(bs), result.FinishedAt, result.Error)
 	txID := int64(0)
 	if jobID > 0 {
 		if tx, e := a.Store.UpdateTransactionByJob(context.Background(), jobID); e == nil {
@@ -329,7 +354,11 @@ func (a *App) runCustomVerification(ctx context.Context, hostID int64, container
 		if strings.HasPrefix(trigger, "automation:") || strings.HasPrefix(trigger, "chain-auto:") {
 			event = "auto"
 		}
-		go a.notifyHostUsers(hostID, event, container, "Verification failed · "+container, "Vibewatch could not verify the updated service. "+result.Error, "")
+		// A standalone manual verification is diagnostic and did not update the
+		// container, so do not emit update-failure notifications for it.
+		if trigger != "manual-test" {
+			go a.notifyHostUsers(hostID, event, container, "Verification failed · "+container, "Vibewatch could not verify the updated service. "+result.Error, "")
+		}
 	} else {
 		if jobID > 0 {
 			_ = a.Store.AddJobLog(context.Background(), jobID, "INFO", "verify", "custom verification passed")
@@ -356,9 +385,14 @@ func (a *App) handleVerification(w http.ResponseWriter, r *http.Request, hostID 
 			writeErr(w, 500, err.Error())
 			return
 		}
-		state, _ := a.Store.VerificationState(r.Context(), hostID, container)
-		state = verificationStateForProfile(profile, state)
+		state := a.effectiveVerificationState(r.Context(), hostID, container, profile)
 		writeJSON(w, 200, map[string]any{"profile": profile, "state": state})
+	case http.MethodPost:
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		result := a.runCustomVerification(r.Context(), hostID, container, "manual-test", a.actor(r), 0)
+		writeJSON(w, http.StatusOK, result)
 	case http.MethodPut:
 		if !a.requireAdmin(w, r) {
 			return
@@ -412,7 +446,11 @@ func (a *App) handleVerification(w http.ResponseWriter, r *http.Request, hostID 
 			writeErr(w, 500, err.Error())
 			return
 		}
-		_ = a.Store.SaveVerificationState(r.Context(), db.VerificationState{HostID: hostID, ContainerName: container, Status: verificationStatusNotConfigured, DetailsJSON: "[]"})
+		if scopeType == "stack" {
+			_ = a.Store.DeleteVerificationScopeState(r.Context(), hostID, scopeType, scopeKey)
+		} else {
+			_ = a.Store.SaveVerificationState(r.Context(), db.VerificationState{HostID: hostID, ContainerName: container, Status: verificationStatusNotConfigured, DetailsJSON: "[]"})
+		}
 		_ = a.Store.Audit(r.Context(), a.actor(r), "verification.profile.delete", hostID, container, fmt.Sprintf("scope=%s:%s", scopeType, scopeKey))
 		writeJSON(w, 200, map[string]any{"ok": true})
 	default:

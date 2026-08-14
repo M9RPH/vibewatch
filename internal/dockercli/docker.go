@@ -202,7 +202,7 @@ type EventWatcher struct {
 }
 
 func New(logger *slog.Logger) *Client {
-	return &Client{Binary: "docker", Logger: logger, HostTLSRoot: "/data/host-tls", ControllerName: "vibewatch", DataDir: "/data", WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.5", labelCache: map[string]cachedLabels{}, platformCache: map[string]cachedPlatform{}}
+	return &Client{Binary: "docker", Logger: logger, HostTLSRoot: "/data/host-tls", ControllerName: "vibewatch", DataDir: "/data", WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.6", labelCache: map[string]cachedLabels{}, platformCache: map[string]cachedPlatform{}}
 }
 
 func ConnectionType(endpoint string) string {
@@ -1675,6 +1675,7 @@ func (c *Client) EnsureWorker(ctx context.Context, host db.Host) (string, error)
 		"-e", "WATCHTOWER_HTTP_API_UPDATE_TIMEOUT=30m",
 		"-e", "WATCHTOWER_HTTP_API_PERIODIC_POLLS=false",
 		"-e", "WATCHTOWER_UPDATE_ON_START=false",
+		"-e", "WATCHTOWER_INCLUDE_STOPPED=true",
 		"-e", "WATCHTOWER_CLEANUP=false",
 	)
 	if ConnectionType(host.Endpoint) == "local" {

@@ -1,5 +1,5 @@
 x-vibewatch-image: &vibewatch-image
-  image: "${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.2.7}"
+  image: "${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}"
 
 services:
   # Compatibility bridge for upgrades from the pre-Vibewatch Docker runtime
@@ -12,7 +12,7 @@ services:
     command:
       - |
         docker rm -f watchtower-ui watchtower-ui-self-updater >/dev/null 2>&1 || true
-        for c in $(docker ps -aq --filter 'name=^watchtower-ui-worker-'); do docker rm -f "$c" >/dev/null 2>&1 || true; done
+        for c in $(docker ps -aq --filter 'name=^watchtower-ui-worker-'); do docker rm -f "$$c" >/dev/null 2>&1 || true; done
         docker network rm watchtower-ui-internal >/dev/null 2>&1 || true
         exit 0
     volumes:
@@ -36,7 +36,7 @@ services:
       WTUI_LOG_LEVEL: "${WTUI_LOG_LEVEL:-INFO}"
       WTUI_WATCHTOWER_IMAGE: "${WTUI_WATCHTOWER_IMAGE:-nickfedor/watchtower:latest}"
       WTUI_WORKER_NETWORK: "vibewatch-internal"
-      WTUI_APP_IMAGE: "${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.2.7}"
+      WTUI_APP_IMAGE: "${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}"
       WTUI_CONTAINER_NAME: "vibewatch"
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       # Legacy migration only; V0.4.8+ sends with each account's own App Token + User Key.

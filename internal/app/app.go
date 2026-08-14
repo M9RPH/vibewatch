@@ -68,27 +68,66 @@ type App struct {
 	chainReserved map[string]int64
 }
 type updateRequest struct {
-	JobID           int64
-	TransactionID   int64
-	HostID          int64
-	Container       string
-	Trigger         string
-	Actor           string
-	PreviewProgress func(percent int, stage string)
-	PreviewCheck    func(check PreflightCheck)
+	JobID                     int64
+	TransactionID             int64
+	HostID                    int64
+	Container                 string
+	Trigger                   string
+	Actor                     string
+	AllowPreflightWarnings    bool
+	SkipDataProtectionCapture bool
+	DeferTargetRestart        bool
+	PreviewProgress           func(percent int, stage string)
+	PreviewCheck              func(check PreflightCheck)
+}
+
+type AutomationHoldView struct {
+	Held      bool   `json:"held"`
+	Source    string `json:"source"`
+	Reason    string `json:"reason"`
+	HeldAt    string `json:"held_at"`
+	ChainID   int64  `json:"chain_id,omitempty"`
+	ChainName string `json:"chain_name,omitempty"`
+}
+
+func deriveAutomationHold(cache db.Cache, policy db.Policy, chain *ChainManagementView, history []db.UpdateHistory) *AutomationHoldView {
+	if !bool(cache.UpdateAvailable) || cacheHasSnoozedUpdate(cache) {
+		return nil
+	}
+	if chain != nil && chain.PolicyMode == "auto" && chain.LastStatus == "blocked" {
+		return &AutomationHoldView{Held: true, Source: "chain", Reason: "Automatic chain held by Preflight", HeldAt: chain.LastRunAt, ChainID: chain.ChainID, ChainName: chain.ChainName}
+	}
+	if policy.Mode != "auto" || len(history) == 0 {
+		return nil
+	}
+	last := history[0]
+	if last.Status != "skipped" || last.PreflightStatus != "blocked" || !strings.HasPrefix(last.Trigger, "automation:") {
+		return nil
+	}
+	return &AutomationHoldView{Held: true, Source: "container", Reason: firstNonEmpty(last.Error, "Automatic update held by Preflight"), HeldAt: last.TS}
+}
+
+type DataProtectionSummaryView struct {
+	Enabled    bool   `json:"enabled"`
+	ScopeType  string `json:"scope_type"`
+	ScopeKey   string `json:"scope_key"`
+	MountCount int    `json:"mount_count"`
 }
 
 type ContainerView struct {
 	dockercli.Container
-	SystemManaged   bool                 `json:"system_managed"`
-	SystemRole      string               `json:"system_role,omitempty"`
-	Policy          db.Policy            `json:"policy"`
-	Cache           db.Cache             `json:"update"`
-	Version         db.VersionInfo       `json:"version"`
-	ConfigDrift     ConfigDriftView      `json:"config_drift"`
-	Verification    db.VerificationState `json:"verification"`
-	RestorePoint    *db.RestorePoint     `json:"restore_point,omitempty"`
-	ChainManagement *ChainManagementView `json:"chain_management,omitempty"`
+	SystemManaged   bool                       `json:"system_managed"`
+	SystemRole      string                     `json:"system_role,omitempty"`
+	Policy          db.Policy                  `json:"policy"`
+	Cache           db.Cache                   `json:"update"`
+	Version         db.VersionInfo             `json:"version"`
+	ConfigDrift     ConfigDriftView            `json:"config_drift"`
+	Verification    db.VerificationState       `json:"verification"`
+	DataProtection  *DataProtectionSummaryView `json:"data_protection,omitempty"`
+	RestorePoint    *db.RestorePoint           `json:"restore_point,omitempty"`
+	ChainManagement *ChainManagementView       `json:"chain_management,omitempty"`
+	AutomationHold  *AutomationHoldView        `json:"automation_hold,omitempty"`
+	RollbackSnoozed bool                       `json:"rollback_snoozed,omitempty"`
 }
 
 type hostInput struct {
@@ -127,9 +166,10 @@ type hostHealthState struct {
 }
 
 type policyInput struct {
-	Mode                 string `json:"mode"`
-	CheckIntervalMinutes int    `json:"check_interval_minutes"`
-	ReleaseRepo          string `json:"release_repo"`
+	Mode                   string `json:"mode"`
+	CheckIntervalMinutes   int    `json:"check_interval_minutes"`
+	ReleaseRepo            string `json:"release_repo"`
+	AllowPreflightWarnings bool   `json:"allow_preflight_warnings"`
 }
 type scheduleInput struct {
 	ID         int64    `json:"id"`
@@ -141,12 +181,17 @@ type scheduleInput struct {
 	Enabled    bool     `json:"enabled"`
 }
 type automationInput struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Cron       string `json:"cron"`
-	TargetType string `json:"target_type"`
-	TargetID   int64  `json:"target_id"`
-	Enabled    bool   `json:"enabled"`
+	ID                int64  `json:"id"`
+	Name              string `json:"name"`
+	Cron              string `json:"cron"`
+	TargetType        string `json:"target_type"`
+	TargetID          int64  `json:"target_id"`
+	Kind              string `json:"kind"`
+	CleanupImages     bool   `json:"cleanup_images"`
+	CleanupNetworks   bool   `json:"cleanup_networks"`
+	CleanupBuildCache bool   `json:"cleanup_build_cache"`
+	CleanupVolumes    bool   `json:"cleanup_volumes"`
+	Enabled           bool   `json:"enabled"`
 }
 type groupInput struct {
 	ID          int64   `json:"id"`
@@ -314,12 +359,9 @@ func (a *App) recoverInterruptedJobs() {
 	} else if count > 0 {
 		a.Logger.Warn("recovered interrupted jobs", "count", count)
 	}
-	chainCount, chainErr := a.Store.FailActiveUpdateChainRuns(a.ctx, reason)
-	if chainErr != nil {
-		a.Logger.Warn("could not recover interrupted update chains", "error", chainErr)
-	} else if chainCount > 0 {
-		a.Logger.Warn("recovered interrupted update chains", "count", chainCount)
-	}
+	// Update chains are recovered after their child update transactions have been
+	// reconciled. Marking them failed here would destroy the context required to
+	// decide whether a started step completed, rolled back or needs attention.
 }
 
 func (a *App) Start() {
@@ -487,6 +529,7 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("GET /api/verification-history", a.handleVerificationHistory)
 	protected.HandleFunc("GET /api/recovery/status", a.handleRecoveryStatus)
 	protected.HandleFunc("POST /api/recovery/gc", a.handleRecoveryGC)
+	protected.HandleFunc("POST /api/recovery/cleanup-unusable", a.handleRecoveryCleanupUnusable)
 	protected.HandleFunc("POST /api/rollback", a.handleRollback)
 	protected.HandleFunc("GET /api/system/registry-credentials", a.handleRegistryCredentials)
 	protected.HandleFunc("POST /api/system/registry-credentials", a.handleRegistryCredentials)
@@ -769,8 +812,11 @@ func (a *App) systemManagedContainer(name string) (bool, string) {
 	if name != "" && (name == controller || name == "watchtower-ui" || name == "vibewatch") {
 		return true, "controller"
 	}
-	for _, prefix := range []string{"watchtower-ui-worker-", "vibewatch-worker-"} {
+	for _, prefix := range []string{"watchtower-ui-worker-", "vibewatch-worker-", "vibewatch-helper-"} {
 		if strings.HasPrefix(name, prefix) {
+			if prefix == "vibewatch-helper-" {
+				return true, "helper"
+			}
 			return true, "worker"
 		}
 	}
@@ -911,6 +957,14 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 		a.handleBuildCachePrune(w, r, id)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "storage" && r.Method == http.MethodGet {
+		a.handleHostStorage(w, r, id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "data-protection" && (r.Method == http.MethodGet || r.Method == http.MethodPut) {
+		a.handleDataProtection(w, r, id)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "volumes" && r.Method == http.MethodGet {
 		a.handleHostVolumes(w, r, id)
 		return
@@ -986,7 +1040,7 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 		a.handleUpdatePreflight(w, r, id)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "verification" && (r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodDelete) {
+	if len(parts) == 2 && parts[1] == "verification" && (r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodPost || r.Method == http.MethodDelete) {
 		a.handleVerification(w, r, id)
 		return
 	}
@@ -1071,7 +1125,7 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		p := db.Policy{HostID: id, ContainerName: container, Mode: in.Mode, CheckIntervalMinutes: in.CheckIntervalMinutes, ReleaseRepo: in.ReleaseRepo}
+		p := db.Policy{HostID: id, ContainerName: container, Mode: in.Mode, CheckIntervalMinutes: in.CheckIntervalMinutes, ReleaseRepo: in.ReleaseRepo, AllowPreflightWarnings: db.Bool(in.AllowPreflightWarnings)}
 		if err := a.Store.SavePolicy(r.Context(), p); err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -1117,6 +1171,7 @@ func (a *App) handleHostOverview(w http.ResponseWriter, r *http.Request, hostID 
 		return
 	}
 	protectedImages, _, _ := a.rollbackProtectedDockerObjects(hostID)
+	a.protectDataHelperImage(ctx, h.Endpoint, protectedImages)
 	for i := range overview.Images {
 		if protectedImages[overview.Images[i].ID] {
 			overview.Images[i].RollbackProtected = true
@@ -1221,6 +1276,7 @@ func (a *App) runImageCleanup(jobID int64, h db.Host, actor string) {
 	defer releaseLease()
 	_ = a.Store.AddJobLog(context.Background(), jobID, "info", "docker", "Pruning images not referenced by any container")
 	protected, _, _ := a.rollbackProtectedDockerObjects(h.ID)
+	a.protectDataHelperImage(ctx, h.Endpoint, protected)
 	result, err := a.Docker.PruneUnusedImagesWithProgress(ctx, h.Endpoint, protected, a.cleanupProgressCallback(jobID))
 	if err != nil {
 		a.jobProgress(context.Background(), jobID, 100, "Image cleanup failed")
@@ -1554,6 +1610,25 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 		imageMeta = map[string]dockercli.ImageMetadata{}
 	}
 
+	dataProfiles, _ := a.Store.DataProtectionProfiles(ctx, hostID)
+	serviceDataProtection := map[string]DataProtectionSummaryView{}
+	stackDataProtection := map[string]DataProtectionSummaryView{}
+	for _, dp := range dataProfiles {
+		if !bool(dp.Enabled) {
+			continue
+		}
+		count := len(selectedMountKeys(dp.MountsJSON))
+		if count == 0 {
+			continue
+		}
+		summary := DataProtectionSummaryView{Enabled: true, ScopeType: dp.ScopeType, ScopeKey: dp.ScopeKey, MountCount: count}
+		if dp.ScopeType == "stack" {
+			stackDataProtection[dp.ScopeKey] = summary
+		} else {
+			serviceDataProtection[dp.ScopeKey] = summary
+		}
+	}
+
 	views := make([]ContainerView, 0, len(cs))
 	for _, c := range cs {
 		p, _ := a.Store.Policy(ctx, hostID, c.Name)
@@ -1616,7 +1691,26 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 		verification, _ := a.Store.VerificationState(ctx, hostID, c.Name)
 		if !managed {
 			profile, _ := a.effectiveVerificationProfile(ctx, hostID, c.Name)
-			verification = verificationStateForProfile(profile, verification)
+			verification = a.effectiveVerificationState(ctx, hostID, c.Name, profile)
+		}
+		var dataProtection *DataProtectionSummaryView
+		if !managed {
+			if dp, ok := serviceDataProtection[c.Name]; ok {
+				copy := dp
+				dataProtection = &copy
+			} else if c.StackName != "" {
+				if dp, ok := stackDataProtection[c.StackName]; ok {
+					copy := dp
+					dataProtection = &copy
+				}
+			}
+			if dataProtection == nil {
+				scopeType, scopeKey := "service", c.Name
+				if c.StackName != "" && !strings.EqualFold(c.StackType, "swarm") {
+					scopeType, scopeKey = "stack", c.StackName
+				}
+				dataProtection = &DataProtectionSummaryView{Enabled: false, ScopeType: scopeType, ScopeKey: scopeKey, MountCount: 0}
+			}
 		}
 		var chainManagement *ChainManagementView
 		if c.StackName != "" {
@@ -1625,7 +1719,20 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 				chainManagement = &copy
 			}
 		}
-		views = append(views, ContainerView{Container: c, SystemManaged: managed, SystemRole: role, Policy: p, Cache: cache, Version: v, ConfigDrift: drift, Verification: verification, RestorePoint: restorePoint, ChainManagement: chainManagement})
+		var holdHistory []db.UpdateHistory
+		if !managed && chainManagement == nil && p.Mode == "auto" && bool(cache.UpdateAvailable) && !cacheHasSnoozedUpdate(cache) {
+			holdHistory, _ = a.Store.UpdateHistory(ctx, 1, hostID, c.Name)
+		}
+		var automationHold *AutomationHoldView
+		rollbackSnoozed := false
+		if !managed {
+			automationHold = deriveAutomationHold(cache, p, chainManagement, holdHistory)
+			if strings.TrimSpace(cache.SnoozedDigest) != "" {
+				recentHistory, _ := a.Store.UpdateHistory(ctx, 6, hostID, c.Name)
+				rollbackSnoozed = rollbackSnoozedFromHistory(cache, recentHistory)
+			}
+		}
+		views = append(views, ContainerView{Container: c, SystemManaged: managed, SystemRole: role, Policy: p, Cache: cache, Version: v, ConfigDrift: drift, Verification: verification, DataProtection: dataProtection, RestorePoint: restorePoint, ChainManagement: chainManagement, AutomationHold: automationHold, RollbackSnoozed: rollbackSnoozed})
 	}
 	writeJSON(w, 200, views)
 }
@@ -1919,12 +2026,22 @@ func (a *App) runCheck(ctx context.Context, jobID, hostID int64, container, trig
 		if strings.TrimSpace(item.Error) == "" && strings.TrimSpace(c.CurrentDigest) != "" && strings.TrimSpace(c.LatestDigest) != "" {
 			c = applyTrackedUpdateState(old, c, item.UpdateAvailable, now)
 		} else {
-			// A transient/per-container check error must not silently forget when a
-			// previously known update was first seen or remove its digest snooze.
+			// A transient/per-container check error or a digest-less post-rollback
+			// response must not silently forget when an update was first seen or
+			// remove its explicit digest snooze. Preserve the last remote digest
+			// while using the currently running image ID as a local identity fallback.
 			c.FirstDetectedAt = old.FirstDetectedAt
 			c.SnoozedDigest = old.SnoozedDigest
 			c.SnoozedAt = old.SnoozedAt
-			if cacheHasSnoozedUpdate(old) {
+			if strings.TrimSpace(old.SnoozedDigest) != "" {
+				if strings.TrimSpace(c.LatestDigest) == "" {
+					c.LatestDigest = firstNonEmpty(old.LatestDigest, old.SnoozedDigest)
+				}
+				if strings.TrimSpace(c.CurrentDigest) == "" {
+					c.CurrentDigest = firstNonEmpty(item.ImageID, old.CurrentDigest)
+				}
+			}
+			if cacheHasSnoozedUpdate(c) || cacheHasSnoozedUpdate(old) {
 				c.UpdateAvailable = false
 			}
 		}
@@ -1975,7 +2092,7 @@ func (a *App) runCheck(ctx context.Context, jobID, hostID int64, container, trig
 	return res, nil
 }
 
-func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigger, actor string) (int64, error) {
+func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigger, actor string, updateFlags ...bool) (int64, error) {
 	if managed, _ := a.systemManagedContainer(container); managed {
 		return 0, fmt.Errorf("Vibewatch system containers are maintained from Owner Settings")
 	}
@@ -1995,6 +2112,11 @@ func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigge
 	if active {
 		return 0, fmt.Errorf("an update job is already queued or running for %s", container)
 	}
+	if recoveryRequired, recoveryErr := a.Store.HasRecoveryRequiredTransaction(ctx, hostID, container); recoveryErr != nil {
+		return 0, recoveryErr
+	} else if recoveryRequired {
+		return 0, fmt.Errorf("%s has an interrupted update transaction that requires recovery before another update can start", container)
+	}
 	p, _ := a.Store.Policy(ctx, hostID, container)
 	if !isChainTrigger && p.Mode == "ignore" {
 		return 0, fmt.Errorf("container is excluded; change its policy before updating it")
@@ -2012,8 +2134,16 @@ func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigge
 		actor = "system"
 	}
 	_ = a.Store.Audit(ctx, actor, "update.queue", hostID, container, trigger)
+	allowWarnings := false
+	skipDataCapture := false
+	if len(updateFlags) > 0 {
+		allowWarnings = updateFlags[0]
+	}
+	if len(updateFlags) > 1 {
+		skipDataCapture = updateFlags[1]
+	}
 	select {
-	case a.Queue <- updateRequest{JobID: id, HostID: hostID, Container: container, Trigger: trigger, Actor: actor}:
+	case a.Queue <- updateRequest{JobID: id, HostID: hostID, Container: container, Trigger: trigger, Actor: actor, AllowPreflightWarnings: allowWarnings, SkipDataProtectionCapture: skipDataCapture}:
 		return id, nil
 	default:
 		_ = a.Store.FinishJob(ctx, id, "failed", "", "update queue full")
@@ -2112,7 +2242,26 @@ func (a *App) executeUpdate(req updateRequest) {
 	// recovery preparation path. The transaction id is passed into preflight so
 	// snapshot and restore-point stages are durable state-machine transitions.
 	a.jobProgress(ctx, req.JobID, 12, "Running update preflight")
+	// Data-protected update targets are allowed to remain stopped after their
+	// cold snapshot. The Watchtower worker includes explicitly targeted stopped
+	// containers, so we avoid an otherwise redundant stop -> start -> stop cycle.
+	req.DeferTargetRestart = true
 	preflight, prepared := a.runUpdatePreflight(ctx, req, true)
+	deferredWritersReleased := false
+	releaseDeferredWriters := func() error {
+		if deferredWritersReleased || len(prepared.DeferredDataWriters) == 0 {
+			deferredWritersReleased = true
+			return nil
+		}
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+		defer releaseCancel()
+		err := a.ensureDataWritersRunning(releaseCtx, req.HostID, prepared.DeferredDataWriters)
+		if err == nil {
+			deferredWritersReleased = true
+		}
+		return err
+	}
+	defer func() { _ = releaseDeferredWriters() }()
 	if fresh, e := a.Store.UpdateTransaction(ctx, txID); e == nil {
 		tx = fresh
 	}
@@ -2144,11 +2293,24 @@ func (a *App) executeUpdate(req updateRequest) {
 	}
 	if preflight.Status == "blocked" {
 		err := fmt.Errorf("update preflight blocked the update")
+		automaticSafetyHold := false
 		for _, check := range preflight.Checks {
 			if check.Status == preflightRed {
 				err = fmt.Errorf("preflight blocked: %s: %s", check.Title, firstNonEmpty(check.Detail, check.Description))
+				if check.Key == "automatic_safety" {
+					automaticSafetyHold = true
+				}
 				break
 			}
+		}
+		if automaticSafetyHold {
+			verificationStatus = "not_run"
+			verificationDetails = `[{"type":"custom_verification","status":"not_run","detail":"automatic update held by Preflight"}]`
+			_ = a.txTransition(ctx, &tx, txSkipped, "skipped", err.Error())
+			a.jobProgress(ctx, req.JobID, 100, "Automatic update held by Preflight")
+			_ = a.Store.FinishJob(ctx, req.JobID, "skipped", `{"reason":"preflight_warning"}`, err.Error())
+			_ = a.Store.Audit(ctx, req.Actor, "update.skipped-preflight", req.HostID, req.Container, err.Error())
+			return
 		}
 		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
 		a.jobProgress(ctx, req.JobID, 100, "Update blocked by preflight")
@@ -2238,6 +2400,10 @@ func (a *App) executeUpdate(req updateRequest) {
 			failure = fmt.Errorf("update engine reported %d failed container operation(s)", res.Summary.Failed)
 		}
 		finishFailed(raw, failure, true)
+		return
+	}
+	if err := releaseDeferredWriters(); err != nil {
+		finishFailed(raw, fmt.Errorf("updated container could not be started after data snapshot handoff: %w", err), true)
 		return
 	}
 
@@ -2432,7 +2598,7 @@ func (a *App) policyScanHost(ctx context.Context, hostID int64, trigger string, 
 				if installAuto && mode == "auto" && !chainManaged {
 					for _, item := range res.Containers {
 						if item.Name == c.Name && item.UpdateAvailable {
-							_, _ = a.enqueueUpdate(ctx, hostID, c.Name, trigger, "scheduler")
+							_, _ = a.enqueueUpdate(ctx, hostID, c.Name, trigger, "scheduler", bool(p.AllowPreflightWarnings))
 						}
 					}
 				}
@@ -2451,6 +2617,75 @@ func (a *App) policyScanHost(ctx context.Context, hostID int64, trigger string, 
 	close(jobs)
 	wg.Wait()
 	return aggregate, nil
+}
+
+func normalizeAutomationKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind == "cleanup" {
+		return "cleanup"
+	}
+	return "policy"
+}
+
+func automationCleanupActions(rule db.Automation) []string {
+	actions := []string{}
+	if bool(rule.CleanupImages) {
+		actions = append(actions, "images")
+	}
+	if bool(rule.CleanupNetworks) {
+		actions = append(actions, "networks")
+	}
+	if bool(rule.CleanupBuildCache) {
+		actions = append(actions, "build-cache")
+	}
+	if bool(rule.CleanupVolumes) {
+		actions = append(actions, "volumes")
+	}
+	return actions
+}
+
+func (a *App) runScheduledCleanupHost(rule db.Automation, hostID int64) {
+	h, err := a.Store.Host(context.Background(), hostID)
+	if err != nil || !bool(h.Enabled) {
+		return
+	}
+	actions := automationCleanupActions(rule)
+	if len(actions) == 0 {
+		return
+	}
+	_ = a.Store.Audit(context.Background(), "scheduler", "cleanup-automation.run", hostID, "", fmt.Sprintf("automation=%d name=%s actions=%s", rule.ID, rule.Name, strings.Join(actions, ",")))
+	for _, action := range actions {
+		var jobType, target string
+		switch action {
+		case "images":
+			jobType, target = "image-cleanup", "unused-images"
+		case "networks":
+			jobType, target = "network-cleanup", "unused-networks"
+		case "build-cache":
+			jobType, target = "build-cache-cleanup", "build-cache"
+		case "volumes":
+			jobType, target = "volume-cleanup", "unused-anonymous-volumes"
+		default:
+			continue
+		}
+		jobID, createErr := a.Store.CreateJob(context.Background(), jobType, fmt.Sprintf("automation:%d", rule.ID), hostID, target, "queued")
+		if createErr != nil {
+			continue
+		}
+		a.jobProgress(context.Background(), jobID, 2, "Scheduled cleanup queued")
+		switch action {
+		case "images":
+			a.runImageCleanup(jobID, h, "scheduler")
+		case "networks":
+			a.runNetworkCleanup(jobID, h, "scheduler")
+		case "build-cache":
+			a.runBuildCacheCleanup(jobID, h, "scheduler")
+		case "volumes":
+			a.runAnonymousVolumeCleanup(jobID, h, "scheduler")
+		}
+	}
+	_ = a.Store.InvalidateHostStorageCache(context.Background(), hostID)
+	_ = a.probeHostStorage(context.Background(), hostID, true)
 }
 
 func (a *App) runAutomations(now time.Time) {
@@ -2488,7 +2723,13 @@ func (a *App) runAutomations(now time.Time) {
 				hostIDs = []int64{rule.TargetID}
 			}
 		}
-		_ = a.Store.Audit(a.ctx, "scheduler", "automation.run", 0, "", fmt.Sprintf("%s target=%s:%d", rule.Name, rule.TargetType, rule.TargetID))
+		_ = a.Store.Audit(a.ctx, "scheduler", "automation.run", 0, "", fmt.Sprintf("%s kind=%s target=%s:%d", rule.Name, normalizeAutomationKind(rule.Kind), rule.TargetType, rule.TargetID))
+		if normalizeAutomationKind(rule.Kind) == "cleanup" {
+			for _, hostID := range hostIDs {
+				go a.runScheduledCleanupHost(rule, hostID)
+			}
+			continue
+		}
 		// Chains bound to this existing policy run reserve their members before the
 		// ordinary policy scan starts. The scan therefore skips those containers
 		// and cannot race or duplicate the explicitly ordered chain transaction.
@@ -2562,7 +2803,15 @@ func (a *App) handleAutomations(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "target is required")
 		return
 	}
-	x := db.Automation{ID: in.ID, Name: strings.TrimSpace(in.Name), Cron: in.Cron, TargetType: in.TargetType, TargetID: in.TargetID, Enabled: db.Bool(in.Enabled)}
+	in.Kind = normalizeAutomationKind(in.Kind)
+	if in.Kind == "cleanup" && !in.CleanupImages && !in.CleanupNetworks && !in.CleanupBuildCache && !in.CleanupVolumes {
+		writeErr(w, 400, "select at least one cleanup action")
+		return
+	}
+	if in.Kind == "policy" {
+		in.CleanupImages, in.CleanupNetworks, in.CleanupBuildCache, in.CleanupVolumes = false, false, false, false
+	}
+	x := db.Automation{ID: in.ID, Name: strings.TrimSpace(in.Name), Cron: in.Cron, TargetType: in.TargetType, TargetID: in.TargetID, Kind: in.Kind, CleanupImages: db.Bool(in.CleanupImages), CleanupNetworks: db.Bool(in.CleanupNetworks), CleanupBuildCache: db.Bool(in.CleanupBuildCache), CleanupVolumes: db.Bool(in.CleanupVolumes), Enabled: db.Bool(in.Enabled)}
 	id, err := a.Store.SaveAutomation(r.Context(), x)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -3211,6 +3460,17 @@ func (a *App) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 		verificationDiag[fmt.Sprintf("host-%d-%s", h.ID, sanitizeFilename(h.Name))] = rows
 	}
 	writeZipJSON(zw, "verification-profiles.json", verificationDiag)
+	dataProtectionDiag := map[string]any{}
+	for _, h := range hosts {
+		profiles, _ := a.Store.DataProtectionProfiles(r.Context(), h.ID)
+		profileMeta := make([]map[string]any, 0, len(profiles))
+		for _, p := range profiles {
+			profileMeta = append(profileMeta, map[string]any{"host_id": p.HostID, "scope_type": p.ScopeType, "scope_key": p.ScopeKey, "enabled": bool(p.Enabled), "mount_count": len(selectedMountKeys(p.MountsJSON)), "updated_at": p.UpdatedAt})
+		}
+		storage, _ := a.Store.HostStorageCache(r.Context(), h.ID)
+		dataProtectionDiag[fmt.Sprintf("host-%d-%s", h.ID, sanitizeFilename(h.Name))] = map[string]any{"profiles": profileMeta, "storage_cache": storage}
+	}
+	writeZipJSON(zw, "data-protection.json", dataProtectionDiag)
 	if history, e := a.Store.UpdateHistory(r.Context(), 500, 0, ""); e == nil {
 		writeZipJSON(zw, "update-history.json", history)
 	}
@@ -3242,7 +3502,8 @@ func (a *App) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 			cache, _ := a.Store.Cache(r.Context(), h.ID, c.Name)
 			v, _ := a.Store.Version(r.Context(), h.ID, c.Name)
 			drift, _ := a.Store.ConfigDrift(r.Context(), h.ID, c.Name)
-			verification, _ := a.Store.VerificationState(r.Context(), h.ID, c.Name)
+			profile, _ := a.effectiveVerificationProfile(r.Context(), h.ID, c.Name)
+			verification := a.effectiveVerificationState(r.Context(), h.ID, c.Name, profile)
 			rows = append(rows, map[string]any{"name": c.Name, "image": c.Image, "image_id": c.ImageID, "state": c.State, "policy": p, "digest_state": cache, "version_metadata": v, "config_drift": drift, "verification_state": verification})
 		}
 		containerState[key] = rows

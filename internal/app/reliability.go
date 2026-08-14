@@ -30,15 +30,16 @@ const (
 	txRollback         = "rollback"
 	txSuccess          = "success"
 	txFailed           = "failed"
+	txSkipped          = "skipped"
 	txRolledBack       = "rolled_back"
 	txRecoveryRequired = "recovery_required"
 )
 
 var transactionTransitions = map[string]map[string]bool{
 	txQueued:           {txPreflight: true, txFailed: true, txRecovering: true},
-	txPreflight:        {txSnapshot: true, txPrepared: true, txFailed: true, txRecovering: true},
-	txSnapshot:         {txRestorePoint: true, txFailed: true, txRecovering: true},
-	txRestorePoint:     {txPrepared: true, txFailed: true, txRecovering: true},
+	txPreflight:        {txSnapshot: true, txPrepared: true, txFailed: true, txSkipped: true, txRecovering: true},
+	txSnapshot:         {txRestorePoint: true, txFailed: true, txSkipped: true, txRecovering: true},
+	txRestorePoint:     {txPrepared: true, txFailed: true, txSkipped: true, txRecovering: true},
 	txPrepared:         {txUpdating: true, txFailed: true, txRecovering: true},
 	txUpdating:         {txDockerHealth: true, txRollback: true, txFailed: true, txRecovering: true},
 	txDockerHealth:     {txDependencies: true, txVerifying: true, txRollback: true, txFailed: true, txRecovering: true},
@@ -64,7 +65,7 @@ func validTransactionTransition(from, to string) bool {
 }
 
 func transactionTerminalState(state string) bool {
-	return state == txSuccess || state == txFailed || state == txRolledBack
+	return state == txSuccess || state == txFailed || state == txSkipped || state == txRolledBack
 }
 
 func (a *App) txTransition(ctx context.Context, tx *db.UpdateTransaction, toState, status, message string) error {
@@ -199,6 +200,17 @@ func (a *App) validateRestorePointIntegrity(ctx context.Context, rp db.RestorePo
 		}
 	} else {
 		add("restore_image", "not_required", "configuration-only restore point")
+	}
+	if bool(rp.VolumeDataProtected) {
+		if hostErr != nil {
+			add("data_restore_point", "missing", "Docker host unavailable")
+		} else if dataErr := a.dataArchiveExists(ctx, rp); dataErr != nil {
+			add("data_restore_point", "missing", dataErr.Error())
+		} else {
+			add("data_restore_point", "ok", fmt.Sprintf("%d byte(s) protected", rp.DataBytes))
+		}
+	} else {
+		add("data_restore_point", "not_required", "no persistent data selected")
 	}
 	if depErr := a.dependencySnapshotsAvailable(rp); depErr != nil {
 		add("dependency_snapshots", "missing", depErr.Error())
@@ -370,6 +382,9 @@ func (a *App) runRecoveryGC(ctx context.Context, trigger string) db.RecoveryGCRu
 		removed, imageErrs := a.removeOrphanRestoreImages(ctx, points)
 		run.ImagesRemoved = removed
 		errs = append(errs, imageErrs...)
+		helperRemoved, helperErrs := a.removeOrphanHelperContainers(ctx, points)
+		run.HelpersRemoved = helperRemoved
+		errs = append(errs, helperErrs...)
 	}
 	if pruneErr := a.Store.PruneReliabilityHistory(context.Background(), 5000); pruneErr != nil {
 		errs = append(errs, "reliability history retention: "+pruneErr.Error())
@@ -382,7 +397,7 @@ func (a *App) runRecoveryGC(ctx context.Context, trigger string) db.RecoveryGCRu
 		}
 	}
 	_, _ = a.Store.AddRecoveryGCRun(context.Background(), run)
-	_ = a.Store.Audit(context.Background(), "system", "recovery.gc", 0, "", fmt.Sprintf("trigger=%s checked=%d degraded=%d expired=%d images_removed=%d", trigger, run.RestorePointsChecked, run.Degraded, run.Expired, run.ImagesRemoved))
+	_ = a.Store.Audit(context.Background(), "system", "recovery.gc", 0, "", fmt.Sprintf("trigger=%s checked=%d degraded=%d expired=%d images_removed=%d helpers_removed=%d", trigger, run.RestorePointsChecked, run.Degraded, run.Expired, run.ImagesRemoved, run.HelpersRemoved))
 	return run
 }
 
@@ -520,10 +535,26 @@ func (a *App) recoverInterruptedTransactions() {
 	txs, err := a.Store.ActiveUpdateTransactions(context.Background())
 	if err != nil {
 		a.Logger.Warn("transaction recovery scan failed", "error", err)
-		return
+	} else {
+		for i := range txs {
+			a.recoverUpdateTransaction(txs[i])
+		}
 	}
-	for i := range txs {
-		a.recoverUpdateTransaction(txs[i])
+	// Chains are reconciled only after their child update transactions. This lets
+	// the chain recovery layer reason from final child outcomes instead of racing
+	// the single-container crash recovery path.
+	a.recoverInterruptedChainRuns()
+	// A controller crash can strand a helper before Docker processes --rm. Once
+	// transaction/chain recovery has released its leases, remove only helpers on
+	// otherwise idle hosts.
+	if points, e := a.Store.RestorePoints(context.Background(), 5000, 0, ""); e == nil {
+		removed, errs := a.removeOrphanHelperContainers(context.Background(), points)
+		if removed > 0 && a.Logger != nil {
+			a.Logger.Info("removed orphan Vibewatch helper containers after recovery", "count", removed)
+		}
+		if len(errs) > 0 && a.Logger != nil {
+			a.Logger.Warn("orphan helper cleanup after recovery had warnings", "errors", strings.Join(errs, "; "))
+		}
 	}
 }
 

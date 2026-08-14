@@ -756,6 +756,9 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 			_, _ = a.Docker.Run(cleanupCtx, h.Endpoint, "image", "rm", safetyRef)
 		}()
 	}
+	var dataStopped []string
+	var safetyData dataArchiveManifest
+	dataRestored := false
 	recoverSafety := func() error {
 		if safetyRef == "" || strings.TrimSpace(current.Name) == "" {
 			return fmt.Errorf("no pre-rollback safety image is available")
@@ -763,8 +766,20 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 		// Any dependent rebound during a partial rollback must be stopped before
 		// the safety parent is recreated, otherwise it would again retain a stale
 		// network namespace reference.
-		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 10*time.Minute, 20*time.Minute))
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 20*time.Minute, 35*time.Minute))
 		defer recoveryCancel()
+		dataRecoveryStopped := []string{}
+		if dataRestored && len(safetyData.Entries) > 0 {
+			freshStopped, stopErr := a.stopDataWriters(recoveryCtx, rp.HostID, dataMountsFromManifest(safetyData))
+			if stopErr != nil {
+				return fmt.Errorf("stop writers for safety data recovery: %w", stopErr)
+			}
+			dataRecoveryStopped = mergeNames(dataStopped, freshStopped)
+			if restoreErr := a.restoreSafetyData(recoveryCtx, rp.HostID, safetyData); restoreErr != nil {
+				_ = a.restartDataWriters(context.Background(), h.Endpoint, dataRecoveryStopped)
+				return fmt.Errorf("restore pre-rollback data safety snapshot: %w", restoreErr)
+			}
+		}
 		stopDependentsBestEffort(recoveryCtx, a, h.Endpoint, rollbackExecutionDeps)
 		fallback := a.prepareRuntimeRestoreRef(recoveryCtx, h.Endpoint, safetyRef, current.Config.Image)
 		if fallbackErr := a.restoreContainerRuntime(recoveryCtx, h.Endpoint, current, fallback); fallbackErr != nil {
@@ -779,7 +794,30 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 				return fmt.Errorf("safety parent restored but dependent rebinding failed: %w", depRestoreErr)
 			}
 		}
+		if len(dataRecoveryStopped) > 0 {
+			if restartErr := a.restartDataWriters(recoveryCtx, h.Endpoint, dataRecoveryStopped); restartErr != nil {
+				return restartErr
+			}
+		}
 		return nil
+	}
+
+	if bool(rp.VolumeDataProtected) {
+		a.jobProgress(ctx, jobID, 32, "Restoring protected application data")
+		dataStopped, safetyData, err = a.restoreDataArchivesWithSafety(ctx, rp)
+		if err != nil {
+			err = fmt.Errorf("protected data restore failed before runtime rollback: %w", err)
+			a.jobProgress(ctx, jobID, 100, "Rollback data restore failed")
+			_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+			_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+			return err
+		}
+		dataRestored = true
+		defer func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cleanupCancel()
+			_ = a.removeDataRestoreArtifacts(cleanupCtx, rp.HostID, safetyData)
+		}()
 	}
 
 	if len(rollbackExecutionDeps) > 0 {
@@ -810,6 +848,31 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 			return "none"
 		}(), DependencyDetails: dependencyNames(rollbackExecutionDeps)})
 		return err
+	}
+
+	if dataRestored && len(dataStopped) > 0 {
+		depNames := map[string]bool{}
+		for _, dep := range rollbackExecutionDeps {
+			depNames[dep.SourceContainer] = true
+		}
+		restartNow := []string{}
+		for _, name := range dataStopped {
+			if name != rp.ContainerName && !depNames[name] {
+				restartNow = append(restartNow, name)
+			}
+		}
+		if restartErr := a.restartDataWriters(ctx, h.Endpoint, restartNow); restartErr != nil {
+			err = fmt.Errorf("restore point data was restored but a data writer could not restart: %w", restartErr)
+			if safetyRef != "" && strings.TrimSpace(current.Name) != "" {
+				if fallbackErr := recoverSafety(); fallbackErr != nil {
+					err = fmt.Errorf("%v; safety recovery also failed: %v", err, fallbackErr)
+				}
+			}
+			a.jobProgress(ctx, jobID, 100, "Rollback data writer restart failed")
+			_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+			_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+			return err
+		}
 	}
 
 	a.jobProgress(ctx, jobID, 72, "Verifying restored parent container")
@@ -854,6 +917,15 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 			return err
 		}
 	}
+	if dataRestored && len(dataStopped) > 0 {
+		if restartErr := a.restartDataWriters(ctx, h.Endpoint, dataStopped); restartErr != nil {
+			err = fmt.Errorf("restored data writer restart failed: %w", restartErr)
+			a.jobProgress(ctx, jobID, 100, "Rollback data writer restart failed")
+			_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+			_ = a.Store.SetRestorePointStatus(context.Background(), rp.ID, "degraded", err.Error())
+			return err
+		}
+	}
 	rollbackVerification := a.runCustomVerification(ctx, rp.HostID, rp.ContainerName, trigger, actor, jobID)
 	rollbackVerificationJSON := "[]"
 	if bs, e := json.Marshal(rollbackVerification); e == nil {
@@ -882,6 +954,9 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 	}
 	after, afterVersion := a.currentContainerState(ctx, rp.HostID, rp.ContainerName)
 	_ = a.Store.MarkRestorePointRestored(ctx, rp.ID, "")
+	// A successful explicit rollback is also the operator's resolution for any
+	// crash-recovery transaction that was waiting on this exact restore point.
+	_ = a.Store.ResolveRecoveryRequiredTransactionsByRestorePoint(ctx, rp.ID, "rollback_completed")
 	a.jobProgress(ctx, jobID, 100, "Rollback completed")
 	_ = a.Store.FinishJob(ctx, jobID, "success", "", "")
 	_ = a.Store.Audit(ctx, actor, "rollback.success", rp.HostID, rp.ContainerName, fmt.Sprintf("restore_point=%d snapshot=%s trigger=%s", rp.ID, rp.SnapshotID, trigger))

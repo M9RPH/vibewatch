@@ -29,6 +29,13 @@ func (a *App) handleHostVolumes(w http.ResponseWriter, r *http.Request, hostID i
 	}
 	_, _, protected := a.rollbackProtectedDockerObjects(hostID)
 	for i := range volumes {
+		if volumes[i].Name == dataRestoreVolume {
+			// This host-local system volume contains Vibewatch data restore points.
+			// Treat it as protected even when no helper container is currently using it.
+			volumes[i].RollbackProtected = true
+			volumes[i].Unused = false
+			continue
+		}
 		if n := protected[volumes[i].Name]; n > 0 {
 			volumes[i].RollbackProtected = true
 			volumes[i].RetainedSnapshots = n
@@ -101,6 +108,10 @@ func (a *App) handleNamedVolumeDelete(w http.ResponseWriter, r *http.Request, ho
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
 	if name == "" {
 		writeErr(w, http.StatusBadRequest, "volume name is required")
+		return
+	}
+	if name == dataRestoreVolume {
+		writeErr(w, http.StatusConflict, "Vibewatch restore-point storage is system managed and cannot be deleted here")
 		return
 	}
 	h, err := a.Store.Host(r.Context(), hostID)

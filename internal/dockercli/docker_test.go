@@ -58,6 +58,9 @@ exit 0
 	if !strings.Contains(got, "WATCHTOWER_HTTP_API_PERIODIC_POLLS=false") || !strings.Contains(got, "WATCHTOWER_UPDATE_ON_START=false") {
 		t.Fatalf("worker autonomous polling/start update safety flags missing:\n%s", got)
 	}
+	if !strings.Contains(got, "WATCHTOWER_INCLUDE_STOPPED=true") {
+		t.Fatalf("worker must include explicitly targeted stopped containers for data-protection handoff:\n%s", got)
+	}
 	if !strings.Contains(got, "com.centurylinklabs.watchtower.scope=vibewatch-worker-7") {
 		t.Fatalf("remote worker isolation scope label missing:\n%s", got)
 	}

@@ -9,6 +9,7 @@ func TestPreflightResultClassification(t *testing.T) {
 		want   string
 	}{
 		{name: "ready", checks: []PreflightCheck{{Status: preflightGreen}}, want: "ready"},
+		{name: "informational", checks: []PreflightCheck{{Status: preflightInfo}, {Status: preflightGreen}}, want: "ready"},
 		{name: "warning", checks: []PreflightCheck{{Status: preflightGreen}, {Status: preflightYellow}}, want: "ready_with_warnings"},
 		{name: "blocked", checks: []PreflightCheck{{Status: preflightYellow}, {Status: preflightRed}}, want: "blocked"},
 	}

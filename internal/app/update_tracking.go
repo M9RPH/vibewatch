@@ -57,5 +57,46 @@ func applyTrackedUpdateState(old, next db.Cache, rawAvailable bool, now string) 
 }
 
 func cacheHasSnoozedUpdate(c db.Cache) bool {
-	return strings.TrimSpace(c.SnoozedDigest) != "" && digestEqual(c.SnoozedDigest, c.LatestDigest) && !digestEqual(c.CurrentDigest, c.LatestDigest)
+	snoozed := strings.TrimSpace(c.SnoozedDigest)
+	if snoozed == "" {
+		return false
+	}
+	latest := strings.TrimSpace(c.LatestDigest)
+	if latest == "" {
+		// Some update engines omit digest fields immediately after a rollback.
+		// Keep an explicit snooze authoritative until a later digest-aware check
+		// can prove that the registry moved to a different image.
+		return strings.TrimSpace(c.SnoozedAt) != ""
+	}
+	return digestEqual(snoozed, latest) && !digestEqual(c.CurrentDigest, latest)
+}
+
+func rollbackSnoozedFromHistory(c db.Cache, history []db.UpdateHistory) bool {
+	if strings.TrimSpace(c.SnoozedDigest) == "" || strings.TrimSpace(c.SnoozedAt) == "" {
+		return false
+	}
+	snoozedAt, err := time.Parse(time.RFC3339, c.SnoozedAt)
+	if err != nil {
+		return false
+	}
+	for _, h := range history {
+		if !strings.EqualFold(strings.TrimSpace(h.Action), "rollback") || !strings.EqualFold(strings.TrimSpace(h.Status), "success") {
+			continue
+		}
+		ts, parseErr := time.Parse(time.RFC3339Nano, h.TS)
+		if parseErr != nil {
+			ts, parseErr = time.Parse(time.RFC3339, h.TS)
+		}
+		if parseErr != nil {
+			continue
+		}
+		delta := ts.Sub(snoozedAt)
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta <= 15*time.Second {
+			return true
+		}
+	}
+	return false
 }

@@ -76,6 +76,8 @@ type RecoveryGCRun struct {
 	Expired              int    `json:"expired"`
 	ImagesRemoved        int    `json:"images_removed"`
 	SnapshotsRemoved     int    `json:"snapshots_removed"`
+	HelpersRemoved       int    `json:"helpers_removed"`
+	UnusableRemoved      int    `json:"unusable_removed"`
 	ErrorsJSON           string `json:"errors_json"`
 }
 
@@ -244,7 +246,7 @@ func (s *Store) AddRecoveryGCRun(ctx context.Context, x RecoveryGCRun) (int64, e
 	if strings.TrimSpace(x.TS) == "" {
 		x.TS = now()
 	}
-	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO recovery_gc_runs(ts,status,restore_points_checked,degraded,expired,images_removed,snapshots_removed,errors_json) VALUES(%s,%s,%d,%d,%d,%d,%d,%s); SELECT last_insert_rowid();`, q(x.TS), q(x.Status), x.RestorePointsChecked, x.Degraded, x.Expired, x.ImagesRemoved, x.SnapshotsRemoved, q(x.ErrorsJSON)))
+	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO recovery_gc_runs(ts,status,restore_points_checked,degraded,expired,images_removed,snapshots_removed,helpers_removed,unusable_removed,errors_json) VALUES(%s,%s,%d,%d,%d,%d,%d,%d,%d,%s); SELECT last_insert_rowid();`, q(x.TS), q(x.Status), x.RestorePointsChecked, x.Degraded, x.Expired, x.ImagesRemoved, x.SnapshotsRemoved, x.HelpersRemoved, x.UnusableRemoved, q(x.ErrorsJSON)))
 	if err == nil {
 		_ = s.exec(ctx, `DELETE FROM recovery_gc_runs WHERE id NOT IN (SELECT id FROM recovery_gc_runs ORDER BY id DESC LIMIT 200);`)
 	}
@@ -255,7 +257,7 @@ func (s *Store) RecoveryGCRuns(ctx context.Context, limit int) ([]RecoveryGCRun,
 		limit = 20
 	}
 	var xs []RecoveryGCRun
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,ts,status,restore_points_checked,degraded,expired,images_removed,snapshots_removed,errors_json FROM recovery_gc_runs ORDER BY id DESC LIMIT %d`, limit), &xs)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,ts,status,restore_points_checked,degraded,expired,images_removed,snapshots_removed,helpers_removed,unusable_removed,errors_json FROM recovery_gc_runs ORDER BY id DESC LIMIT %d`, limit), &xs)
 	return xs, err
 }
 
@@ -263,11 +265,11 @@ func (s *Store) FailActiveJobsWithoutTransaction(ctx context.Context, reason str
 	if strings.TrimSpace(reason) == "" {
 		reason = "operation interrupted"
 	}
-	n, err := s.scalarInt(ctx, `SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required'));`)
+	n, err := s.scalarInt(ctx, `SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required')) AND id NOT IN (SELECT job_id FROM update_chain_runs WHERE status IN ('queued','running','recovering','recovery_required') AND job_id>0);`)
 	if err != nil || n == 0 {
 		return int(n), err
 	}
-	err = s.exec(ctx, fmt.Sprintf(`UPDATE jobs SET status='failed',finished_at=%s,error=CASE WHEN error='' THEN %s ELSE error END WHERE status IN ('queued','running') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required'));`, q(now()), q(reason)))
+	err = s.exec(ctx, fmt.Sprintf(`UPDATE jobs SET status='failed',finished_at=%s,error=CASE WHEN error='' THEN %s ELSE error END WHERE status IN ('queued','running') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required')) AND id NOT IN (SELECT job_id FROM update_chain_runs WHERE status IN ('queued','running','recovering','recovery_required') AND job_id>0);`, q(now()), q(reason)))
 	return int(n), err
 }
 
@@ -286,4 +288,19 @@ SELECT id FROM update_transactions WHERE status NOT IN ('running','recovering','
 
 func (s *Store) SetRestorePointIntegrity(ctx context.Context, id int64, status, details string) error {
 	return s.exec(ctx, fmt.Sprintf(`UPDATE restore_points SET integrity_status=%s,integrity_checked_at=%s,integrity_details=%s,updated_at=%s WHERE id=%d`, q(status), q(now()), q(details), q(now()), id))
+}
+
+func (s *Store) HasRecoveryRequiredTransaction(ctx context.Context, hostID int64, container string) (bool, error) {
+	n, err := s.scalarInt(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM update_transactions WHERE host_id=%d AND container_name=%s AND status='recovery_required'`, hostID, q(strings.TrimSpace(container))))
+	return n > 0, err
+}
+
+func (s *Store) ResolveRecoveryRequiredTransactionsByRestorePoint(ctx context.Context, restorePointID int64, action string) error {
+	if restorePointID <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(action) == "" {
+		action = "manual_rollback"
+	}
+	return s.exec(ctx, fmt.Sprintf(`UPDATE update_transactions SET status='rolled_back',state='rolled_back',recovery_action=%s,error='',updated_at=%s,finished_at=CASE WHEN finished_at='' THEN %s ELSE finished_at END WHERE restore_point_id=%d AND status='recovery_required'`, q(action), q(now()), q(now()), restorePointID))
 }

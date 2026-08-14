@@ -15,6 +15,18 @@ import (
 	"github.com/watchtower-ui/watchtower-ui/internal/db"
 )
 
+type restorePointDataMountView struct {
+	Key          string   `json:"key"`
+	Type         string   `json:"type"`
+	Name         string   `json:"name,omitempty"`
+	Source       string   `json:"source"`
+	Destinations []string `json:"destinations,omitempty"`
+	Owners       []string `json:"owners,omitempty"`
+	StorageClass string   `json:"storage_class"`
+	FSType       string   `json:"fs_type,omitempty"`
+	SizeBytes    int64    `json:"size_bytes"`
+}
+
 type restorePointView struct {
 	db.RestorePoint
 	HostName          string                       `json:"host_name"`
@@ -22,6 +34,13 @@ type restorePointView struct {
 	SnapshotAvailable bool                         `json:"snapshot_available"`
 	ProtectionLevel   string                       `json:"protection_level"`
 	Dependencies      []networkNamespaceDependency `json:"dependencies,omitempty"`
+	DataScopeType     string                       `json:"data_scope_type,omitempty"`
+	DataScopeKey      string                       `json:"data_scope_key,omitempty"`
+	DataMounts        []restorePointDataMountView  `json:"data_mounts,omitempty"`
+	ChainRunID        int64                        `json:"chain_run_id,omitempty"`
+	ChainID           int64                        `json:"chain_id,omitempty"`
+	ChainName         string                       `json:"chain_name,omitempty"`
+	ChainTrigger      string                       `json:"chain_trigger,omitempty"`
 }
 
 var restoreRepoClean = regexp.MustCompile(`[^a-z0-9._-]+`)
@@ -80,18 +99,37 @@ func (a *App) findSnapshotByID(hostID int64, snapshotID, container string) (stri
 	return found, info, nil
 }
 
+type restorePointCaptureOptions struct {
+	CaptureData        bool
+	DeferWriterRestart map[string]bool
+}
+
+type restorePointCaptureResult struct {
+	RestorePoint    db.RestorePoint
+	DeferredWriters []string
+}
+
+func defaultRestorePointCaptureOptions() restorePointCaptureOptions {
+	return restorePointCaptureOptions{CaptureData: true}
+}
+
 func (a *App) createRestorePointForSnapshot(ctx context.Context, hostID int64, container string, snap ContainerBackupSnapshot, reason, trigger string, deps []networkNamespaceDependencyRuntime) (db.RestorePoint, error) {
+	res, err := a.createRestorePointForSnapshotWithOptions(ctx, hostID, container, snap, reason, trigger, deps, defaultRestorePointCaptureOptions())
+	return res.RestorePoint, err
+}
+
+func (a *App) createRestorePointForSnapshotWithOptions(ctx context.Context, hostID int64, container string, snap ContainerBackupSnapshot, reason, trigger string, deps []networkNamespaceDependencyRuntime, opts restorePointCaptureOptions) (restorePointCaptureResult, error) {
 	path, info, err := a.findSnapshotByID(hostID, snap.ID, container)
 	if err != nil {
-		return db.RestorePoint{}, err
+		return restorePointCaptureResult{}, err
 	}
 	raw, err := snapshotZipEntry(path, "container-inspect.json")
 	if err != nil {
-		return db.RestorePoint{}, err
+		return restorePointCaptureResult{}, err
 	}
 	old, err := findInspectForContainer(raw, container)
 	if err != nil {
-		return db.RestorePoint{}, err
+		return restorePointCaptureResult{}, err
 	}
 	version, _ := a.Store.Version(ctx, hostID, container)
 	cache, _ := a.Store.Cache(ctx, hostID, container)
@@ -128,15 +166,11 @@ func (a *App) createRestorePointForSnapshot(ctx context.Context, hostID int64, c
 		base.Status = "config_only"
 		id, e := a.Store.AddRestorePoint(ctx, base)
 		if e != nil {
-			return db.RestorePoint{}, e
+			return restorePointCaptureResult{}, e
 		}
 		base.ID = id
-		return base, nil
+		return restorePointCaptureResult{RestorePoint: base}, nil
 	}
-	// Validate that the captured runtime configuration can be translated back
-	// into a safe docker create command before allowing the destructive update.
-	// This makes "full restore point ready" a stronger promise than simply
-	// having a committed filesystem image.
 	if _, _, recreateErr := createArgsFromInspect(old, "vibewatch-restore-validation:latest"); recreateErr != nil {
 		base.Status = "degraded"
 		base.LastError = recreateErr.Error()
@@ -144,12 +178,43 @@ func (a *App) createRestorePointForSnapshot(ctx context.Context, hostID int64, c
 		if addErr == nil {
 			base.ID = id
 		}
-		return base, recreateErr
+		return restorePointCaptureResult{RestorePoint: base}, recreateErr
 	}
 	h, err := a.Store.Host(ctx, hostID)
 	if err != nil {
-		return db.RestorePoint{}, err
+		return restorePointCaptureResult{}, err
 	}
+	profile, protectedMounts, dataConfigured, dataErr := a.selectedDataProtectionMounts(ctx, hostID, container)
+	if dataErr != nil {
+		return restorePointCaptureResult{}, fmt.Errorf("load data protection profile: %w", dataErr)
+	}
+	dataConfigured = dataConfigured && opts.CaptureData
+	var stoppedWriters []string
+	if dataConfigured {
+		stoppedWriters, err = a.stopDataWriters(ctx, hostID, protectedMounts)
+		if err != nil {
+			return restorePointCaptureResult{}, fmt.Errorf("prepare cold data restore point: %w", err)
+		}
+	}
+	deferred := []string{}
+	immediate := []string{}
+	for _, name := range stoppedWriters {
+		if opts.DeferWriterRestart != nil && opts.DeferWriterRestart[name] {
+			deferred = append(deferred, name)
+		} else {
+			immediate = append(immediate, name)
+		}
+	}
+	completed := false
+	defer func() {
+		if completed || len(stoppedWriters) == 0 {
+			return
+		}
+		restartCtx, cancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+		defer cancel()
+		_ = a.ensureDataWritersRunning(restartCtx, hostID, stoppedWriters)
+	}()
+
 	ref := restoreImageRef(hostID, container, snap.ID)
 	base.ImageRef = ref
 	commitCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -172,21 +237,59 @@ func (a *App) createRestorePointForSnapshot(ctx context.Context, hostID int64, c
 			base.ID = id
 		}
 		if commitErr != nil {
-			return base, commitErr
+			return restorePointCaptureResult{RestorePoint: base}, commitErr
 		}
-		return base, fmt.Errorf("docker commit returned no image id")
+		return restorePointCaptureResult{RestorePoint: base}, fmt.Errorf("docker commit returned no image id")
 	}
 	base.ImageID = imageID
 	base.Status = "ready"
 	base.WritableLayer = db.Bool(true)
+	var dataManifest dataArchiveManifest
+	if dataConfigured {
+		dataManifest, err = a.captureDataArchive(ctx, hostID, h.Endpoint, profile, snap.ID, protectedMounts)
+		if err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+			_ = a.removeDataRestoreArtifacts(cleanupCtx, hostID, dataManifest)
+			cleanupCancel()
+			_, _ = a.Docker.Run(context.Background(), h.Endpoint, "image", "rm", ref)
+			return restorePointCaptureResult{}, fmt.Errorf("data restore point capture failed: %w", err)
+		}
+		manifestJSON, _ := json.Marshal(dataManifest)
+		base.VolumeDataProtected = db.Bool(len(dataManifest.Entries) > 0)
+		base.DataManifestJSON = string(manifestJSON)
+		base.DataBytes = dataManifest.TotalBytes
+	}
+	if len(immediate) > 0 {
+		restartCtx, restartCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+		restartErr := a.ensureDataWritersRunning(restartCtx, hostID, immediate)
+		restartCancel()
+		if restartErr != nil {
+			if dataConfigured {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+				_ = a.removeDataRestoreArtifacts(cleanupCtx, hostID, dataManifest)
+				cleanupCancel()
+			}
+			_, _ = a.Docker.Run(context.Background(), h.Endpoint, "image", "rm", ref)
+			return restorePointCaptureResult{}, fmt.Errorf("data writers did not recover after restore-point capture: %w", restartErr)
+		}
+	}
+	if dataConfigured {
+		_ = a.Store.InvalidateHostStorageCache(context.Background(), hostID)
+	}
 	id, err := a.Store.AddRestorePoint(ctx, base)
 	if err != nil {
 		_, _ = a.Docker.Run(context.Background(), h.Endpoint, "image", "rm", ref)
-		return db.RestorePoint{}, err
+		if dataConfigured {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+			_ = a.removeDataRestoreArtifacts(cleanupCtx, hostID, dataManifest)
+			cleanupCancel()
+		}
+		return restorePointCaptureResult{}, err
 	}
 	base.ID = id
-	_ = a.Store.Audit(context.Background(), "system", "restore-point.create", hostID, container, fmt.Sprintf("restore_point=%d snapshot=%s image=%s", id, snap.ID, ref))
-	return base, nil
+	completed = true
+	_ = a.Store.Audit(context.Background(), "system", "restore-point.create", hostID, container, fmt.Sprintf("restore_point=%d snapshot=%s image=%s deferred_writers=%s", id, snap.ID, ref, strings.Join(deferred, ",")))
+	return restorePointCaptureResult{RestorePoint: base, DeferredWriters: deferred}, nil
 }
 
 func (a *App) expireRestorePointsForSnapshot(ctx context.Context, hostID int64, snapshotID string) {
@@ -197,6 +300,15 @@ func (a *App) expireRestorePointsForSnapshot(ctx context.Context, hostID int64, 
 	h, hostErr := a.Store.Host(ctx, hostID)
 	removedDependencySnapshots := map[string]bool{}
 	for _, rp := range points {
+		if bool(rp.VolumeDataProtected) && strings.TrimSpace(rp.DataManifestJSON) != "" {
+			if manifest, manifestErr := decodeDataManifest(rp.DataManifestJSON); manifestErr == nil && len(manifest.Entries) > 0 {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				if cleanupErr := a.removeDataRestoreArtifacts(cleanupCtx, rp.HostID, manifest); cleanupErr != nil && a.Logger != nil {
+					a.Logger.Warn("expired data restore point could not be removed", "host_id", rp.HostID, "restore_point", rp.ID, "error", cleanupErr)
+				}
+				cleanupCancel()
+			}
+		}
 		// Cross-stack namespace dependents may have received a dedicated recovery
 		// snapshot for this transaction. Once the parent restore point expires,
 		// remove those transaction-only snapshots as well so retention, object
@@ -222,7 +334,33 @@ func (a *App) expireRestorePointsForSnapshot(ctx context.Context, hostID int64, 
 	}
 }
 
+func restorePointDataDetails(rp db.RestorePoint) (string, string, []restorePointDataMountView) {
+	manifest, err := decodeDataManifest(rp.DataManifestJSON)
+	if err != nil || len(manifest.Entries) == 0 {
+		return "", "", nil
+	}
+	mounts := make([]restorePointDataMountView, 0, len(manifest.Entries))
+	for _, e := range manifest.Entries {
+		mounts = append(mounts, restorePointDataMountView{Key: e.Key, Type: e.Type, Name: e.Name, Source: e.Source, Destinations: e.Destinations, Owners: e.Owners, StorageClass: e.StorageClass, FSType: e.FSType, SizeBytes: e.SizeBytes})
+	}
+	return manifest.ScopeType, manifest.ScopeKey, mounts
+}
+
+func restorePointChainRunID(trigger string) int64 {
+	t := strings.TrimSpace(trigger)
+	for _, prefix := range []string{"chain-auto:", "chain-recreate:", "chain:"} {
+		if strings.HasPrefix(t, prefix) {
+			id, _ := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(t, prefix)), 10, 64)
+			return id
+		}
+	}
+	return 0
+}
+
 func restorePointProtectionLevel(rp db.RestorePoint) string {
+	if bool(rp.WritableLayer) && bool(rp.VolumeDataProtected) {
+		return "full_application"
+	}
 	if bool(rp.WritableLayer) {
 		return "full_container"
 	}
@@ -258,6 +396,8 @@ func (a *App) handleRestorePoints(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]restorePointView, 0, len(rows))
+	chainRunCache := map[int64]db.UpdateChainRun{}
+	chainRunMissing := map[int64]bool{}
 	for _, rp := range rows {
 		if !a.hostAllowed(r, rp.HostID) {
 			continue
@@ -282,7 +422,27 @@ func (a *App) handleRestorePoints(w http.ResponseWriter, r *http.Request) {
 			rp.Status = "degraded"
 			rp.LastError = reason
 		}
-		out = append(out, restorePointView{RestorePoint: rp, HostName: hostName, RollbackAvailable: available, SnapshotAvailable: snapshotAvailable, ProtectionLevel: restorePointProtectionLevel(rp), Dependencies: restorePointDependencies(rp)})
+		dataScopeType, dataScopeKey, dataMounts := restorePointDataDetails(rp)
+		view := restorePointView{RestorePoint: rp, HostName: hostName, RollbackAvailable: available, SnapshotAvailable: snapshotAvailable, ProtectionLevel: restorePointProtectionLevel(rp), Dependencies: restorePointDependencies(rp), DataScopeType: dataScopeType, DataScopeKey: dataScopeKey, DataMounts: dataMounts}
+		if runID := restorePointChainRunID(rp.Trigger); runID > 0 {
+			view.ChainRunID = runID
+			run, cached := chainRunCache[runID]
+			if !cached && !chainRunMissing[runID] {
+				if loaded, runErr := a.Store.UpdateChainRun(r.Context(), runID); runErr == nil {
+					run = loaded
+					chainRunCache[runID] = loaded
+					cached = true
+				} else {
+					chainRunMissing[runID] = true
+				}
+			}
+			if cached {
+				view.ChainID = run.ChainID
+				view.ChainName = run.ChainName
+				view.ChainTrigger = run.Trigger
+			}
+		}
+		out = append(out, view)
 	}
 	writeJSON(w, 200, out)
 }

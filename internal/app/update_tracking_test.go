@@ -36,3 +36,18 @@ func TestUpdateTrackingClearsWhenCurrent(t *testing.T) {
 		t.Fatalf("current image should clear pending update tracking: %+v", next)
 	}
 }
+
+func TestCacheHasSnoozedUpdateSurvivesDigestlessPostRollbackCheck(t *testing.T) {
+	c := db.Cache{SnoozedDigest: "sha256:new", SnoozedAt: "2026-08-14T08:51:57Z", LatestDigest: "", CurrentDigest: ""}
+	if !cacheHasSnoozedUpdate(c) {
+		t.Fatal("explicit rollback/manual snooze must survive a digest-less check response")
+	}
+}
+
+func TestRollbackSnoozedFromHistory(t *testing.T) {
+	c := db.Cache{SnoozedDigest: "sha256:new", SnoozedAt: "2026-08-14T08:51:57Z"}
+	h := []db.UpdateHistory{{Action: "update", Status: "failed", TS: "2026-08-14T08:51:59.997684879Z"}, {Action: "rollback", Status: "success", TS: "2026-08-14T08:51:57.556648172Z"}}
+	if !rollbackSnoozedFromHistory(c, h) {
+		t.Fatal("successful rollback adjacent to snooze timestamp should be identified as rollback snooze")
+	}
+}

@@ -33,6 +33,13 @@ func TestV084VerificationHistoryAndChainsRoundTrip(t *testing.T) {
 	if err != nil || st.Status != "verified" {
 		t.Fatalf("state lost: %#v err=%v", st, err)
 	}
+	if err := s.SaveVerificationScopeState(ctx, VerificationScopeState{HostID: 1, ScopeType: "stack", ScopeKey: "core", Status: "verified", DetailsJSON: `[]`, CheckedAt: "2026-08-12T20:01:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := s.VerificationScopeState(ctx, 1, "stack", "core")
+	if err != nil || shared.Status != "verified" || shared.ScopeKey != "core" {
+		t.Fatalf("scope state lost: %#v err=%v", shared, err)
+	}
 	hid, err := s.AddUpdateHistory(ctx, UpdateHistory{HostID: 1, ContainerName: "app", Status: "success", PreflightStatus: "ready_with_warnings", PreflightDetails: `[{"key":"docker_health"}]`, VerificationStatus: "verified", VerificationDetails: `{"status":"verified"}`})
 	if err != nil {
 		t.Fatal(err)
@@ -70,6 +77,26 @@ func TestV084VerificationHistoryAndChainsRoundTrip(t *testing.T) {
 	runs, err := s.UpdateChainRuns(ctx, cid, 10)
 	if err != nil || len(runs) != 1 || runs[0].Status != "failed" {
 		t.Fatalf("interrupted run not failed: %#v err=%v", runs, err)
+	}
+}
+
+func TestVerificationScopeStateBackfillsFromHistory(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 not installed")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "vibewatch.db")
+	sql := `CREATE TABLE verification_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', job_id INTEGER NOT NULL DEFAULT 0, transaction_id INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, scope_type TEXT NOT NULL DEFAULT '', scope_key TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, details_json TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT ''); INSERT INTO verification_history(ts,host_id,container_name,status,scope_type,scope_key,details_json) VALUES('2026-08-13T20:18:46.123456789Z',7,'immich_server','verified','stack','immich','[{"status":"verified"}]');`
+	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
+		t.Fatalf("legacy scope history create: %v: %s", err, out)
+	}
+	s := New(path)
+	if err := s.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.VerificationScopeState(ctx, 7, "stack", "immich")
+	if err != nil || state.Status != "verified" || state.CheckedAt != "2026-08-13T20:18:46.123456789Z" {
+		t.Fatalf("stack state was not backfilled: %#v err=%v", state, err)
 	}
 }
 

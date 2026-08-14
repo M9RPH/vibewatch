@@ -24,13 +24,40 @@ type updateChainView struct {
 	Steps []db.UpdateChainStep `json:"steps"`
 }
 
+type ChainPreflightStepView struct {
+	Position        int              `json:"position"`
+	ContainerName   string           `json:"container_name"`
+	UpdateAvailable bool             `json:"update_available"`
+	Snoozed         bool             `json:"snoozed"`
+	Status          string           `json:"status"`
+	Warnings        int              `json:"warnings"`
+	Blocked         int              `json:"blocked"`
+	Summary         string           `json:"summary"`
+	Checks          []PreflightCheck `json:"checks"`
+	Error           string           `json:"error,omitempty"`
+}
+
+type ChainPreflightPlanView struct {
+	ChainID   int64                    `json:"chain_id"`
+	ChainName string                   `json:"chain_name"`
+	HostID    int64                    `json:"host_id"`
+	Status    string                   `json:"status"`
+	Updates   int                      `json:"updates"`
+	Warnings  int                      `json:"warnings"`
+	Blocked   int                      `json:"blocked"`
+	Steps     []ChainPreflightStepView `json:"steps"`
+}
+
 type ChainManagementView struct {
-	ChainID      int64  `json:"chain_id"`
-	ChainName    string `json:"chain_name"`
-	AutomationID int64  `json:"automation_id"`
-	ScopeType    string `json:"scope_type"`
-	ScopeKey     string `json:"scope_key"`
-	PolicyMode   string `json:"policy_mode"`
+	ChainID                int64  `json:"chain_id"`
+	ChainName              string `json:"chain_name"`
+	AutomationID           int64  `json:"automation_id"`
+	ScopeType              string `json:"scope_type"`
+	ScopeKey               string `json:"scope_key"`
+	PolicyMode             string `json:"policy_mode"`
+	AllowPreflightWarnings bool   `json:"allow_preflight_warnings"`
+	LastRunAt              string `json:"last_run_at"`
+	LastStatus             string `json:"last_status"`
 }
 
 func normalizeChainPolicyMode(v string) string {
@@ -61,7 +88,7 @@ func (a *App) stackChainManagement(ctx context.Context, hostID int64) (map[strin
 		if c.HostID != hostID || c.ScopeType != "stack" || strings.TrimSpace(c.ScopeKey) == "" {
 			continue
 		}
-		out[c.ScopeKey] = ChainManagementView{ChainID: c.ID, ChainName: c.Name, AutomationID: c.AutomationID, ScopeType: c.ScopeType, ScopeKey: c.ScopeKey, PolicyMode: normalizeChainPolicyMode(c.PolicyMode)}
+		out[c.ScopeKey] = ChainManagementView{ChainID: c.ID, ChainName: c.Name, AutomationID: c.AutomationID, ScopeType: c.ScopeType, ScopeKey: c.ScopeKey, PolicyMode: normalizeChainPolicyMode(c.PolicyMode), AllowPreflightWarnings: bool(c.AllowPreflightWarnings), LastRunAt: c.LastRunAt, LastStatus: c.LastStatus}
 	}
 	return out, nil
 }
@@ -81,7 +108,7 @@ func (a *App) stackChainForMember(ctx context.Context, hostID int64, container s
 		}
 		for _, st := range steps {
 			if st.ContainerName == container {
-				return ChainManagementView{ChainID: c.ID, ChainName: c.Name, AutomationID: c.AutomationID, ScopeType: c.ScopeType, ScopeKey: c.ScopeKey, PolicyMode: normalizeChainPolicyMode(c.PolicyMode)}, true
+				return ChainManagementView{ChainID: c.ID, ChainName: c.Name, AutomationID: c.AutomationID, ScopeType: c.ScopeType, ScopeKey: c.ScopeKey, PolicyMode: normalizeChainPolicyMode(c.PolicyMode), AllowPreflightWarnings: bool(c.AllowPreflightWarnings), LastRunAt: c.LastRunAt, LastStatus: c.LastStatus}, true
 			}
 		}
 	}
@@ -179,6 +206,11 @@ func (a *App) reserveChainMembers(ctx context.Context, chainID, hostID int64, st
 		if active {
 			return fmt.Errorf("chain blocked: %s already has a queued or running operation", st.ContainerName)
 		}
+		if recoveryRequired, err := a.Store.HasRecoveryRequiredTransaction(ctx, hostID, st.ContainerName); err != nil {
+			return err
+		} else if recoveryRequired {
+			return fmt.Errorf("chain blocked: %s has an interrupted update transaction that requires recovery", st.ContainerName)
+		}
 	}
 	for _, st := range steps {
 		a.chainReserved[chainReservationKey(hostID, st.ContainerName)] = chainID
@@ -198,16 +230,17 @@ func (a *App) releaseChainMembers(chainID, hostID int64, steps []db.UpdateChainS
 }
 
 type updateChainInput struct {
-	ID                int64                `json:"id"`
-	Name              string               `json:"name"`
-	HostID            int64                `json:"host_id"`
-	AutomationID      int64                `json:"automation_id"`
-	ScopeType         string               `json:"scope_type"`
-	ScopeKey          string               `json:"scope_key"`
-	PolicyMode        string               `json:"policy_mode"`
-	StopOnFailure     bool                 `json:"stop_on_failure"`
-	RollbackCompleted bool                 `json:"rollback_completed"`
-	Steps             []db.UpdateChainStep `json:"steps"`
+	ID                     int64                `json:"id"`
+	Name                   string               `json:"name"`
+	HostID                 int64                `json:"host_id"`
+	AutomationID           int64                `json:"automation_id"`
+	ScopeType              string               `json:"scope_type"`
+	ScopeKey               string               `json:"scope_key"`
+	PolicyMode             string               `json:"policy_mode"`
+	AllowPreflightWarnings bool                 `json:"allow_preflight_warnings"`
+	StopOnFailure          bool                 `json:"stop_on_failure"`
+	RollbackCompleted      bool                 `json:"rollback_completed"`
+	Steps                  []db.UpdateChainStep `json:"steps"`
 }
 
 func (a *App) chainViews(ctx context.Context) ([]updateChainView, error) {
@@ -347,6 +380,10 @@ func (a *App) handleUpdateChains(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "selected automation not found")
 			return
 		}
+		if normalizeAutomationKind(automation.Kind) != "policy" {
+			writeErr(w, 400, "selected automation is a cleanup run, not a policy run")
+			return
+		}
 		if !a.automationIncludesHost(r.Context(), automation, in.HostID) {
 			writeErr(w, 400, "selected automation does not target this Docker host")
 			return
@@ -377,7 +414,7 @@ func (a *App) handleUpdateChains(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	x := db.UpdateChain{ID: in.ID, Name: in.Name, HostID: in.HostID, AutomationID: in.AutomationID, ScopeType: in.ScopeType, ScopeKey: in.ScopeKey, PolicyMode: in.PolicyMode, StopOnFailure: db.Bool(in.StopOnFailure), RollbackCompleted: db.Bool(in.RollbackCompleted)}
+	x := db.UpdateChain{ID: in.ID, Name: in.Name, HostID: in.HostID, AutomationID: in.AutomationID, ScopeType: in.ScopeType, ScopeKey: in.ScopeKey, PolicyMode: in.PolicyMode, AllowPreflightWarnings: db.Bool(in.AllowPreflightWarnings), StopOnFailure: db.Bool(in.StopOnFailure), RollbackCompleted: db.Bool(in.RollbackCompleted)}
 	id, err := a.Store.SaveUpdateChain(r.Context(), x, in.Steps)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -405,6 +442,95 @@ func (a *App) handleUpdateChainRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor string) (ChainPreflightPlanView, error) {
+	chain, err := a.Store.UpdateChain(ctx, chainID)
+	if err != nil {
+		return ChainPreflightPlanView{}, err
+	}
+	host, err := a.Store.Host(ctx, chain.HostID)
+	if err != nil || !bool(host.Enabled) {
+		if err == nil {
+			err = fmt.Errorf("host is disabled")
+		}
+		return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: Docker host unavailable: %w", err)
+	}
+	steps, err := a.Store.UpdateChainSteps(ctx, chainID)
+	if err != nil || len(steps) == 0 {
+		if err == nil {
+			err = fmt.Errorf("chain has no steps")
+		}
+		return ChainPreflightPlanView{}, err
+	}
+	if chain.ScopeType == "stack" {
+		if err := a.validateStackChainMembers(ctx, chain.HostID, chain.ScopeKey, steps); err != nil {
+			return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: %w", err)
+		}
+		if normalizeChainPolicyMode(chain.PolicyMode) == "ignore" {
+			return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: stack policy is Excluded")
+		}
+	} else {
+		for _, st := range steps {
+			p, _ := a.Store.Policy(ctx, chain.HostID, st.ContainerName)
+			if p.Mode == "ignore" {
+				return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: %s is excluded", st.ContainerName)
+			}
+		}
+	}
+
+	plan := ChainPreflightPlanView{ChainID: chain.ID, ChainName: chain.Name, HostID: chain.HostID, Status: "ready", Steps: make([]ChainPreflightStepView, 0, len(steps))}
+	for _, st := range steps {
+		step := ChainPreflightStepView{Position: st.Position, ContainerName: st.ContainerName, Status: "checking", Checks: []PreflightCheck{}}
+		checkCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+		_, _, checkErr := a.check(checkCtx, chain.HostID, st.ContainerName, fmt.Sprintf("chain-preview:%d", chain.ID))
+		cancel()
+		if checkErr != nil {
+			step.Status = "blocked"
+			step.Blocked = 1
+			step.Summary = "Update check failed"
+			step.Error = checkErr.Error()
+			plan.Blocked++
+			plan.Status = "blocked"
+			plan.Steps = append(plan.Steps, step)
+			continue
+		}
+		cache, _ := a.Store.Cache(ctx, chain.HostID, st.ContainerName)
+		step.Snoozed = cacheHasSnoozedUpdate(cache)
+		step.UpdateAvailable = bool(cache.UpdateAvailable) && !step.Snoozed
+		if step.Snoozed {
+			step.Status = "snoozed"
+			step.Summary = "Available update is snoozed"
+			plan.Steps = append(plan.Steps, step)
+			continue
+		}
+		if !step.UpdateAvailable {
+			step.Status = "current"
+			step.Summary = "No update available"
+			plan.Steps = append(plan.Steps, step)
+			continue
+		}
+
+		plan.Updates++
+		preflight, _ := a.runUpdatePreflight(ctx, updateRequest{HostID: chain.HostID, Container: st.ContainerName, Trigger: fmt.Sprintf("chain-preview:%d", chain.ID), Actor: actor}, false)
+		step.Status = preflight.Status
+		step.Warnings = preflight.Warnings
+		step.Blocked = preflight.Blocked
+		step.Summary = preflight.Summary
+		step.Checks = preflight.Checks
+		plan.Warnings += preflight.Warnings
+		plan.Blocked += preflight.Blocked
+		if preflight.Status == "blocked" {
+			plan.Status = "blocked"
+		} else if preflight.Status == "ready_with_warnings" && plan.Status != "blocked" {
+			plan.Status = "ready_with_warnings"
+		}
+		plan.Steps = append(plan.Steps, step)
+	}
+	if plan.Updates == 0 && plan.Blocked == 0 {
+		plan.Status = "no_updates"
+	}
+	return plan, nil
+}
+
 func (a *App) handleUpdateChainSubroutes(w http.ResponseWriter, r *http.Request) {
 	if !a.requireAdmin(w, r) {
 		return
@@ -424,6 +550,15 @@ func (a *App) handleUpdateChainSubroutes(w http.ResponseWriter, r *http.Request)
 		}
 		_ = a.Store.Audit(r.Context(), a.actor(r), "chain.delete", chain.HostID, "", fmt.Sprintf("chain=%d name=%s", id, chain.Name))
 		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "preflight" && r.Method == http.MethodPost {
+		plan, err := a.previewUpdateChain(r.Context(), id, a.actor(r))
+		if err != nil {
+			writeErr(w, 409, err.Error())
+			return
+		}
+		writeJSON(w, 200, plan)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "run" && r.Method == http.MethodPost {
@@ -449,6 +584,13 @@ func (a *App) startUpdateChain(ctx context.Context, chainID int64, trigger, acto
 			err = fmt.Errorf("host is disabled")
 		}
 		return 0, 0, fmt.Errorf("chain blocked: Docker host unavailable: %w", err)
+	}
+	if activeRuns, activeErr := a.Store.ActiveUpdateChainRuns(ctx); activeErr == nil {
+		for _, activeRun := range activeRuns {
+			if activeRun.ChainID == chainID {
+				return 0, 0, fmt.Errorf("chain blocked: previous run #%d is %s and must be reconciled before a new run", activeRun.ID, activeRun.Status)
+			}
+		}
 	}
 	steps, err := a.Store.UpdateChainSteps(ctx, chainID)
 	if err != nil || len(steps) == 0 {
@@ -497,7 +639,7 @@ func (a *App) startUpdateChain(ctx context.Context, chainID int64, trigger, acto
 	if err != nil {
 		return 0, 0, err
 	}
-	runID, err := a.Store.CreateUpdateChainRun(ctx, db.UpdateChainRun{ChainID: chain.ID, ChainName: chain.Name, HostID: chain.HostID, Trigger: trigger, Actor: actor, Status: "running"})
+	runID, err := a.Store.CreateUpdateChainRun(ctx, db.UpdateChainRun{ChainID: chain.ID, ChainName: chain.Name, HostID: chain.HostID, JobID: jobID, Trigger: trigger, Actor: actor, Status: "running"})
 	if err != nil {
 		_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
 		return 0, 0, err
@@ -514,7 +656,7 @@ func (a *App) waitForJob(ctx context.Context, id int64) (db.Job, error) {
 		if err != nil {
 			return db.Job{}, err
 		}
-		if job.Status == "success" || job.Status == "failed" || job.Status == "cancelled" {
+		if job.Status == "success" || job.Status == "failed" || job.Status == "cancelled" || job.Status == "skipped" {
 			return job, nil
 		}
 		select {
@@ -684,7 +826,7 @@ func (a *App) restartCurrentChainMember(ctx context.Context, runID, chainJobID, 
 	return true, nil
 }
 
-func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID, hostID int64, container, actor string) (db.RestorePoint, bool, error) {
+func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID, hostID int64, container, actor string, skipDataCapture bool) (db.RestorePoint, bool, error) {
 	leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, chainJobID, hostID, container, "chain-recreate")
 	if leaseErr != nil {
 		return db.RestorePoint{}, false, leaseErr
@@ -720,8 +862,24 @@ func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID,
 		return db.RestorePoint{}, false, fmt.Errorf("config snapshot before recreate: %w", err)
 	}
 	restoreCtx, restoreCancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 12*time.Minute, 20*time.Minute))
-	rp, err := a.createRestorePointForSnapshot(restoreCtx, hostID, container, snap, reason, fmt.Sprintf("chain-recreate:%d", runID), deps)
+	capture, err := a.createRestorePointForSnapshotWithOptions(restoreCtx, hostID, container, snap, reason, fmt.Sprintf("chain-recreate:%d", runID), deps, restorePointCaptureOptions{CaptureData: !skipDataCapture, DeferWriterRestart: map[string]bool{container: true}})
 	restoreCancel()
+	rp := capture.RestorePoint
+	deferredReleased := false
+	releaseDeferred := func() error {
+		if deferredReleased || len(capture.DeferredWriters) == 0 {
+			deferredReleased = true
+			return nil
+		}
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
+		defer releaseCancel()
+		err := a.ensureDataWritersRunning(releaseCtx, hostID, capture.DeferredWriters)
+		if err == nil {
+			deferredReleased = true
+		}
+		return err
+	}
+	defer func() { _ = releaseDeferred() }()
 	if err != nil {
 		return rp, false, fmt.Errorf("full restore point before recreate: %w", err)
 	}
@@ -748,6 +906,14 @@ func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID,
 			return rp, true, fmt.Errorf("recreate failed: %v; automatic restore also failed: %v", err, rbErr)
 		}
 		return rp, true, fmt.Errorf("recreate failed: %v; original container restored", err)
+	}
+	if err := releaseDeferred(); err != nil {
+		releaseLease()
+		rbErr := a.rollbackChainRestorePoint(context.Background(), runID, chainJobID, container, rp, actor, "failed-current-recreate-start")
+		if rbErr != nil {
+			return rp, true, fmt.Errorf("recreated data writer could not start: %v; automatic restore also failed: %v", err, rbErr)
+		}
+		return rp, true, fmt.Errorf("recreated data writer could not start: %v; original container restored", err)
 	}
 	parentAfter, inspectErr := a.inspectOne(ctx, hostID, container)
 	if inspectErr != nil {
@@ -830,6 +996,50 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 		}
 	}
 
+	if chainErr == nil && actionableUpdates > 0 && trigger == "automatic" {
+		a.jobProgress(ctx, chainJobID, 20, "Validating chain Preflight plan")
+		blockedContainer := ""
+		blockedReason := ""
+		for _, st := range steps {
+			state := states[st.ContainerName]
+			if !state.UpdateAvailable {
+				continue
+			}
+			preflight, _ := a.runUpdatePreflight(ctx, updateRequest{HostID: chain.HostID, Container: st.ContainerName, Trigger: fmt.Sprintf("chain-auto:%d:plan", runID), Actor: actor, AllowPreflightWarnings: bool(chain.AllowPreflightWarnings)}, false)
+			if preflight.Status != "blocked" {
+				continue
+			}
+			blockedContainer = st.ContainerName
+			blockedReason = preflight.Summary
+			for _, check := range preflight.Checks {
+				if check.Status == preflightRed {
+					blockedReason = check.Title + ": " + firstNonEmpty(check.Detail, check.Description)
+					break
+				}
+			}
+			break
+		}
+		if blockedContainer != "" {
+			for _, st := range steps {
+				status := "skipped_preflight"
+				errText := ""
+				if st.ContainerName == blockedContainer {
+					status = "blocked_preflight"
+					errText = blockedReason
+				}
+				_ = a.Store.UpdateChainRunStep(ctx, stepIDs[st.ContainerName], status, 0, errText, true)
+			}
+			msg := fmt.Sprintf("automatic chain held by Preflight at %s: %s", blockedContainer, blockedReason)
+			_ = a.Store.AddJobLog(ctx, chainJobID, "WARN", "chain", msg)
+			_ = a.Store.FinishUpdateChainRun(ctx, runID, "blocked", msg)
+			_ = a.Store.TouchUpdateChain(ctx, chain.ID, "blocked")
+			a.jobProgress(ctx, chainJobID, 100, "Automatic chain held by Preflight")
+			_ = a.Store.FinishJob(ctx, chainJobID, "skipped", fmt.Sprintf(`{"updates":%d,"status":"blocked_preflight"}`, actionableUpdates), "")
+			_ = a.Store.Audit(ctx, actor, "chain.blocked-preflight", chain.HostID, blockedContainer, fmt.Sprintf("chain=%d run=%d %s", chain.ID, runID, blockedReason))
+			return
+		}
+	}
+
 	if chainErr == nil && actionableUpdates == 0 {
 		for _, st := range steps {
 			stepID := stepIDs[st.ContainerName]
@@ -855,6 +1065,13 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 	}
 
 	completed := []completedChainAction{}
+	// Data protection is transaction-scoped inside a chain: each effective
+	// service/stack protection scope is cold-captured at most once per run.
+	// Later steps still get their own writable-layer/config restore points, but
+	// they reuse the already protected persistent-data baseline.
+	capturedDataScopes := map[string]int64{}
+	forceDataTransactionRollback := false
+	blockedDuringExecution := false
 	for i, st := range steps {
 		if chainErr != nil {
 			break
@@ -890,11 +1107,19 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 				}
 			case "recreate":
 				_ = a.Store.UpdateChainRunStep(ctx, stepID, "recreating", 0, "", false)
-				rp, performed, err := a.recreateCurrentChainMember(ctx, runID, chainJobID, chain.HostID, st.ContainerName, actor)
+				dataScope := a.dataProtectionCaptureScope(ctx, chain.HostID, st.ContainerName)
+				reusingDataBaseline := dataScope != "" && capturedDataScopes[dataScope] > 0
+				rp, performed, err := a.recreateCurrentChainMember(ctx, runID, chainJobID, chain.HostID, st.ContainerName, actor, reusingDataBaseline)
 				if err != nil {
+					if reusingDataBaseline && performed {
+						forceDataTransactionRollback = true
+					}
 					chainErr = fmt.Errorf("%s recreate-if-current failed: %w", st.ContainerName, err)
 					_ = a.Store.UpdateChainRunStep(ctx, stepID, "failed", 0, chainErr.Error(), true)
 				} else if performed {
+					if dataScope != "" && bool(rp.VolumeDataProtected) {
+						capturedDataScopes[dataScope] = rp.ID
+					}
 					completed = append(completed, completedChainAction{Container: st.ContainerName, Kind: "recreate", RestorePointID: rp.ID})
 					_ = a.Store.UpdateChainRunStep(ctx, stepID, "recreated", 0, "", true)
 					_ = a.Store.AddJobLog(ctx, chainJobID, "INFO", "chain", fmt.Sprintf("%s was already current and safely recreated from the same image (restore point #%d)", st.ContainerName, rp.ID))
@@ -914,17 +1139,42 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 			if trigger == "automatic" {
 				stepTrigger = fmt.Sprintf("chain-auto:%d", runID)
 			}
-			jobID, err := a.enqueueUpdate(ctx, chain.HostID, st.ContainerName, stepTrigger, actor)
+			dataScope := a.dataProtectionCaptureScope(ctx, chain.HostID, st.ContainerName)
+			reusingDataBaseline := dataScope != "" && capturedDataScopes[dataScope] > 0
+			jobID, err := a.enqueueUpdate(ctx, chain.HostID, st.ContainerName, stepTrigger, actor, bool(chain.AllowPreflightWarnings), reusingDataBaseline)
 			if err != nil {
 				chainErr = fmt.Errorf("%s could not be queued: %w", st.ContainerName, err)
 				_ = a.Store.UpdateChainRunStep(ctx, stepID, "failed", 0, chainErr.Error(), true)
 			} else {
 				_ = a.Store.UpdateChainRunStep(ctx, stepID, "updating", jobID, "", false)
 				job, waitErr := a.waitForJob(ctx, jobID)
+				transactionWasDestructive := false
+				if tx, txErr := a.Store.UpdateTransactionByJob(ctx, jobID); txErr == nil {
+					if tx.RestorePointID > 0 {
+						if rp, rpErr := a.Store.RestorePoint(ctx, tx.RestorePointID); rpErr == nil && dataScope != "" && bool(rp.VolumeDataProtected) {
+							capturedDataScopes[dataScope] = rp.ID
+						}
+					}
+					if events, eventsErr := a.Store.UpdateTransactionEvents(ctx, tx.ID); eventsErr == nil {
+						for _, event := range events {
+							if event.ToState == txUpdating {
+								transactionWasDestructive = true
+								break
+							}
+						}
+					}
+				}
 				if waitErr != nil {
 					chainErr = fmt.Errorf("%s update wait failed: %w", st.ContainerName, waitErr)
 					_ = a.Store.UpdateChainRunStep(ctx, stepID, "failed", jobID, chainErr.Error(), true)
+				} else if job.Status == "skipped" {
+					blockedDuringExecution = true
+					chainErr = fmt.Errorf("%s automatic update held by Preflight", st.ContainerName)
+					_ = a.Store.UpdateChainRunStep(ctx, stepID, "blocked_preflight", jobID, chainErr.Error(), true)
 				} else if job.Status != "success" {
+					if reusingDataBaseline && transactionWasDestructive {
+						forceDataTransactionRollback = true
+					}
 					chainErr = fmt.Errorf("%s update failed: %s", st.ContainerName, job.Error)
 					_ = a.Store.UpdateChainRunStep(ctx, stepID, "failed", jobID, job.Error, true)
 				} else {
@@ -940,6 +1190,10 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 		}
 
 		if chainErr != nil {
+			if blockedDuringExecution {
+				_ = a.Store.Audit(context.Background(), actor, "chain.step.blocked-preflight", chain.HostID, st.ContainerName, fmt.Sprintf("chain=%d run=%d error=%s", chain.ID, runID, chainErr.Error()))
+				break
+			}
 			_ = a.Store.Audit(context.Background(), actor, "chain.step.failed", chain.HostID, st.ContainerName, fmt.Sprintf("chain=%d run=%d error=%s", chain.ID, runID, chainErr.Error()))
 			critical := criticalChainFailure(chainErr)
 			if bool(chain.StopOnFailure) || critical {
@@ -953,7 +1207,21 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 		}
 	}
 
-	if chainErr != nil && bool(chain.RollbackCompleted) && len(completed) > 0 {
+	if chainErr != nil && blockedDuringExecution {
+		msg := chainErr.Error()
+		_ = a.Store.AddJobLog(ctx, chainJobID, "WARN", "chain", msg)
+		_ = a.Store.FinishUpdateChainRun(ctx, runID, "blocked", msg)
+		_ = a.Store.TouchUpdateChain(ctx, chain.ID, "blocked")
+		a.jobProgress(ctx, chainJobID, 100, "Automatic chain held by Preflight")
+		_ = a.Store.FinishJob(ctx, chainJobID, "skipped", fmt.Sprintf(`{"updates":%d,"completed_actions":%d,"status":"blocked_preflight"}`, actionableUpdates, len(completed)), "")
+		_ = a.Store.Audit(ctx, actor, "chain.blocked-preflight", chain.HostID, "", fmt.Sprintf("chain=%d run=%d error=%s", chain.ID, runID, msg))
+		return
+	}
+
+	if chainErr != nil && (bool(chain.RollbackCompleted) || forceDataTransactionRollback) && len(completed) > 0 {
+		if forceDataTransactionRollback && !bool(chain.RollbackCompleted) {
+			_ = a.Store.AddJobLog(ctx, chainJobID, "WARN", "chain", "shared protected data may have been touched by a failed step; rolling back completed members to keep software and data on the same chain baseline")
+		}
 		a.jobProgress(ctx, chainJobID, 94, "Rolling back completed chain members")
 		failedRollbacks := a.rollbackCompletedChainMembers(ctx, runID, chainJobID, completed, chain.HostID, actor)
 		if len(failedRollbacks) > 0 {

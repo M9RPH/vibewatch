@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/watchtower-ui/watchtower-ui/internal/db"
@@ -17,6 +15,7 @@ import (
 
 const (
 	preflightGreen  = "green"
+	preflightInfo   = "info"
 	preflightYellow = "yellow"
 	preflightRed    = "red"
 )
@@ -50,26 +49,31 @@ type PreflightResult struct {
 }
 
 type preflightPrepared struct {
-	Snapshot      ContainerBackupSnapshot
-	RestorePoint  db.RestorePoint
-	Dependencies  []networkNamespaceDependencyRuntime
-	TargetInspect inspectContainer
+	Snapshot            ContainerBackupSnapshot
+	RestorePoint        db.RestorePoint
+	Dependencies        []networkNamespaceDependencyRuntime
+	TargetInspect       inspectContainer
+	DeferredDataWriters []string
 }
 
 func preflightCheckSource(key string) string {
 	switch key {
 	case "registry", "architecture", "new_image":
 		return "registry manifest"
-	case "disk_space":
-		return "Docker host / controller filesystem"
 	case "volumes", "bind_mounts", "container_state", "docker_health", "dependencies", "restore_configuration":
 		return "Docker Engine"
 	case "custom_verification":
 		return "Vibewatch verification profile"
+	case "data_protection":
+		return "Vibewatch data protection"
+	case "restore_storage":
+		return "Vibewatch restore storage"
 	case "config_snapshot", "dependency_snapshots", "restore_point":
 		return "Vibewatch recovery engine"
 	case "transaction_state":
 		return "Vibewatch transaction engine"
+	case "automatic_safety":
+		return "Vibewatch automation safety"
 	case "major_version":
 		return "Vibewatch version metadata"
 	default:
@@ -112,6 +116,56 @@ func (r *PreflightResult) finish() {
 	}
 }
 
+func isAutomaticUpdateTrigger(trigger string) bool {
+	return strings.HasPrefix(trigger, "automation:") || strings.HasPrefix(trigger, "chain-auto:")
+}
+
+func automaticApprovalRequired(check PreflightCheck) bool {
+	if check.Status != preflightYellow {
+		return false
+	}
+	switch check.Key {
+	case "container_state", "new_image":
+		return true
+	case "major_version":
+		return strings.Contains(strings.ToLower(check.Title), "major version update detected")
+	default:
+		return false
+	}
+}
+
+func automaticPreflightBlocked(checks []PreflightCheck, allowWarnings bool) (bool, string) {
+	for _, check := range checks {
+		if check.Status == preflightRed {
+			return true, check.Title
+		}
+	}
+	for _, check := range checks {
+		if check.Status != preflightYellow {
+			continue
+		}
+		if automaticApprovalRequired(check) {
+			return true, check.Title
+		}
+		if !allowWarnings {
+			return true, check.Title
+		}
+	}
+	return false, ""
+}
+func applyAutomaticPreflightSafety(result *PreflightResult, req updateRequest) {
+	if result == nil || !isAutomaticUpdateTrigger(req.Trigger) || result.Blocked != 0 {
+		return
+	}
+	if blocked, reason := automaticPreflightBlocked(result.Checks, req.AllowPreflightWarnings); blocked {
+		detail := "Automatic updates require a clean Preflight by default."
+		if req.AllowPreflightWarnings {
+			detail = "This warning requires manual approval even when advisory warnings are allowed."
+		}
+		result.add("automatic_safety", preflightRed, "Automatic update held by Preflight", detail, reason)
+	}
+}
+
 func majorPart(v string) (int, bool) {
 	v = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V"))
 	if v == "" {
@@ -126,25 +180,6 @@ func majorPart(v string) (int, bool) {
 	}
 	n, err := strconv.Atoi(v[:end])
 	return n, err == nil
-}
-
-func localDockerFreeBytes(root string) (int64, bool) {
-	root = strings.TrimSpace(root)
-	if root == "" {
-		return 0, false
-	}
-	if _, err := os.Stat(root); err != nil {
-		return 0, false
-	}
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(root, &st); err != nil {
-		return 0, false
-	}
-	return int64(st.Bavail) * int64(st.Bsize), true
-}
-
-func formatGB(n int64) string {
-	return fmt.Sprintf("%.1f GB", float64(n)/(1024*1024*1024))
 }
 
 func (a *App) preflightProgress(ctx context.Context, req updateRequest, percent int, stage string) {
@@ -209,12 +244,14 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 	}
 
 	a.preflightProgress(ctx, req, 19, "Checking health and verification configuration")
+	profile, _ := a.effectiveVerificationProfile(ctx, req.HostID, req.Container)
 	if target.Config.Healthcheck != nil {
 		result.add("docker_health", preflightGreen, "Docker healthcheck configured", "Docker health will be evaluated after the update.", "")
+	} else if profile.Configured {
+		result.add("docker_health", preflightInfo, "No Docker healthcheck", "Custom verification is configured, so the missing Docker healthcheck is informational. Running-state stability is still checked before application verification.", "")
 	} else {
-		result.add("docker_health", preflightYellow, "No Docker healthcheck", "Vibewatch will use running-state stability plus any custom verification checks.", "")
+		result.add("docker_health", preflightYellow, "No Docker healthcheck", "Only running-state stability is available. Configure custom verification to validate application functionality after the update.", "")
 	}
-	profile, _ := a.effectiveVerificationProfile(ctx, req.HostID, req.Container)
 	if profile.Configured {
 		result.add("custom_verification", preflightGreen, "Custom verification configured", fmt.Sprintf("%d application-level check(s) will run after Docker health.", len(profile.Checks)), profile.ScopeType+":"+profile.ScopeKey)
 	} else {
@@ -293,26 +330,6 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 		result.add("major_version", preflightYellow, "Major version could not be determined", "Readable version metadata is incomplete; digest-based update detection remains authoritative.", "")
 	}
 
-	a.preflightProgress(ctx, req, 29, "Checking storage capacity")
-	// Docker Engine does not expose filesystem free capacity for remote daemons.
-	// Use a real statfs when the controller can see DockerRootDir, otherwise be
-	// explicit and warn rather than inventing a safe capacity value.
-	if overview, oe := a.Docker.HostOverview(ctx, h.Endpoint, false); oe == nil {
-		if free, ok := localDockerFreeBytes(overview.DockerRootDir); ok {
-			status := preflightGreen
-			desc := fmt.Sprintf("%s free on the filesystem containing DockerRootDir.", formatGB(free))
-			if free < 2*1024*1024*1024 {
-				status = preflightRed
-				desc = fmt.Sprintf("Only %s free on DockerRootDir; at least 2 GB is required by Vibewatch's safety threshold.", formatGB(free))
-			}
-			result.add("disk_space", status, "Docker storage capacity", desc, overview.DockerRootDir)
-		} else {
-			result.add("disk_space", preflightYellow, "Docker free space not directly measurable", "Docker Engine exposes usage but not host filesystem free capacity for this endpoint. Ensure the Docker host has sufficient free disk space.", fmt.Sprintf("images=%s reclaimable; build cache=%s reclaimable", formatGB(overview.ImageReclaimableBytes), formatGB(overview.BuildCacheReclaimable)))
-		}
-	} else {
-		result.add("disk_space", preflightYellow, "Docker storage could not be measured", "The update can still be prepared, but disk capacity could not be evaluated.", oe.Error())
-	}
-
 	a.preflightProgress(ctx, req, 32, "Checking volumes, bind mounts and restore configuration")
 	volumeNames := []string{}
 	binds := []string{}
@@ -343,6 +360,14 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 		result.add("bind_mounts", preflightYellow, "Bind mounts recorded", "Bind mount sources are recorded, but the stopped container cannot prove current runtime reachability.", strings.Join(binds, ", "))
 	}
 
+	if dataCheck, configured := a.dataProtectionPreflight(ctx, req); configured {
+		result.add(dataCheck.Key, dataCheck.Status, dataCheck.Title, dataCheck.Description, dataCheck.Detail)
+	}
+	if strings.TrimSpace(target.ID) != "" {
+		storageCheck := a.restoreStoragePreflight(ctx, req, target, prepare)
+		result.add(storageCheck.Key, storageCheck.Status, storageCheck.Title, storageCheck.Description, storageCheck.Detail)
+	}
+
 	if strings.TrimSpace(target.ID) != "" {
 		if _, _, e := createArgsFromInspect(target, imageRef); e != nil {
 			result.add("restore_configuration", preflightRed, "Restore configuration invalid", "The current runtime configuration cannot be translated into a safe restore command.", e.Error())
@@ -352,6 +377,8 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 			result.add("restore_configuration", preflightGreen, "Restore configuration valid", "The current runtime configuration can be reconstructed for rollback.", "")
 		}
 	}
+
+	applyAutomaticPreflightSafety(&result, req)
 
 	if prepare && result.Blocked == 0 {
 		if e := a.transitionPreflightTransaction(ctx, req, txSnapshot, "creating pre-update config snapshot"); e != nil {
@@ -390,14 +417,22 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 				if result.Blocked == 0 {
 					a.preflightProgress(ctx, req, 39, "Creating full restore point")
 					restoreCtx, restoreCancel := context.WithTimeout(ctx, 10*time.Minute)
-					rp, re := a.createRestorePointForSnapshot(restoreCtx, req.HostID, req.Container, snap, snapshotReason, req.Trigger, prepared.Dependencies)
+					deferRestart := map[string]bool{}
+					if req.DeferTargetRestart {
+						deferRestart[req.Container] = true
+					}
+					capture, re := a.createRestorePointForSnapshotWithOptions(restoreCtx, req.HostID, req.Container, snap, snapshotReason, req.Trigger, prepared.Dependencies, restorePointCaptureOptions{CaptureData: !req.SkipDataProtectionCapture, DeferWriterRestart: deferRestart})
 					restoreCancel()
+					rp := capture.RestorePoint
 					prepared.RestorePoint = rp
+					prepared.DeferredDataWriters = capture.DeferredWriters
 					result.RestoreID = rp.ID
 					if re != nil {
 						result.add("restore_point", preflightRed, "Restore point failed", "The writable-layer restore point could not be prepared; the running container is left unchanged.", re.Error())
 					} else if rp.Status == "config_only" {
 						result.add("restore_point", preflightYellow, "Config-only restore point", "The recovery configuration is retained, but full writable-layer rollback is unavailable for this target.", fmt.Sprintf("restore point #%d", rp.ID))
+					} else if bool(rp.VolumeDataProtected) {
+						result.add("restore_point", preflightGreen, "Application restore point available", "Container state and selected persistent data are protected for rollback.", fmt.Sprintf("restore point #%d · %d data byte(s)", rp.ID, rp.DataBytes))
 					} else {
 						result.add("restore_point", preflightGreen, "Restore point available", "A full pre-update writable-layer restore point is ready.", fmt.Sprintf("restore point #%d", rp.ID))
 					}
@@ -412,6 +447,10 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 			result.add("restore_point", preflightGreen, "Restore point pipeline ready", "A full writable-layer restore point will be created immediately before the update is executed.", "")
 		}
 	}
+
+	// Preparation can add new advisory results (for example a config-only
+	// restore point). Re-evaluate automatic safety before any image mutation.
+	applyAutomaticPreflightSafety(&result, req)
 
 	result.finish()
 	if prepare {

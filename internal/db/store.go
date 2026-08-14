@@ -71,12 +71,13 @@ func (h *Host) UnmarshalJSON(data []byte) error {
 }
 
 type Policy struct {
-	HostID               int64  `json:"host_id"`
-	ContainerName        string `json:"container_name"`
-	Mode                 string `json:"mode"`
-	CheckIntervalMinutes int    `json:"check_interval_minutes"`
-	ReleaseRepo          string `json:"release_repo"`
-	LastCheckedAt        string `json:"last_checked_at,omitempty"`
+	HostID                 int64  `json:"host_id"`
+	ContainerName          string `json:"container_name"`
+	Mode                   string `json:"mode"`
+	CheckIntervalMinutes   int    `json:"check_interval_minutes"`
+	ReleaseRepo            string `json:"release_repo"`
+	AllowPreflightWarnings Bool   `json:"allow_preflight_warnings"`
+	LastCheckedAt          string `json:"last_checked_at,omitempty"`
 }
 
 type Cache struct {
@@ -151,13 +152,18 @@ type VersionInfo struct {
 }
 
 type Automation struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Cron       string `json:"cron"`
-	TargetType string `json:"target_type"`
-	TargetID   int64  `json:"target_id"`
-	Enabled    Bool   `json:"enabled"`
-	LastRunAt  string `json:"last_run_at"`
+	ID                int64  `json:"id"`
+	Name              string `json:"name"`
+	Cron              string `json:"cron"`
+	TargetType        string `json:"target_type"`
+	TargetID          int64  `json:"target_id"`
+	Kind              string `json:"kind"`
+	CleanupImages     Bool   `json:"cleanup_images"`
+	CleanupNetworks   Bool   `json:"cleanup_networks"`
+	CleanupBuildCache Bool   `json:"cleanup_build_cache"`
+	CleanupVolumes    Bool   `json:"cleanup_volumes"`
+	Enabled           Bool   `json:"enabled"`
+	LastRunAt         string `json:"last_run_at"`
 }
 
 type HostGroup struct {
@@ -317,6 +323,39 @@ type RestorePoint struct {
 	IntegrityStatus     string `json:"integrity_status"`
 	IntegrityCheckedAt  string `json:"integrity_checked_at"`
 	IntegrityDetails    string `json:"integrity_details"`
+	DataManifestJSON    string `json:"-"`
+	DataBytes           int64  `json:"data_bytes"`
+}
+
+type DataProtectionProfile struct {
+	HostID     int64  `json:"host_id"`
+	ScopeType  string `json:"scope_type"`
+	ScopeKey   string `json:"scope_key"`
+	Enabled    Bool   `json:"enabled"`
+	MountsJSON string `json:"mounts_json"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+type DataMountCache struct {
+	HostID        int64  `json:"host_id"`
+	MountKey      string `json:"mount_key"`
+	StorageClass  string `json:"storage_class"`
+	FSType        string `json:"fs_type"`
+	CheckedAt     string `json:"checked_at"`
+	Error         string `json:"error"`
+	SizeBytes     int64  `json:"size_bytes"`
+	SizeCheckedAt string `json:"size_checked_at"`
+	SizeError     string `json:"size_error"`
+}
+
+type HostStorageCache struct {
+	HostID            int64  `json:"host_id"`
+	HostTotalBytes    int64  `json:"host_total_bytes"`
+	HostFreeBytes     int64  `json:"host_free_bytes"`
+	RestoreTotalBytes int64  `json:"restore_total_bytes"`
+	RestoreFreeBytes  int64  `json:"restore_free_bytes"`
+	CheckedAt         string `json:"checked_at"`
+	Error             string `json:"error"`
 }
 
 type ConfigDriftState struct {
@@ -347,26 +386,39 @@ type VerificationProfile struct {
 type VerificationState struct {
 	HostID        int64  `json:"host_id"`
 	ContainerName string `json:"container_name"`
+	ScopeType     string `json:"scope_type,omitempty"`
+	ScopeKey      string `json:"scope_key,omitempty"`
 	Status        string `json:"status"`
 	DetailsJSON   string `json:"details_json"`
 	CheckedAt     string `json:"checked_at"`
 	Error         string `json:"error"`
 }
 
+type VerificationScopeState struct {
+	HostID      int64  `json:"host_id"`
+	ScopeType   string `json:"scope_type"`
+	ScopeKey    string `json:"scope_key"`
+	Status      string `json:"status"`
+	DetailsJSON string `json:"details_json"`
+	CheckedAt   string `json:"checked_at"`
+	Error       string `json:"error"`
+}
+
 type UpdateChain struct {
-	ID                int64  `json:"id"`
-	Name              string `json:"name"`
-	HostID            int64  `json:"host_id"`
-	AutomationID      int64  `json:"automation_id"`
-	ScopeType         string `json:"scope_type"`
-	ScopeKey          string `json:"scope_key"`
-	PolicyMode        string `json:"policy_mode"`
-	StopOnFailure     Bool   `json:"stop_on_failure"`
-	RollbackCompleted Bool   `json:"rollback_completed"`
-	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at"`
-	LastRunAt         string `json:"last_run_at"`
-	LastStatus        string `json:"last_status"`
+	ID                     int64  `json:"id"`
+	Name                   string `json:"name"`
+	HostID                 int64  `json:"host_id"`
+	AutomationID           int64  `json:"automation_id"`
+	ScopeType              string `json:"scope_type"`
+	ScopeKey               string `json:"scope_key"`
+	PolicyMode             string `json:"policy_mode"`
+	AllowPreflightWarnings Bool   `json:"allow_preflight_warnings"`
+	StopOnFailure          Bool   `json:"stop_on_failure"`
+	RollbackCompleted      Bool   `json:"rollback_completed"`
+	CreatedAt              string `json:"created_at"`
+	UpdatedAt              string `json:"updated_at"`
+	LastRunAt              string `json:"last_run_at"`
+	LastStatus             string `json:"last_status"`
 }
 
 type UpdateChainStep struct {
@@ -379,16 +431,19 @@ type UpdateChainStep struct {
 }
 
 type UpdateChainRun struct {
-	ID         int64  `json:"id"`
-	ChainID    int64  `json:"chain_id"`
-	ChainName  string `json:"chain_name"`
-	HostID     int64  `json:"host_id"`
-	Trigger    string `json:"trigger"`
-	Actor      string `json:"actor"`
-	Status     string `json:"status"`
-	StartedAt  string `json:"started_at"`
-	FinishedAt string `json:"finished_at"`
-	Error      string `json:"error"`
+	ID             int64  `json:"id"`
+	ChainID        int64  `json:"chain_id"`
+	ChainName      string `json:"chain_name"`
+	HostID         int64  `json:"host_id"`
+	JobID          int64  `json:"job_id"`
+	Trigger        string `json:"trigger"`
+	Actor          string `json:"actor"`
+	Status         string `json:"status"`
+	RecoveryAction string `json:"recovery_action"`
+	RecoveredAt    string `json:"recovered_at"`
+	StartedAt      string `json:"started_at"`
+	FinishedAt     string `json:"finished_at"`
+	Error          string `json:"error"`
 }
 
 type UpdateChainRunStep struct {
@@ -452,7 +507,7 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	schema := `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;
 CREATE TABLE IF NOT EXISTS hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, endpoint TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, worker_token TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS policies (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'manual', check_interval_minutes INTEGER NOT NULL DEFAULT 30, release_repo TEXT NOT NULL DEFAULT '', last_checked_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
+CREATE TABLE IF NOT EXISTS policies (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'manual', check_interval_minutes INTEGER NOT NULL DEFAULT 30, release_repo TEXT NOT NULL DEFAULT '', allow_preflight_warnings INTEGER NOT NULL DEFAULT 0, last_checked_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
 CREATE TABLE IF NOT EXISTS container_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, image TEXT NOT NULL DEFAULT '', image_id TEXT NOT NULL DEFAULT '', current_digest TEXT NOT NULL DEFAULT '', latest_digest TEXT NOT NULL DEFAULT '', update_available INTEGER NOT NULL DEFAULT 0, first_detected_at TEXT NOT NULL DEFAULT '', snoozed_digest TEXT NOT NULL DEFAULT '', snoozed_at TEXT NOT NULL DEFAULT '', last_checked_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
 CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, trigger TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', summary_json TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS job_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL, ts TEXT NOT NULL, level TEXT NOT NULL, source TEXT NOT NULL, message TEXT NOT NULL);
@@ -460,7 +515,7 @@ CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, name
 CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, host_id INTEGER NOT NULL DEFAULT 0, container_name TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS version_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, installed_version TEXT NOT NULL DEFAULT '', installed_source TEXT NOT NULL DEFAULT '', latest_version TEXT NOT NULL DEFAULT '', latest_source TEXT NOT NULL DEFAULT '', update_kind TEXT NOT NULL DEFAULT '', security_update INTEGER NOT NULL DEFAULT 0, release_repo TEXT NOT NULL DEFAULT '', published_at TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
-CREATE TABLE IF NOT EXISTS automations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, cron TEXT NOT NULL, target_type TEXT NOT NULL DEFAULT 'host', target_id INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS automations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, cron TEXT NOT NULL, target_type TEXT NOT NULL DEFAULT 'host', target_id INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'policy', cleanup_images INTEGER NOT NULL DEFAULT 0, cleanup_networks INTEGER NOT NULL DEFAULT 0, cleanup_build_cache INTEGER NOT NULL DEFAULT 0, cleanup_volumes INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS host_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS host_group_members (group_id INTEGER NOT NULL, host_id INTEGER NOT NULL, PRIMARY KEY(group_id,host_id));
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
@@ -471,21 +526,34 @@ CREATE TABLE IF NOT EXISTS notification_state (user_id INTEGER NOT NULL, host_id
 CREATE TABLE IF NOT EXISTS notification_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, user_id INTEGER NOT NULL, username TEXT NOT NULL, host_id INTEGER NOT NULL DEFAULT 0, container_name TEXT NOT NULL DEFAULT '', event TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS update_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, action TEXT NOT NULL DEFAULT 'update', trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, from_version TEXT NOT NULL DEFAULT '', to_version TEXT NOT NULL DEFAULT '', from_image_ref TEXT NOT NULL DEFAULT '', to_image_ref TEXT NOT NULL DEFAULT '', from_digest TEXT NOT NULL DEFAULT '', to_digest TEXT NOT NULL DEFAULT '', snapshot_id TEXT NOT NULL DEFAULT '', restore_point_id INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', dependency_count INTEGER NOT NULL DEFAULT 0, dependency_status TEXT NOT NULL DEFAULT '', dependency_details TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS restore_points (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, snapshot_id TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', trigger TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'ready', image_ref TEXT NOT NULL DEFAULT '', image_id TEXT NOT NULL DEFAULT '', original_image_ref TEXT NOT NULL DEFAULT '', original_image_id TEXT NOT NULL DEFAULT '', target_digest TEXT NOT NULL DEFAULT '', from_version TEXT NOT NULL DEFAULT '', unit_kind TEXT NOT NULL DEFAULT '', unit_key TEXT NOT NULL DEFAULT '', stack_type TEXT NOT NULL DEFAULT '', writable_layer INTEGER NOT NULL DEFAULT 0, config_protected INTEGER NOT NULL DEFAULT 1, volume_data_protected INTEGER NOT NULL DEFAULT 0, volume_count INTEGER NOT NULL DEFAULT 0, bind_count INTEGER NOT NULL DEFAULT 0, restore_count INTEGER NOT NULL DEFAULT 0, last_restored_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', dependency_count INTEGER NOT NULL DEFAULT 0, dependencies_json TEXT NOT NULL DEFAULT '[]');
+CREATE TABLE IF NOT EXISTS data_protection_profiles (host_id INTEGER NOT NULL, scope_type TEXT NOT NULL, scope_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, mounts_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL, PRIMARY KEY(host_id,scope_type,scope_key));
+CREATE TABLE IF NOT EXISTS data_mount_cache (host_id INTEGER NOT NULL, mount_key TEXT NOT NULL, storage_class TEXT NOT NULL DEFAULT 'unknown', fs_type TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0, size_checked_at TEXT NOT NULL DEFAULT '', size_error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,mount_key));
+CREATE TABLE IF NOT EXISTS host_storage_cache (host_id INTEGER PRIMARY KEY, host_total_bytes INTEGER NOT NULL DEFAULT 0, host_free_bytes INTEGER NOT NULL DEFAULT 0, restore_total_bytes INTEGER NOT NULL DEFAULT 0, restore_free_bytes INTEGER NOT NULL DEFAULT 0, checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS config_drift_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'not_checked', details_json TEXT NOT NULL DEFAULT '[]', baseline_at TEXT NOT NULL DEFAULT '', baseline_json TEXT NOT NULL DEFAULT '', baseline_source TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
 CREATE TABLE IF NOT EXISTS registry_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, registry TEXT NOT NULL UNIQUE COLLATE NOCASE, username TEXT NOT NULL DEFAULT '', secret_enc TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS verification_profiles (host_id INTEGER NOT NULL, scope_type TEXT NOT NULL, scope_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, start_delay_seconds INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 2, retry_interval_seconds INTEGER NOT NULL DEFAULT 3, checks_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(host_id,scope_type,scope_key));
 CREATE TABLE IF NOT EXISTS verification_state (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'not_configured', details_json TEXT NOT NULL DEFAULT '[]', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
-CREATE TABLE IF NOT EXISTS update_chains (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, host_id INTEGER NOT NULL, automation_id INTEGER NOT NULL DEFAULT 0, scope_type TEXT NOT NULL DEFAULT 'custom', scope_key TEXT NOT NULL DEFAULT '', policy_mode TEXT NOT NULL DEFAULT 'inherit', stop_on_failure INTEGER NOT NULL DEFAULT 1, rollback_completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_run_at TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT 'never');
+CREATE TABLE IF NOT EXISTS verification_scope_state (host_id INTEGER NOT NULL, scope_type TEXT NOT NULL, scope_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'not_configured', details_json TEXT NOT NULL DEFAULT '[]', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,scope_type,scope_key));
+CREATE TABLE IF NOT EXISTS update_chains (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, host_id INTEGER NOT NULL, automation_id INTEGER NOT NULL DEFAULT 0, scope_type TEXT NOT NULL DEFAULT 'custom', scope_key TEXT NOT NULL DEFAULT '', policy_mode TEXT NOT NULL DEFAULT 'inherit', allow_preflight_warnings INTEGER NOT NULL DEFAULT 0, stop_on_failure INTEGER NOT NULL DEFAULT 1, rollback_completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_run_at TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT 'never');
 CREATE TABLE IF NOT EXISTS update_chain_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, chain_id INTEGER NOT NULL, position INTEGER NOT NULL, container_name TEXT NOT NULL, current_action TEXT NOT NULL DEFAULT 'skip', wait_seconds INTEGER NOT NULL DEFAULT 0, UNIQUE(chain_id,position));
-CREATE TABLE IF NOT EXISTS update_chain_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, chain_id INTEGER NOT NULL, chain_name TEXT NOT NULL, host_id INTEGER NOT NULL, trigger TEXT NOT NULL, actor TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS update_chain_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, chain_id INTEGER NOT NULL, chain_name TEXT NOT NULL, host_id INTEGER NOT NULL, job_id INTEGER NOT NULL DEFAULT 0, trigger TEXT NOT NULL, actor TEXT NOT NULL, status TEXT NOT NULL, recovery_action TEXT NOT NULL DEFAULT '', recovered_at TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS update_chain_run_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, position INTEGER NOT NULL, container_name TEXT NOT NULL, status TEXT NOT NULL, job_id INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS update_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL UNIQUE, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', status TEXT NOT NULL DEFAULT 'running', snapshot_id TEXT NOT NULL DEFAULT '', restore_point_id INTEGER NOT NULL DEFAULT 0, target_digest TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', recovery_action TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS update_transaction_events (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_id INTEGER NOT NULL, ts TEXT NOT NULL, from_state TEXT NOT NULL DEFAULT '', to_state TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running', message TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS operation_leases (resource_key TEXT PRIMARY KEY, host_id INTEGER NOT NULL, container_name TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL, operation_type TEXT NOT NULL, transaction_id INTEGER NOT NULL DEFAULT 0, job_id INTEGER NOT NULL DEFAULT 0, acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS verification_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', job_id INTEGER NOT NULL DEFAULT 0, transaction_id INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, scope_type TEXT NOT NULL DEFAULT '', scope_key TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, details_json TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS recovery_gc_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, status TEXT NOT NULL, restore_points_checked INTEGER NOT NULL DEFAULT 0, degraded INTEGER NOT NULL DEFAULT 0, expired INTEGER NOT NULL DEFAULT 0, images_removed INTEGER NOT NULL DEFAULT 0, snapshots_removed INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]');
-CREATE INDEX IF NOT EXISTS idx_update_transactions_status ON update_transactions(status,id); CREATE INDEX IF NOT EXISTS idx_update_transactions_container ON update_transactions(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_update_transaction_events_tx ON update_transaction_events(transaction_id,id); CREATE INDEX IF NOT EXISTS idx_operation_leases_expiry ON operation_leases(expires_at); CREATE INDEX IF NOT EXISTS idx_verification_history_container ON verification_history(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_verification_state_container ON verification_state(host_id,container_name); CREATE INDEX IF NOT EXISTS idx_update_chains_host ON update_chains(host_id,id); CREATE INDEX IF NOT EXISTS idx_update_chain_runs_chain ON update_chain_runs(chain_id,id DESC); CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(id DESC); CREATE INDEX IF NOT EXISTS idx_update_history_id ON update_history(id DESC); CREATE INDEX IF NOT EXISTS idx_restore_points_container ON restore_points(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_restore_points_snapshot ON restore_points(host_id,snapshot_id); CREATE INDEX IF NOT EXISTS idx_update_history_container ON update_history(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_notification_deliveries_id ON notification_deliveries(id DESC); CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id,id); CREATE INDEX IF NOT EXISTS idx_group_members_host ON host_group_members(host_id); CREATE INDEX IF NOT EXISTS idx_user_hosts_host ON user_hosts(host_id);`
+CREATE TABLE IF NOT EXISTS recovery_gc_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, status TEXT NOT NULL, restore_points_checked INTEGER NOT NULL DEFAULT 0, degraded INTEGER NOT NULL DEFAULT 0, expired INTEGER NOT NULL DEFAULT 0, images_removed INTEGER NOT NULL DEFAULT 0, snapshots_removed INTEGER NOT NULL DEFAULT 0, helpers_removed INTEGER NOT NULL DEFAULT 0, unusable_removed INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]');
+CREATE INDEX IF NOT EXISTS idx_update_transactions_status ON update_transactions(status,id); CREATE INDEX IF NOT EXISTS idx_update_transactions_container ON update_transactions(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_update_transaction_events_tx ON update_transaction_events(transaction_id,id); CREATE INDEX IF NOT EXISTS idx_operation_leases_expiry ON operation_leases(expires_at); CREATE INDEX IF NOT EXISTS idx_verification_history_container ON verification_history(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_verification_state_container ON verification_state(host_id,container_name); CREATE INDEX IF NOT EXISTS idx_verification_scope_state ON verification_scope_state(host_id,scope_type,scope_key); CREATE INDEX IF NOT EXISTS idx_update_chains_host ON update_chains(host_id,id); CREATE INDEX IF NOT EXISTS idx_update_chain_runs_chain ON update_chain_runs(chain_id,id DESC); CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(id DESC); CREATE INDEX IF NOT EXISTS idx_update_history_id ON update_history(id DESC); CREATE INDEX IF NOT EXISTS idx_restore_points_container ON restore_points(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_restore_points_snapshot ON restore_points(host_id,snapshot_id); CREATE INDEX IF NOT EXISTS idx_update_history_container ON update_history(host_id,container_name,id DESC); CREATE INDEX IF NOT EXISTS idx_notification_deliveries_id ON notification_deliveries(id DESC); CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id,id); CREATE INDEX IF NOT EXISTS idx_group_members_host ON host_group_members(host_id); CREATE INDEX IF NOT EXISTS idx_user_hosts_host ON user_hosts(host_id);`
 	if err := s.exec(ctx, schema); err != nil {
+		return err
+	}
+	// Backfill shared stack state from the newest scope-aware history entry.
+	// This preserves existing successful stack verifications when upgrading from
+	// the older per-container state model.
+	if err := s.exec(ctx, `INSERT OR IGNORE INTO verification_scope_state(host_id,scope_type,scope_key,status,details_json,checked_at,error)
+SELECT h.host_id,h.scope_type,h.scope_key,h.status,h.details_json,h.ts,h.error
+FROM verification_history h
+JOIN (SELECT host_id,scope_type,scope_key,MAX(id) AS id FROM verification_history WHERE scope_type='stack' AND scope_key<>'' GROUP BY host_id,scope_type,scope_key) latest ON latest.id=h.id;`); err != nil {
 		return err
 	}
 	// Safe migrations for databases created by older Vibewatch releases.
@@ -534,6 +602,8 @@ CREATE INDEX IF NOT EXISTS idx_update_transactions_status ON update_transactions
 		"ALTER TABLE update_chains ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'custom';",
 		"ALTER TABLE update_chains ADD COLUMN scope_key TEXT NOT NULL DEFAULT '';",
 		"ALTER TABLE update_chains ADD COLUMN policy_mode TEXT NOT NULL DEFAULT 'inherit';",
+		"ALTER TABLE update_chains ADD COLUMN allow_preflight_warnings INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE policies ADD COLUMN allow_preflight_warnings INTEGER NOT NULL DEFAULT 0;",
 		"ALTER TABLE update_chain_steps ADD COLUMN current_action TEXT NOT NULL DEFAULT 'skip';",
 	} {
 		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -560,6 +630,39 @@ CREATE INDEX IF NOT EXISTS idx_update_transactions_status ON update_transactions
 		"ALTER TABLE restore_points ADD COLUMN integrity_status TEXT NOT NULL DEFAULT 'not_checked';",
 		"ALTER TABLE restore_points ADD COLUMN integrity_checked_at TEXT NOT NULL DEFAULT '';",
 		"ALTER TABLE restore_points ADD COLUMN integrity_details TEXT NOT NULL DEFAULT '';",
+	} {
+		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE automations ADD COLUMN kind TEXT NOT NULL DEFAULT 'policy';",
+		"ALTER TABLE automations ADD COLUMN cleanup_images INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE automations ADD COLUMN cleanup_networks INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE automations ADD COLUMN cleanup_build_cache INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE automations ADD COLUMN cleanup_volumes INTEGER NOT NULL DEFAULT 0;",
+	} {
+		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE restore_points ADD COLUMN data_manifest_json TEXT NOT NULL DEFAULT '{}';",
+		"ALTER TABLE restore_points ADD COLUMN data_bytes INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE data_mount_cache ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE data_mount_cache ADD COLUMN size_checked_at TEXT NOT NULL DEFAULT '';",
+		"ALTER TABLE data_mount_cache ADD COLUMN size_error TEXT NOT NULL DEFAULT '';",
+	} {
+		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE update_chain_runs ADD COLUMN job_id INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE update_chain_runs ADD COLUMN recovery_action TEXT NOT NULL DEFAULT '';",
+		"ALTER TABLE update_chain_runs ADD COLUMN recovered_at TEXT NOT NULL DEFAULT '';",
+		"ALTER TABLE recovery_gc_runs ADD COLUMN helpers_removed INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE recovery_gc_runs ADD COLUMN unusable_removed INTEGER NOT NULL DEFAULT 0;",
 	} {
 		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			return err
@@ -655,8 +758,8 @@ var recoverableCoreTables = []string{
 	"audit_events", "settings", "version_cache", "automations", "host_groups",
 	"host_group_members", "users", "user_hosts", "user_groups",
 	"notification_settings", "notification_state", "notification_deliveries", "update_history", "restore_points", "config_drift_cache", "registry_credentials",
-	"verification_profiles", "verification_state", "verification_history", "update_chains", "update_chain_steps", "update_chain_runs", "update_chain_run_steps",
-	"update_transactions", "update_transaction_events", "operation_leases", "recovery_gc_runs",
+	"verification_profiles", "verification_state", "verification_scope_state", "verification_history", "update_chains", "update_chain_steps", "update_chain_runs", "update_chain_run_steps",
+	"update_transactions", "update_transaction_events", "operation_leases", "recovery_gc_runs", "data_protection_profiles", "data_mount_cache", "host_storage_cache",
 }
 
 // RepairDockerEventCorruption is a narrowly-scoped startup recovery for the
@@ -896,12 +999,12 @@ func (s *Store) RenameHost(ctx context.Context, id int64, name string) error {
 	return s.exec(ctx, fmt.Sprintf(`UPDATE hosts SET name=%s WHERE id=%d`, q(name), id))
 }
 func (s *Store) DeleteHost(ctx context.Context, id int64) error {
-	return s.exec(ctx, fmt.Sprintf(`DELETE FROM policies WHERE host_id=%d; DELETE FROM container_cache WHERE host_id=%d; DELETE FROM version_cache WHERE host_id=%d; DELETE FROM schedules WHERE host_id=%d; DELETE FROM host_group_members WHERE host_id=%d; DELETE FROM user_hosts WHERE host_id=%d; DELETE FROM notification_state WHERE host_id=%d; DELETE FROM config_drift_cache WHERE host_id=%d; DELETE FROM verification_profiles WHERE host_id=%d; DELETE FROM verification_state WHERE host_id=%d; DELETE FROM verification_history WHERE host_id=%d; DELETE FROM operation_leases WHERE host_id=%d; DELETE FROM update_transaction_events WHERE transaction_id IN (SELECT id FROM update_transactions WHERE host_id=%d); DELETE FROM update_transactions WHERE host_id=%d; DELETE FROM update_chain_steps WHERE chain_id IN (SELECT id FROM update_chains WHERE host_id=%d); DELETE FROM update_chains WHERE host_id=%d; DELETE FROM automations WHERE target_type='host' AND target_id=%d; DELETE FROM restore_points WHERE host_id=%d; DELETE FROM hosts WHERE id=%d;`, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id))
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM policies WHERE host_id=%d; DELETE FROM container_cache WHERE host_id=%d; DELETE FROM version_cache WHERE host_id=%d; DELETE FROM schedules WHERE host_id=%d; DELETE FROM host_group_members WHERE host_id=%d; DELETE FROM user_hosts WHERE host_id=%d; DELETE FROM notification_state WHERE host_id=%d; DELETE FROM config_drift_cache WHERE host_id=%d; DELETE FROM verification_profiles WHERE host_id=%d; DELETE FROM verification_state WHERE host_id=%d; DELETE FROM verification_scope_state WHERE host_id=%d; DELETE FROM verification_history WHERE host_id=%d; DELETE FROM operation_leases WHERE host_id=%d; DELETE FROM update_transaction_events WHERE transaction_id IN (SELECT id FROM update_transactions WHERE host_id=%d); DELETE FROM update_transactions WHERE host_id=%d; DELETE FROM update_chain_steps WHERE chain_id IN (SELECT id FROM update_chains WHERE host_id=%d); DELETE FROM update_chains WHERE host_id=%d; DELETE FROM automations WHERE target_type='host' AND target_id=%d; DELETE FROM restore_points WHERE host_id=%d; DELETE FROM data_protection_profiles WHERE host_id=%d; DELETE FROM data_mount_cache WHERE host_id=%d; DELETE FROM host_storage_cache WHERE host_id=%d; DELETE FROM hosts WHERE id=%d;`, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id))
 }
 
 func (s *Store) Policy(ctx context.Context, hostID int64, name string) (Policy, error) {
 	var x []Policy
-	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,container_name,mode,check_interval_minutes,release_repo,last_checked_at FROM policies WHERE host_id=%d AND container_name=%s`, hostID, q(name)), &x)
+	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,container_name,mode,check_interval_minutes,release_repo,allow_preflight_warnings,last_checked_at FROM policies WHERE host_id=%d AND container_name=%s`, hostID, q(name)), &x)
 	if err != nil {
 		return Policy{}, err
 	}
@@ -912,14 +1015,14 @@ func (s *Store) Policy(ctx context.Context, hostID int64, name string) (Policy, 
 }
 func (s *Store) Policies(ctx context.Context) ([]Policy, error) {
 	var x []Policy
-	err := s.query(ctx, `SELECT host_id,container_name,mode,check_interval_minutes,release_repo,last_checked_at FROM policies ORDER BY host_id,container_name`, &x)
+	err := s.query(ctx, `SELECT host_id,container_name,mode,check_interval_minutes,release_repo,allow_preflight_warnings,last_checked_at FROM policies ORDER BY host_id,container_name`, &x)
 	return x, err
 }
 func (s *Store) SavePolicy(ctx context.Context, p Policy) error {
 	if p.CheckIntervalMinutes < 1 {
 		p.CheckIntervalMinutes = 30
 	}
-	return s.exec(ctx, fmt.Sprintf(`INSERT INTO policies(host_id,container_name,mode,check_interval_minutes,release_repo,last_checked_at) VALUES(%d,%s,%s,%d,%s,COALESCE((SELECT last_checked_at FROM policies WHERE host_id=%d AND container_name=%s),'')) ON CONFLICT(host_id,container_name) DO UPDATE SET mode=excluded.mode,check_interval_minutes=excluded.check_interval_minutes,release_repo=excluded.release_repo;`, p.HostID, q(p.ContainerName), q(p.Mode), p.CheckIntervalMinutes, q(p.ReleaseRepo), p.HostID, q(p.ContainerName)))
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO policies(host_id,container_name,mode,check_interval_minutes,release_repo,allow_preflight_warnings,last_checked_at) VALUES(%d,%s,%s,%d,%s,%d,COALESCE((SELECT last_checked_at FROM policies WHERE host_id=%d AND container_name=%s),'')) ON CONFLICT(host_id,container_name) DO UPDATE SET mode=excluded.mode,check_interval_minutes=excluded.check_interval_minutes,release_repo=excluded.release_repo,allow_preflight_warnings=excluded.allow_preflight_warnings;`, p.HostID, q(p.ContainerName), q(p.Mode), p.CheckIntervalMinutes, q(p.ReleaseRepo), b(p.AllowPreflightWarnings), p.HostID, q(p.ContainerName)))
 }
 func (s *Store) TouchPolicy(ctx context.Context, hostID int64, name string) error {
 	return s.exec(ctx, fmt.Sprintf(`UPDATE policies SET last_checked_at=%s WHERE host_id=%d AND container_name=%s;`, q(now()), hostID, q(name)))
@@ -1081,16 +1184,19 @@ func (s *Store) AddRestorePoint(ctx context.Context, x RestorePoint) (int64, err
 		x.Status = "ready"
 	}
 	ts := now()
-	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO restore_points(created_at,updated_at,host_id,container_name,snapshot_id,reason,trigger,status,image_ref,image_id,original_image_ref,original_image_id,target_digest,from_version,unit_kind,unit_key,stack_type,writable_layer,config_protected,volume_data_protected,volume_count,bind_count,restore_count,last_restored_at,last_error,dependency_count,dependencies_json) VALUES(%s,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%s,%d,%s); SELECT last_insert_rowid();`,
-		q(ts), q(ts), x.HostID, q(x.ContainerName), q(x.SnapshotID), q(x.Reason), q(x.Trigger), q(x.Status), q(x.ImageRef), q(x.ImageID), q(x.OriginalImageRef), q(x.OriginalImageID), q(x.TargetDigest), q(x.FromVersion), q(x.UnitKind), q(x.UnitKey), q(x.StackType), b(x.WritableLayer), b(x.ConfigProtected), b(x.VolumeDataProtected), x.VolumeCount, x.BindCount, x.RestoreCount, q(x.LastRestoredAt), q(x.LastError), x.DependencyCount, q(x.DependenciesJSON)))
+	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO restore_points(created_at,updated_at,host_id,container_name,snapshot_id,reason,trigger,status,image_ref,image_id,original_image_ref,original_image_id,target_digest,from_version,unit_kind,unit_key,stack_type,writable_layer,config_protected,volume_data_protected,volume_count,bind_count,restore_count,last_restored_at,last_error,dependency_count,dependencies_json,data_manifest_json,data_bytes) VALUES(%s,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%s,%d,%s,%s,%d); SELECT last_insert_rowid();`,
+		q(ts), q(ts), x.HostID, q(x.ContainerName), q(x.SnapshotID), q(x.Reason), q(x.Trigger), q(x.Status), q(x.ImageRef), q(x.ImageID), q(x.OriginalImageRef), q(x.OriginalImageID), q(x.TargetDigest), q(x.FromVersion), q(x.UnitKind), q(x.UnitKey), q(x.StackType), b(x.WritableLayer), b(x.ConfigProtected), b(x.VolumeDataProtected), x.VolumeCount, x.BindCount, x.RestoreCount, q(x.LastRestoredAt), q(x.LastError), x.DependencyCount, q(x.DependenciesJSON), q(x.DataManifestJSON), x.DataBytes))
 	if err == nil {
-		_ = s.exec(ctx, `DELETE FROM restore_points WHERE id NOT IN (SELECT id FROM restore_points ORDER BY id DESC LIMIT 5000);`)
+		// Only prune already-expired metadata here. Ready/degraded Restore Points may
+		// own host-local images and data archives that must be expired through the
+		// recovery retention pipeline before their database row disappears.
+		_ = s.exec(ctx, `DELETE FROM restore_points WHERE status='expired' AND id NOT IN (SELECT id FROM restore_points ORDER BY id DESC LIMIT 5000);`)
 	}
 	return id, err
 }
 
 func restorePointSelect() string {
-	return `id,created_at,updated_at,host_id,container_name,snapshot_id,reason,trigger,status,image_ref,image_id,original_image_ref,original_image_id,target_digest,from_version,unit_kind,unit_key,stack_type,writable_layer,config_protected,volume_data_protected,volume_count,bind_count,restore_count,last_restored_at,last_error,dependency_count,dependencies_json,integrity_status,integrity_checked_at,integrity_details`
+	return `id,created_at,updated_at,host_id,container_name,snapshot_id,reason,trigger,status,image_ref,image_id,original_image_ref,original_image_id,target_digest,from_version,unit_kind,unit_key,stack_type,writable_layer,config_protected,volume_data_protected,volume_count,bind_count,restore_count,last_restored_at,last_error,dependency_count,dependencies_json,integrity_status,integrity_checked_at,integrity_details,data_manifest_json,data_bytes`
 }
 
 func (s *Store) RestorePoint(ctx context.Context, id int64) (RestorePoint, error) {
@@ -1152,6 +1258,10 @@ func (s *Store) LatestRestorePointsForHost(ctx context.Context, hostID int64) (m
 		}
 	}
 	return out, nil
+}
+
+func (s *Store) DeleteRestorePoint(ctx context.Context, id int64) error {
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM restore_points WHERE id=%d`, id))
 }
 
 func (s *Store) SetRestorePointStatus(ctx context.Context, id int64, status, lastError string) error {
@@ -1234,6 +1344,81 @@ func (s *Store) DeleteRegistryCredential(ctx context.Context, id int64) error {
 	return s.exec(ctx, fmt.Sprintf(`DELETE FROM registry_credentials WHERE id=%d`, id))
 }
 
+func (s *Store) DataProtectionProfile(ctx context.Context, hostID int64, scopeType, scopeKey string) (DataProtectionProfile, error) {
+	var xs []DataProtectionProfile
+	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,scope_type,scope_key,enabled,mounts_json,updated_at FROM data_protection_profiles WHERE host_id=%d AND scope_type=%s AND scope_key=%s LIMIT 1`, hostID, q(scopeType), q(scopeKey)), &xs)
+	if err != nil {
+		return DataProtectionProfile{}, err
+	}
+	if len(xs) == 0 {
+		return DataProtectionProfile{HostID: hostID, ScopeType: scopeType, ScopeKey: scopeKey, MountsJSON: "[]"}, nil
+	}
+	return xs[0], nil
+}
+func (s *Store) DataProtectionProfiles(ctx context.Context, hostID int64) ([]DataProtectionProfile, error) {
+	var xs []DataProtectionProfile
+	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,scope_type,scope_key,enabled,mounts_json,updated_at FROM data_protection_profiles WHERE host_id=%d ORDER BY scope_type,scope_key`, hostID), &xs)
+	if xs == nil {
+		xs = []DataProtectionProfile{}
+	}
+	return xs, err
+}
+func (s *Store) SaveDataProtectionProfile(ctx context.Context, x DataProtectionProfile) error {
+	if strings.TrimSpace(x.MountsJSON) == "" {
+		x.MountsJSON = "[]"
+	}
+	ts := now()
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO data_protection_profiles(host_id,scope_type,scope_key,enabled,mounts_json,updated_at) VALUES(%d,%s,%s,%d,%s,%s) ON CONFLICT(host_id,scope_type,scope_key) DO UPDATE SET enabled=excluded.enabled,mounts_json=excluded.mounts_json,updated_at=excluded.updated_at`, x.HostID, q(x.ScopeType), q(x.ScopeKey), b(x.Enabled), q(x.MountsJSON), q(ts)))
+}
+func (s *Store) DeleteDataProtectionProfile(ctx context.Context, hostID int64, scopeType, scopeKey string) error {
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM data_protection_profiles WHERE host_id=%d AND scope_type=%s AND scope_key=%s`, hostID, q(scopeType), q(scopeKey)))
+}
+func (s *Store) DataMountCache(ctx context.Context, hostID int64, mountKey string) (DataMountCache, error) {
+	var xs []DataMountCache
+	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,mount_key,storage_class,fs_type,checked_at,error,size_bytes,size_checked_at,size_error FROM data_mount_cache WHERE host_id=%d AND mount_key=%s LIMIT 1`, hostID, q(mountKey)), &xs)
+	if err != nil {
+		return DataMountCache{}, err
+	}
+	if len(xs) == 0 {
+		return DataMountCache{HostID: hostID, MountKey: mountKey, StorageClass: "unknown"}, nil
+	}
+	return xs[0], nil
+}
+func (s *Store) SaveDataMountCache(ctx context.Context, x DataMountCache) error {
+	if x.StorageClass == "" {
+		x.StorageClass = "unknown"
+	}
+	if x.CheckedAt == "" {
+		x.CheckedAt = now()
+	}
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO data_mount_cache(host_id,mount_key,storage_class,fs_type,checked_at,error) VALUES(%d,%s,%s,%s,%s,%s) ON CONFLICT(host_id,mount_key) DO UPDATE SET storage_class=excluded.storage_class,fs_type=excluded.fs_type,checked_at=excluded.checked_at,error=excluded.error`, x.HostID, q(x.MountKey), q(x.StorageClass), q(x.FSType), q(x.CheckedAt), q(x.Error)))
+}
+func (s *Store) SaveDataMountSize(ctx context.Context, hostID int64, mountKey string, sizeBytes int64, checkedAt, sizeError string) error {
+	if checkedAt == "" {
+		checkedAt = now()
+	}
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO data_mount_cache(host_id,mount_key,storage_class,fs_type,checked_at,error,size_bytes,size_checked_at,size_error) VALUES(%d,%s,'unknown','','','',%d,%s,%s) ON CONFLICT(host_id,mount_key) DO UPDATE SET size_bytes=excluded.size_bytes,size_checked_at=excluded.size_checked_at,size_error=excluded.size_error`, hostID, q(mountKey), sizeBytes, q(checkedAt), q(sizeError)))
+}
+func (s *Store) InvalidateHostStorageCache(ctx context.Context, hostID int64) error {
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM host_storage_cache WHERE host_id=%d`, hostID))
+}
+func (s *Store) HostStorageCache(ctx context.Context, hostID int64) (HostStorageCache, error) {
+	var xs []HostStorageCache
+	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,host_total_bytes,host_free_bytes,restore_total_bytes,restore_free_bytes,checked_at,error FROM host_storage_cache WHERE host_id=%d LIMIT 1`, hostID), &xs)
+	if err != nil {
+		return HostStorageCache{}, err
+	}
+	if len(xs) == 0 {
+		return HostStorageCache{HostID: hostID}, nil
+	}
+	return xs[0], nil
+}
+func (s *Store) SaveHostStorageCache(ctx context.Context, x HostStorageCache) error {
+	if x.CheckedAt == "" {
+		x.CheckedAt = now()
+	}
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO host_storage_cache(host_id,host_total_bytes,host_free_bytes,restore_total_bytes,restore_free_bytes,checked_at,error) VALUES(%d,%d,%d,%d,%d,%s,%s) ON CONFLICT(host_id) DO UPDATE SET host_total_bytes=excluded.host_total_bytes,host_free_bytes=excluded.host_free_bytes,restore_total_bytes=excluded.restore_total_bytes,restore_free_bytes=excluded.restore_free_bytes,checked_at=excluded.checked_at,error=excluded.error`, x.HostID, x.HostTotalBytes, x.HostFreeBytes, x.RestoreTotalBytes, x.RestoreFreeBytes, q(x.CheckedAt), q(x.Error)))
+}
 func (s *Store) VerificationProfile(ctx context.Context, hostID int64, scopeType, scopeKey string) (VerificationProfile, error) {
 	var x []VerificationProfile
 	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,scope_type,scope_key,enabled,start_delay_seconds,retry_count,retry_interval_seconds,checks_json,created_at,updated_at FROM verification_profiles WHERE host_id=%d AND scope_type=%s AND scope_key=%s LIMIT 1`, hostID, q(scopeType), q(scopeKey)), &x)
@@ -1262,7 +1447,7 @@ func (s *Store) SaveVerificationProfile(ctx context.Context, x VerificationProfi
 	if x.CreatedAt == "" {
 		x.CreatedAt = ts
 	}
-	return s.exec(ctx, fmt.Sprintf(`INSERT INTO verification_profiles(host_id,scope_type,scope_key,enabled,start_delay_seconds,retry_count,retry_interval_seconds,checks_json,created_at,updated_at) VALUES(%d,%s,%s,%d,%d,%d,%d,%s,%s,%s) ON CONFLICT(host_id,scope_type,scope_key) DO UPDATE SET enabled=excluded.enabled,start_delay_seconds=excluded.start_delay_seconds,retry_count=excluded.retry_count,retry_interval_seconds=excluded.retry_interval_seconds,checks_json=excluded.checks_json,updated_at=excluded.updated_at`, x.HostID, q(x.ScopeType), q(x.ScopeKey), b(x.Enabled), x.StartDelaySeconds, x.RetryCount, x.RetryIntervalSeconds, q(x.ChecksJSON), q(x.CreatedAt), q(ts)))
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO verification_profiles(host_id,scope_type,scope_key,enabled,start_delay_seconds,retry_count,retry_interval_seconds,checks_json,created_at,updated_at) VALUES(%d,%s,%s,%d,%d,%d,%d,%s,%s,%s) ON CONFLICT(host_id,scope_type,scope_key) DO UPDATE SET updated_at=CASE WHEN verification_profiles.enabled=excluded.enabled AND verification_profiles.start_delay_seconds=excluded.start_delay_seconds AND verification_profiles.retry_count=excluded.retry_count AND verification_profiles.retry_interval_seconds=excluded.retry_interval_seconds AND verification_profiles.checks_json=excluded.checks_json THEN verification_profiles.updated_at ELSE excluded.updated_at END,enabled=excluded.enabled,start_delay_seconds=excluded.start_delay_seconds,retry_count=excluded.retry_count,retry_interval_seconds=excluded.retry_interval_seconds,checks_json=excluded.checks_json`, x.HostID, q(x.ScopeType), q(x.ScopeKey), b(x.Enabled), x.StartDelaySeconds, x.RetryCount, x.RetryIntervalSeconds, q(x.ChecksJSON), q(x.CreatedAt), q(ts)))
 }
 func (s *Store) DeleteVerificationProfile(ctx context.Context, hostID int64, scopeType, scopeKey string) error {
 	return s.exec(ctx, fmt.Sprintf(`DELETE FROM verification_profiles WHERE host_id=%d AND scope_type=%s AND scope_key=%s`, hostID, q(scopeType), q(scopeKey)))
@@ -1290,14 +1475,40 @@ func (s *Store) SaveVerificationState(ctx context.Context, x VerificationState) 
 	}
 	return s.exec(ctx, fmt.Sprintf(`INSERT INTO verification_state(host_id,container_name,status,details_json,checked_at,error) VALUES(%d,%s,%s,%s,%s,%s) ON CONFLICT(host_id,container_name) DO UPDATE SET status=excluded.status,details_json=excluded.details_json,checked_at=excluded.checked_at,error=excluded.error`, x.HostID, q(x.ContainerName), q(x.Status), q(x.DetailsJSON), q(x.CheckedAt), q(x.Error)))
 }
+func (s *Store) VerificationScopeState(ctx context.Context, hostID int64, scopeType, scopeKey string) (VerificationScopeState, error) {
+	var x []VerificationScopeState
+	err := s.query(ctx, fmt.Sprintf(`SELECT host_id,scope_type,scope_key,status,details_json,checked_at,error FROM verification_scope_state WHERE host_id=%d AND scope_type=%s AND scope_key=%s LIMIT 1`, hostID, q(scopeType), q(scopeKey)), &x)
+	if err != nil {
+		return VerificationScopeState{}, err
+	}
+	if len(x) == 0 {
+		return VerificationScopeState{HostID: hostID, ScopeType: scopeType, ScopeKey: scopeKey, Status: "not_configured", DetailsJSON: "[]"}, nil
+	}
+	return x[0], nil
+}
+func (s *Store) SaveVerificationScopeState(ctx context.Context, x VerificationScopeState) error {
+	if x.Status == "" {
+		x.Status = "not_configured"
+	}
+	if x.DetailsJSON == "" {
+		x.DetailsJSON = "[]"
+	}
+	if x.CheckedAt == "" {
+		x.CheckedAt = now()
+	}
+	return s.exec(ctx, fmt.Sprintf(`INSERT INTO verification_scope_state(host_id,scope_type,scope_key,status,details_json,checked_at,error) VALUES(%d,%s,%s,%s,%s,%s,%s) ON CONFLICT(host_id,scope_type,scope_key) DO UPDATE SET status=excluded.status,details_json=excluded.details_json,checked_at=excluded.checked_at,error=excluded.error`, x.HostID, q(x.ScopeType), q(x.ScopeKey), q(x.Status), q(x.DetailsJSON), q(x.CheckedAt), q(x.Error)))
+}
+func (s *Store) DeleteVerificationScopeState(ctx context.Context, hostID int64, scopeType, scopeKey string) error {
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM verification_scope_state WHERE host_id=%d AND scope_type=%s AND scope_key=%s`, hostID, q(scopeType), q(scopeKey)))
+}
 func (s *Store) UpdateChains(ctx context.Context) ([]UpdateChain, error) {
 	var x []UpdateChain
-	err := s.query(ctx, `SELECT id,name,host_id,automation_id,scope_type,scope_key,policy_mode,stop_on_failure,rollback_completed,created_at,updated_at,last_run_at,last_status FROM update_chains ORDER BY name,id`, &x)
+	err := s.query(ctx, `SELECT id,name,host_id,automation_id,scope_type,scope_key,policy_mode,allow_preflight_warnings,stop_on_failure,rollback_completed,created_at,updated_at,last_run_at,last_status FROM update_chains ORDER BY name,id`, &x)
 	return x, err
 }
 func (s *Store) UpdateChain(ctx context.Context, id int64) (UpdateChain, error) {
 	var x []UpdateChain
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,name,host_id,automation_id,scope_type,scope_key,policy_mode,stop_on_failure,rollback_completed,created_at,updated_at,last_run_at,last_status FROM update_chains WHERE id=%d LIMIT 1`, id), &x)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,name,host_id,automation_id,scope_type,scope_key,policy_mode,allow_preflight_warnings,stop_on_failure,rollback_completed,created_at,updated_at,last_run_at,last_status FROM update_chains WHERE id=%d LIMIT 1`, id), &x)
 	if err != nil {
 		return UpdateChain{}, err
 	}
@@ -1317,9 +1528,9 @@ func (s *Store) SaveUpdateChain(ctx context.Context, x UpdateChain, steps []Upda
 	var id = x.ID
 	var err error
 	if id == 0 {
-		id, err = s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_chains(name,host_id,automation_id,scope_type,scope_key,policy_mode,stop_on_failure,rollback_completed,created_at,updated_at) VALUES(%s,%d,%d,%s,%s,%s,%d,%d,%s,%s); SELECT last_insert_rowid();`, q(x.Name), x.HostID, x.AutomationID, q(x.ScopeType), q(x.ScopeKey), q(x.PolicyMode), b(x.StopOnFailure), b(x.RollbackCompleted), q(ts), q(ts)))
+		id, err = s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_chains(name,host_id,automation_id,scope_type,scope_key,policy_mode,allow_preflight_warnings,stop_on_failure,rollback_completed,created_at,updated_at) VALUES(%s,%d,%d,%s,%s,%s,%d,%d,%d,%s,%s); SELECT last_insert_rowid();`, q(x.Name), x.HostID, x.AutomationID, q(x.ScopeType), q(x.ScopeKey), q(x.PolicyMode), b(x.AllowPreflightWarnings), b(x.StopOnFailure), b(x.RollbackCompleted), q(ts), q(ts)))
 	} else {
-		err = s.exec(ctx, fmt.Sprintf(`UPDATE update_chains SET name=%s,host_id=%d,automation_id=%d,scope_type=%s,scope_key=%s,policy_mode=%s,stop_on_failure=%d,rollback_completed=%d,updated_at=%s WHERE id=%d`, q(x.Name), x.HostID, x.AutomationID, q(x.ScopeType), q(x.ScopeKey), q(x.PolicyMode), b(x.StopOnFailure), b(x.RollbackCompleted), q(ts), id))
+		err = s.exec(ctx, fmt.Sprintf(`UPDATE update_chains SET name=%s,host_id=%d,automation_id=%d,scope_type=%s,scope_key=%s,policy_mode=%s,allow_preflight_warnings=%d,stop_on_failure=%d,rollback_completed=%d,updated_at=%s WHERE id=%d`, q(x.Name), x.HostID, x.AutomationID, q(x.ScopeType), q(x.ScopeKey), q(x.PolicyMode), b(x.AllowPreflightWarnings), b(x.StopOnFailure), b(x.RollbackCompleted), q(ts), id))
 	}
 	if err != nil {
 		return 0, err
@@ -1354,11 +1565,32 @@ func (s *Store) TouchUpdateChain(ctx context.Context, id int64, status string) e
 	return s.exec(ctx, fmt.Sprintf(`UPDATE update_chains SET last_run_at=%s,last_status=%s,updated_at=%s WHERE id=%d`, q(now()), q(status), q(now()), id))
 }
 func (s *Store) CreateUpdateChainRun(ctx context.Context, x UpdateChainRun) (int64, error) {
-	return s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_chain_runs(chain_id,chain_name,host_id,trigger,actor,status,started_at) VALUES(%d,%s,%d,%s,%s,%s,%s); SELECT last_insert_rowid();`, x.ChainID, q(x.ChainName), x.HostID, q(x.Trigger), q(x.Actor), q(x.Status), q(now())))
+	return s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_chain_runs(chain_id,chain_name,host_id,job_id,trigger,actor,status,recovery_action,recovered_at,started_at) VALUES(%d,%s,%d,%d,%s,%s,%s,%s,%s,%s); SELECT last_insert_rowid();`, x.ChainID, q(x.ChainName), x.HostID, x.JobID, q(x.Trigger), q(x.Actor), q(x.Status), q(x.RecoveryAction), q(x.RecoveredAt), q(now())))
 }
 func (s *Store) FinishUpdateChainRun(ctx context.Context, id int64, status, errText string) error {
 	return s.exec(ctx, fmt.Sprintf(`UPDATE update_chain_runs SET status=%s,finished_at=%s,error=%s WHERE id=%d`, q(status), q(now()), q(errText), id))
 }
+func (s *Store) SetUpdateChainRunRecovery(ctx context.Context, id int64, status, action, errText string, finished bool) error {
+	fin := ""
+	recovered := ""
+	if finished {
+		fin = now()
+		recovered = fin
+	}
+	return s.exec(ctx, fmt.Sprintf(`UPDATE update_chain_runs SET status=%s,recovery_action=%s,recovered_at=CASE WHEN %s='' THEN recovered_at ELSE %s END,finished_at=CASE WHEN %s='' THEN finished_at ELSE %s END,error=%s WHERE id=%d`, q(status), q(action), q(recovered), q(recovered), q(fin), q(fin), q(errText), id))
+}
+func (s *Store) UpdateChainRun(ctx context.Context, id int64) (UpdateChainRun, error) {
+	var x []UpdateChainRun
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,chain_id,chain_name,host_id,job_id,trigger,actor,status,recovery_action,recovered_at,started_at,finished_at,error FROM update_chain_runs WHERE id=%d LIMIT 1`, id), &x)
+	if err != nil {
+		return UpdateChainRun{}, err
+	}
+	if len(x) == 0 {
+		return UpdateChainRun{}, fmt.Errorf("update chain run %d not found", id)
+	}
+	return x[0], nil
+}
+
 func (s *Store) UpdateChainRuns(ctx context.Context, chainID int64, limit int) ([]UpdateChainRun, error) {
 	if limit < 1 || limit > 500 {
 		limit = 100
@@ -1368,7 +1600,12 @@ func (s *Store) UpdateChainRuns(ctx context.Context, chainID int64, limit int) (
 		where = fmt.Sprintf("chain_id=%d", chainID)
 	}
 	var x []UpdateChainRun
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,chain_id,chain_name,host_id,trigger,actor,status,started_at,finished_at,error FROM update_chain_runs WHERE %s ORDER BY id DESC LIMIT %d`, where, limit), &x)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,chain_id,chain_name,host_id,job_id,trigger,actor,status,recovery_action,recovered_at,started_at,finished_at,error FROM update_chain_runs WHERE %s ORDER BY id DESC LIMIT %d`, where, limit), &x)
+	return x, err
+}
+func (s *Store) ActiveUpdateChainRuns(ctx context.Context) ([]UpdateChainRun, error) {
+	var x []UpdateChainRun
+	err := s.query(ctx, `SELECT id,chain_id,chain_name,host_id,job_id,trigger,actor,status,recovery_action,recovered_at,started_at,finished_at,error FROM update_chain_runs WHERE status IN ('queued','running','recovering','recovery_required') ORDER BY id`, &x)
 	return x, err
 }
 func (s *Store) AddUpdateChainRunStep(ctx context.Context, x UpdateChainRunStep) (int64, error) {
@@ -1633,12 +1870,12 @@ func (s *Store) SaveVersion(ctx context.Context, v VersionInfo) error {
 
 func (s *Store) Automations(ctx context.Context) ([]Automation, error) {
 	var x []Automation
-	err := s.query(ctx, `SELECT id,name,cron,target_type,target_id,enabled,last_run_at FROM automations ORDER BY name`, &x)
+	err := s.query(ctx, `SELECT id,name,cron,target_type,target_id,kind,cleanup_images,cleanup_networks,cleanup_build_cache,cleanup_volumes,enabled,last_run_at FROM automations ORDER BY name`, &x)
 	return x, err
 }
 func (s *Store) Automation(ctx context.Context, id int64) (Automation, error) {
 	var x []Automation
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,name,cron,target_type,target_id,enabled,last_run_at FROM automations WHERE id=%d LIMIT 1`, id), &x)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,name,cron,target_type,target_id,kind,cleanup_images,cleanup_networks,cleanup_build_cache,cleanup_volumes,enabled,last_run_at FROM automations WHERE id=%d LIMIT 1`, id), &x)
 	if err != nil {
 		return Automation{}, err
 	}
@@ -1648,10 +1885,13 @@ func (s *Store) Automation(ctx context.Context, id int64) (Automation, error) {
 	return x[0], nil
 }
 func (s *Store) SaveAutomation(ctx context.Context, x Automation) (int64, error) {
-	if x.ID == 0 {
-		return s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO automations(name,cron,target_type,target_id,enabled,last_run_at) VALUES(%s,%s,%s,%d,%d,%s); SELECT last_insert_rowid();`, q(x.Name), q(x.Cron), q(x.TargetType), x.TargetID, b(x.Enabled), q(x.LastRunAt)))
+	if strings.TrimSpace(x.Kind) == "" {
+		x.Kind = "policy"
 	}
-	err := s.exec(ctx, fmt.Sprintf(`UPDATE automations SET name=%s,cron=%s,target_type=%s,target_id=%d,enabled=%d WHERE id=%d`, q(x.Name), q(x.Cron), q(x.TargetType), x.TargetID, b(x.Enabled), x.ID))
+	if x.ID == 0 {
+		return s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO automations(name,cron,target_type,target_id,kind,cleanup_images,cleanup_networks,cleanup_build_cache,cleanup_volumes,enabled,last_run_at) VALUES(%s,%s,%s,%d,%s,%d,%d,%d,%d,%d,%s); SELECT last_insert_rowid();`, q(x.Name), q(x.Cron), q(x.TargetType), x.TargetID, q(x.Kind), b(x.CleanupImages), b(x.CleanupNetworks), b(x.CleanupBuildCache), b(x.CleanupVolumes), b(x.Enabled), q(x.LastRunAt)))
+	}
+	err := s.exec(ctx, fmt.Sprintf(`UPDATE automations SET name=%s,cron=%s,target_type=%s,target_id=%d,kind=%s,cleanup_images=%d,cleanup_networks=%d,cleanup_build_cache=%d,cleanup_volumes=%d,enabled=%d WHERE id=%d`, q(x.Name), q(x.Cron), q(x.TargetType), x.TargetID, q(x.Kind), b(x.CleanupImages), b(x.CleanupNetworks), b(x.CleanupBuildCache), b(x.CleanupVolumes), b(x.Enabled), x.ID))
 	return x.ID, err
 }
 func (s *Store) DeleteAutomation(ctx context.Context, id int64) error {

@@ -2,9 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +44,124 @@ func TestVerificationTCP(t *testing.T) {
 	got := a.executeVerificationCheck(context.Background(), VerificationCheck{Type: "tcp", Host: "127.0.0.1", Port: addr.Port, TimeoutSeconds: 2})
 	if got.Status != verificationStatusVerified {
 		t.Fatalf("expected verified TCP check, got %#v", got)
+	}
+}
+
+func TestManualVerificationPersistsCurrentStateAndHistory(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not available")
+	}
+	ctx := context.Background()
+	store := db.New(filepath.Join(t.TempDir(), "vibewatch.db"))
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	hostID, err := store.CreateHost(ctx, "test", "tcp://docker:2375", "token", db.Bool(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("upsnap-ready"))
+	}))
+	defer srv.Close()
+	checks, _ := json.Marshal([]VerificationCheck{{Type: "http", URL: srv.URL, ExpectedStatus: http.StatusOK, ExpectedContent: "ready", TimeoutSeconds: 2}})
+	if err := store.SaveVerificationProfile(ctx, db.VerificationProfile{HostID: hostID, ScopeType: "container", ScopeKey: "upsnap", Enabled: db.Bool(true), RetryCount: 0, RetryIntervalSeconds: 0, ChecksJSON: string(checks)}); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{Store: store, Logger: slog.Default()}
+	result := a.runCustomVerification(ctx, hostID, "upsnap", "manual-test", "owner", 0)
+	if result.Status != verificationStatusVerified {
+		t.Fatalf("manual verification should pass, got %#v", result)
+	}
+	state, err := store.VerificationState(ctx, hostID, "upsnap")
+	if err != nil || state.Status != verificationStatusVerified || state.CheckedAt == "" {
+		t.Fatalf("unexpected verification state: %#v err=%v", state, err)
+	}
+	history, err := store.VerificationHistory(ctx, hostID, "upsnap", 10)
+	if err != nil || len(history) != 1 || history[0].Trigger != "manual-test" || history[0].Status != verificationStatusVerified {
+		t.Fatalf("unexpected verification history: %#v err=%v", history, err)
+	}
+
+	// The effective profile must not appear newer than a verification that was
+	// executed immediately after saving it. Verification timestamps therefore
+	// retain sub-second precision.
+	profile, err := a.effectiveVerificationProfile(ctx, hostID, "upsnap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presented := verificationStateForProfile(profile, state); presented.Status != verificationStatusVerified {
+		t.Fatalf("fresh verification must present as verified, got %#v (profile updated_at=%s state checked_at=%s)", presented, profile.UpdatedAt, state.CheckedAt)
+	}
+
+	// Saving the exact same profile again is not a configuration change and
+	// must not invalidate an already successful verification result.
+	before, err := store.VerificationProfile(ctx, hostID, "container", "upsnap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveVerificationProfile(ctx, before); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.VerificationProfile(ctx, hostID, "container", "upsnap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("identical profile save changed updated_at: before=%s after=%s", before.UpdatedAt, after.UpdatedAt)
+	}
+	profile = verificationProfileView(after, false)
+	if presented := verificationStateForProfile(profile, state); presented.Status != verificationStatusVerified {
+		t.Fatalf("identical profile save must keep verification valid, got %#v", presented)
+	}
+
+	// A real profile change still invalidates the previous result.
+	time.Sleep(2 * time.Millisecond)
+	after.RetryCount++
+	if err := store.SaveVerificationProfile(ctx, after); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.VerificationProfile(ctx, hostID, "container", "upsnap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.UpdatedAt == after.UpdatedAt {
+		t.Fatal("changed profile did not advance updated_at")
+	}
+	profile = verificationProfileView(changed, false)
+	if presented := verificationStateForProfile(profile, state); presented.Status != "pending" {
+		t.Fatalf("changed profile must invalidate old verification result, got %#v", presented)
+	}
+}
+
+func TestStackVerificationStateIsSharedAcrossMembers(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not available")
+	}
+	ctx := context.Background()
+	store := db.New(filepath.Join(t.TempDir(), "vibewatch.db"))
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	profile := VerificationProfileView{HostID: 1, ScopeType: "stack", ScopeKey: "immich", Enabled: true, Configured: true}
+	a := &App{Store: store, Logger: slog.Default()}
+	if err := a.saveVerificationStateForProfile(ctx, profile, 1, "immich_server", verificationStatusVerified, `[]`, "2026-08-13T20:20:00.123456789Z", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := a.effectiveVerificationState(ctx, 1, "immich_server", profile)
+	postgres := a.effectiveVerificationState(ctx, 1, "immich_postgres", profile)
+	if server.Status != verificationStatusVerified || postgres.Status != verificationStatusVerified {
+		t.Fatalf("stack members must share verification state: server=%#v postgres=%#v", server, postgres)
+	}
+	if postgres.ScopeType != "stack" || postgres.ScopeKey != "immich" || postgres.ContainerName != "immich_postgres" {
+		t.Fatalf("shared state must retain stack scope while projecting to member: %#v", postgres)
+	}
+	legacy, err := store.VerificationState(ctx, 1, "immich_server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Status == verificationStatusVerified {
+		t.Fatalf("stack verification must not be persisted as a container-only state: %#v", legacy)
 	}
 }
 

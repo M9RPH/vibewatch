@@ -89,3 +89,6 @@ temp/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Internal development/context documentation
+.vibewatch-internal/

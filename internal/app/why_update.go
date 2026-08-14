@@ -31,7 +31,7 @@ type updateWhyResponse struct {
 }
 
 func (a *App) automationTargetsHost(ctx context.Context, automation db.Automation, hostID int64) bool {
-	if !bool(automation.Enabled) {
+	if normalizeAutomationKind(automation.Kind) != "policy" || !bool(automation.Enabled) {
 		return false
 	}
 	switch automation.TargetType {
@@ -153,6 +153,11 @@ func (a *App) handleWhyUpdate(w http.ResponseWriter, r *http.Request, hostID int
 			}
 			add("yellow", "Chain policy · Manual", "Automatic installation is disabled for this stack.")
 		case "auto":
+			if cm.AllowPreflightWarnings {
+				add("yellow", "Preflight safety · advisory warnings allowed", "Critical warnings and blockers still require manual approval.")
+			} else {
+				add("green", "Preflight safety · clean required", "Any Preflight warning holds the automatic chain before update execution.")
+			}
 			if cm.AutomationID <= 0 {
 				res.Status = "blocked"
 				res.Summary = "The Stack Chain is Auto Update but has no Policy Run assigned."
@@ -182,6 +187,11 @@ func (a *App) handleWhyUpdate(w http.ResponseWriter, r *http.Request, hostID int
 			}
 			add("yellow", "Policy · Manual", "Automatic installation is disabled.")
 		case "auto":
+			if bool(p.AllowPreflightWarnings) {
+				add("yellow", "Preflight safety · advisory warnings allowed", "Critical warnings and blockers still require manual approval.")
+			} else {
+				add("green", "Preflight safety · clean required", "Any Preflight warning holds the automatic update before execution.")
+			}
 			if au, ok := a.enabledAutomationForHost(r.Context(), hostID); !ok {
 				res.Status = "blocked"
 				res.Summary = "Auto Update is enabled, but no active Policy Run targets this host."
@@ -235,13 +245,29 @@ func (a *App) handleWhyUpdate(w http.ResponseWriter, r *http.Request, hostID int
 		add("green", "Image is current", fmt.Sprintf("Last checked %s", cache.LastCheckedAt))
 	}
 
+	if cm, ok := a.stackChainForMember(r.Context(), hostID, container); ok && cm.PolicyMode == "auto" && cm.LastStatus == "blocked" && bool(cache.UpdateAvailable) && !cacheHasSnoozedUpdate(cache) {
+		add("yellow", "Last automatic chain was held by Preflight", fmt.Sprintf("%s · review Chain history for the blocked step.", cm.ChainName))
+		res.Status = "held"
+		res.Summary = "The latest automatic chain run was safely held by Preflight."
+		res.NextAction = "Open Update Chains, review the held run, then use Run Now for a one-time manual approval."
+	}
+
 	history, _ := a.Store.UpdateHistory(r.Context(), 1, hostID, container)
 	if len(history) > 0 && history[0].PreflightStatus == "blocked" {
-		add("red", "Last update attempt was blocked by Preflight", firstNonEmpty(history[0].Error, history[0].PreflightDetails))
-		if bool(cache.UpdateAvailable) && res.Status != "snoozed" {
-			res.Status = "blocked"
-			res.Summary = "The latest update attempt was blocked by Preflight."
-			res.NextAction = "Open the update Preflight details and resolve the red check before retrying."
+		if history[0].Status == "skipped" {
+			add("yellow", "Last Auto Update was held by Preflight", firstNonEmpty(history[0].Error, history[0].PreflightDetails))
+			if bool(cache.UpdateAvailable) && res.Status != "snoozed" {
+				res.Status = "held"
+				res.Summary = "The latest automatic update was safely held by Preflight."
+				res.NextAction = "Review the warning, then run Update manually for a one-time approval; only allow advisory warnings if this risk should be accepted automatically."
+			}
+		} else {
+			add("red", "Last update attempt was blocked by Preflight", firstNonEmpty(history[0].Error, history[0].PreflightDetails))
+			if bool(cache.UpdateAvailable) && res.Status != "snoozed" {
+				res.Status = "blocked"
+				res.Summary = "The latest update attempt was blocked by Preflight."
+				res.NextAction = "Open the update Preflight details and resolve the red check before retrying."
+			}
 		}
 	}
 	writeJSON(w, 200, res)
