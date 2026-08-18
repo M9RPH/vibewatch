@@ -2,6 +2,25 @@
 
 All notable public changes to Vibewatch are documented here.
 
+## 1.0.2
+
+### Update Chains live transaction UI
+
+- Rebuilt **Run now → Chain Preflight** with the Web UI v2 live transaction design used by SSH Quick Setup and container updates.
+- Chain Preflight now exposes real backend progress per member instead of a static waiting dialog.
+- Advisory warnings and blockers stay attached to the exact chain member that produced them.
+- After approval, the Chain execution window follows every configured member live through checking, updating, restart/recreate, verification, failure and recovery states.
+- Preflight warnings remain visible during Chain execution so the operator keeps the original safety context.
+
+## 1.0.1
+
+### Fixed
+
+- Fixed a Web UI v2 interaction bug in the Update Chain editor where the portaled Policy dropdown could be visible above the dialog while clicks were handled by a switch underneath.
+- Policy menus now portal into the active dialog content when opened from a modal, retain fixed viewport positioning to avoid clipping, and explicitly own pointer interaction.
+- Containers-table policy dropdown behavior remains unchanged through the normal body-portal fallback.
+
+
 ## 1.0.0
 
 ### Release milestone

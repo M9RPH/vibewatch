@@ -17,7 +17,7 @@ RUN VIBEWATCH_VERSION="$(cat VERSION)" && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/vibewatch-dev-updater ./cmd/devupdater
 
 FROM alpine:3.20
-ARG VIBEWATCH_VERSION=1.0.0
+ARG VIBEWATCH_VERSION=1.0.2
 LABEL org.opencontainers.image.title="Vibewatch" \
       org.opencontainers.image.version="$VIBEWATCH_VERSION" \
       org.opencontainers.image.description="Self-hosted Docker update and recovery platform" \

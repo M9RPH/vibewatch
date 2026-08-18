@@ -1,41 +1,15 @@
-# Vibewatch v1.0.0
+# Vibewatch v1.0.2
 
-Vibewatch v1.0.0 is the first stable public release of the project.
+v1.0.2 modernizes the complete manual Update Chain workflow.
 
 ## Highlights
 
-- New **Web UI v2** with the final Vibewatch design language.
-- Live staged inspectors for **Preflight**, **SSH Quick Setup**, **container updates** and **rollbacks**.
-- Hardened **SSH Quick Setup** for legacy TCP and managed mTLS, including transactional rollback and richer diagnostics.
-- Improved **Container Inspector** with service icons, update classification and direct safety actions.
-- Owner-only **Developer Updater** for applying development ZIP packages from the UI.
-- Persistent notification read-state and navigation from notifications to the relevant object.
-- Public GitHub release layout with updated docs, screenshots, CI and container publishing.
+- **Run now** opens a Web UI v2 live Chain Preflight immediately.
+- Every chain member is shown as an individual animated stage.
+- Advisory warnings and hard blockers are displayed on the member that produced them.
+- The backend publishes real Preflight member progress for the open inspector.
+- Starting the approved Chain transitions into a live Chain transaction window.
+- Member states include checking, updating, restarting, recreating, verified, blocked, failed, rolled back and recovery-required outcomes.
+- Warnings discovered during the preview remain visible while the Chain runs.
 
-## Upgrade
-
-The database migration path remains additive. Existing hosts, policies, Update Chains, verification profiles, restore points and history remain compatible.
-
-```bash
-docker compose pull
-docker compose up -d
-```
-
-The release Compose file is pinned to:
-
-```text
-ghcr.io/m9rph/vibewatch:1.0.0
-```
-
-## Distribution
-
-Vibewatch can be installed without cloning the source tree.
-
-```bash
-mkdir -p vibewatch && cd vibewatch
-curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.0/compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.0/.env.example
-nano .env
-docker compose pull
-docker compose up -d
-```
+The Update Chain execution engine and its safety rules are unchanged; this release makes the existing behavior observable through the Web UI v2 transaction language.

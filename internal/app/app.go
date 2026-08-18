@@ -41,35 +41,37 @@ type Config struct {
 	ProjectDir       string
 }
 type App struct {
-	Cfg           Config
-	Store         *db.Store
-	Docker        *dockercli.Client
-	WT            *watchtower.Client
-	Releases      *releases.GitHubClient
-	Registry      *registry.Client
-	Pushover      *notify.Pushover
-	SSH           *sshsetup.Client
-	Logger        *slog.Logger
-	Auth          *auth.Manager
-	Events        *dockercli.EventWatcher
-	Queue         chan updateRequest
-	ctx           context.Context
-	cancel        context.CancelFunc
-	ensureMu      sync.Mutex
-	ensureLocks   map[int64]*sync.Mutex
-	workerOpMu    sync.RWMutex
-	maintenanceMu sync.Mutex
-	infoRefreshMu sync.Mutex
-	infoRefresh   map[string]bool
-	registryMu    sync.Mutex
-	registryKey   []byte
-	hostHealthMu  sync.Mutex
-	hostHealth    map[int64]hostHealthState
-	hostHealthRun map[int64]bool
-	quickSetupMu  sync.Mutex
-	quickSetupOps map[string]quickSetupProgress
-	chainMu       sync.Mutex
-	chainReserved map[string]int64
+	Cfg               Config
+	Store             *db.Store
+	Docker            *dockercli.Client
+	WT                *watchtower.Client
+	Releases          *releases.GitHubClient
+	Registry          *registry.Client
+	Pushover          *notify.Pushover
+	SSH               *sshsetup.Client
+	Logger            *slog.Logger
+	Auth              *auth.Manager
+	Events            *dockercli.EventWatcher
+	Queue             chan updateRequest
+	ctx               context.Context
+	cancel            context.CancelFunc
+	ensureMu          sync.Mutex
+	ensureLocks       map[int64]*sync.Mutex
+	workerOpMu        sync.RWMutex
+	maintenanceMu     sync.Mutex
+	infoRefreshMu     sync.Mutex
+	infoRefresh       map[string]bool
+	registryMu        sync.Mutex
+	registryKey       []byte
+	hostHealthMu      sync.Mutex
+	hostHealth        map[int64]hostHealthState
+	hostHealthRun     map[int64]bool
+	quickSetupMu      sync.Mutex
+	quickSetupOps     map[string]quickSetupProgress
+	chainPreflightMu  sync.Mutex
+	chainPreflightOps map[string]ChainPreflightProgress
+	chainMu           sync.Mutex
+	chainReserved     map[string]int64
 }
 type updateRequest struct {
 	JobID                     int64
@@ -259,7 +261,7 @@ type quickSetupProgress struct {
 
 func New(cfg Config, store *db.Store, docker *dockercli.Client, wt *watchtower.Client, gh *releases.GitHubClient, reg *registry.Client, po *notify.Pushover, ssh *sshsetup.Client, logger *slog.Logger, authm *auth.Manager) *App {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}, ensureLocks: map[int64]*sync.Mutex{}, hostHealth: map[int64]hostHealthState{}, hostHealthRun: map[int64]bool{}, quickSetupOps: map[string]quickSetupProgress{}, chainReserved: map[string]int64{}}
+	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}, ensureLocks: map[int64]*sync.Mutex{}, hostHealth: map[int64]hostHealthState{}, hostHealthRun: map[int64]bool{}, quickSetupOps: map[string]quickSetupProgress{}, chainPreflightOps: map[string]ChainPreflightProgress{}, chainReserved: map[string]int64{}}
 }
 func remoteDockerEndpoint(endpoint string) bool {
 	v := strings.ToLower(strings.TrimSpace(endpoint))

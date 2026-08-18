@@ -48,6 +48,51 @@ type ChainPreflightPlanView struct {
 	Steps     []ChainPreflightStepView `json:"steps"`
 }
 
+type ChainPreflightProgress struct {
+	OperationID     string                   `json:"operation_id"`
+	ChainID         int64                    `json:"chain_id"`
+	ChainName       string                   `json:"chain_name"`
+	HostID          int64                    `json:"host_id"`
+	Status          string                   `json:"status"`
+	Stage           string                   `json:"stage"`
+	Message         string                   `json:"message"`
+	CurrentPosition int                      `json:"current_position"`
+	Total           int                      `json:"total"`
+	Steps           []ChainPreflightStepView `json:"steps"`
+	UpdatedAt       string                   `json:"updated_at"`
+}
+
+func (a *App) setChainPreflightProgress(progress ChainPreflightProgress) {
+	id := strings.TrimSpace(progress.OperationID)
+	if !validQuickSetupOperationID(id) {
+		return
+	}
+	now := time.Now().UTC()
+	progress.OperationID = id
+	progress.UpdatedAt = now.Format(time.RFC3339Nano)
+	progress.Steps = append([]ChainPreflightStepView(nil), progress.Steps...)
+	a.chainPreflightMu.Lock()
+	defer a.chainPreflightMu.Unlock()
+	if a.chainPreflightOps == nil {
+		a.chainPreflightOps = map[string]ChainPreflightProgress{}
+	}
+	for key, item := range a.chainPreflightOps {
+		ts, err := time.Parse(time.RFC3339Nano, item.UpdatedAt)
+		if err == nil && now.Sub(ts) > 20*time.Minute {
+			delete(a.chainPreflightOps, key)
+		}
+	}
+	a.chainPreflightOps[id] = progress
+}
+
+func (a *App) chainPreflightProgress(id string) (ChainPreflightProgress, bool) {
+	a.chainPreflightMu.Lock()
+	defer a.chainPreflightMu.Unlock()
+	v, ok := a.chainPreflightOps[strings.TrimSpace(id)]
+	v.Steps = append([]ChainPreflightStepView(nil), v.Steps...)
+	return v, ok
+}
+
 type ChainManagementView struct {
 	ChainID                int64  `json:"chain_id"`
 	ChainName              string `json:"chain_name"`
@@ -446,7 +491,7 @@ func (a *App) handleUpdateChainRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor string) (ChainPreflightPlanView, error) {
+func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor, operationID string) (ChainPreflightPlanView, error) {
 	chain, err := a.Store.UpdateChain(ctx, chainID)
 	if err != nil {
 		return ChainPreflightPlanView{}, err
@@ -474,9 +519,19 @@ func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor strin
 		return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: chain policy is Excluded")
 	}
 
+	progress := ChainPreflightProgress{OperationID: operationID, ChainID: chain.ID, ChainName: chain.Name, HostID: chain.HostID, Status: "running", Stage: "prepare", Message: "Preparing the chain plan and checking member update state.", Total: len(steps), Steps: []ChainPreflightStepView{}}
+	if operationID != "" {
+		a.setChainPreflightProgress(progress)
+	}
 	plan := ChainPreflightPlanView{ChainID: chain.ID, ChainName: chain.Name, HostID: chain.HostID, Status: "ready", Steps: make([]ChainPreflightStepView, 0, len(steps))}
 	for _, st := range steps {
 		step := ChainPreflightStepView{Position: st.Position, ContainerName: st.ContainerName, Status: "checking", Checks: []PreflightCheck{}}
+		if operationID != "" {
+			progress.Stage = "member"
+			progress.CurrentPosition = st.Position
+			progress.Message = fmt.Sprintf("Checking %s (%d of %d).", st.ContainerName, st.Position, len(steps))
+			a.setChainPreflightProgress(progress)
+		}
 		checkCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 		_, _, checkErr := a.check(checkCtx, chain.HostID, st.ContainerName, fmt.Sprintf("chain-preview:%d", chain.ID))
 		cancel()
@@ -488,6 +543,11 @@ func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor strin
 			plan.Blocked++
 			plan.Status = "blocked"
 			plan.Steps = append(plan.Steps, step)
+			if operationID != "" {
+				progress.Steps = append([]ChainPreflightStepView(nil), plan.Steps...)
+				progress.Message = fmt.Sprintf("%s is blocked because its update state could not be checked.", st.ContainerName)
+				a.setChainPreflightProgress(progress)
+			}
 			continue
 		}
 		cache, _ := a.Store.Cache(ctx, chain.HostID, st.ContainerName)
@@ -497,16 +557,28 @@ func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor strin
 			step.Status = "snoozed"
 			step.Summary = "Available update is snoozed"
 			plan.Steps = append(plan.Steps, step)
+			if operationID != "" {
+				progress.Steps = append([]ChainPreflightStepView(nil), plan.Steps...)
+				a.setChainPreflightProgress(progress)
+			}
 			continue
 		}
 		if !step.UpdateAvailable {
 			step.Status = "current"
 			step.Summary = "No update available"
 			plan.Steps = append(plan.Steps, step)
+			if operationID != "" {
+				progress.Steps = append([]ChainPreflightStepView(nil), plan.Steps...)
+				a.setChainPreflightProgress(progress)
+			}
 			continue
 		}
 
 		plan.Updates++
+		if operationID != "" {
+			progress.Message = fmt.Sprintf("Running safety checks for %s.", st.ContainerName)
+			a.setChainPreflightProgress(progress)
+		}
 		preflight, _ := a.runUpdatePreflight(ctx, updateRequest{HostID: chain.HostID, Container: st.ContainerName, Trigger: fmt.Sprintf("chain-preview:%d", chain.ID), Actor: actor}, false)
 		step.Status = preflight.Status
 		step.Warnings = preflight.Warnings
@@ -521,9 +593,22 @@ func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor strin
 			plan.Status = "ready_with_warnings"
 		}
 		plan.Steps = append(plan.Steps, step)
+		if operationID != "" {
+			progress.Steps = append([]ChainPreflightStepView(nil), plan.Steps...)
+			progress.Message = fmt.Sprintf("Preflight finished for %s.", st.ContainerName)
+			a.setChainPreflightProgress(progress)
+		}
 	}
 	if plan.Updates == 0 && plan.Blocked == 0 {
 		plan.Status = "no_updates"
+	}
+	if operationID != "" {
+		progress.Status = "completed"
+		progress.Stage = "decision"
+		progress.CurrentPosition = len(steps)
+		progress.Steps = append([]ChainPreflightStepView(nil), plan.Steps...)
+		progress.Message = fmt.Sprintf("Chain Preflight finished: %s.", strings.ReplaceAll(plan.Status, "_", " "))
+		a.setChainPreflightProgress(progress)
 	}
 	return plan, nil
 }
@@ -564,9 +649,36 @@ func (a *App) handleUpdateChainSubroutes(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
+	if len(parts) == 3 && parts[1] == "preflight" && parts[2] == "progress" && r.Method == http.MethodGet {
+		opID := strings.TrimSpace(r.URL.Query().Get("id"))
+		if !validQuickSetupOperationID(opID) {
+			writeErr(w, 400, "invalid chain preflight operation id")
+			return
+		}
+		progress, ok := a.chainPreflightProgress(opID)
+		if !ok || progress.ChainID != id {
+			writeErr(w, 404, "chain preflight operation not found")
+			return
+		}
+		writeJSON(w, 200, progress)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "preflight" && r.Method == http.MethodPost {
-		plan, err := a.previewUpdateChain(r.Context(), id, a.actor(r))
+		opID := strings.TrimSpace(r.URL.Query().Get("operation_id"))
+		if opID != "" && !validQuickSetupOperationID(opID) {
+			writeErr(w, 400, "invalid chain preflight operation id")
+			return
+		}
+		plan, err := a.previewUpdateChain(r.Context(), id, a.actor(r), opID)
 		if err != nil {
+			if opID != "" {
+				if progress, ok := a.chainPreflightProgress(opID); ok {
+					progress.Status = "failed"
+					progress.Stage = "decision"
+					progress.Message = err.Error()
+					a.setChainPreflightProgress(progress)
+				}
+			}
 			writeErr(w, 409, err.Error())
 			return
 		}

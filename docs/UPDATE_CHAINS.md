@@ -24,6 +24,8 @@ Each actual update step still repeats the normal Preflight immediately before it
 
 Manual `Run Now` displays the Chain Preflight review before execution. Advisory warnings can be accepted for that one run; hard blockers cannot be overridden.
 
+In v1.0.2 this review uses the staged Web UI v2 transaction inspector. Each member progresses independently through the review, and warnings/blockers are shown directly under the member that produced them. Once approved, the same transaction language continues through the live Chain run so the current member and failure point remain visible.
+
 ## Verification
 
 After each actual update/recreate, Docker health/running-state and the effective Custom/Stack Verification are evaluated before the Chain proceeds.
