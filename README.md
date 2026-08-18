@@ -49,6 +49,21 @@ Initial Owner login:
 - [Changelog](CHANGELOG.md)
 - [Release notes](RELEASE_NOTES.md)
 
+
+## Screenshots
+
+A few current **Web UI v2** views:
+
+| Dashboard | Containers |
+| --- | --- |
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Containers](docs/screenshots/containers.png) |
+
+| Hosts | Update Chains |
+| --- | --- |
+| ![Hosts](docs/screenshots/hosts.png) | ![Update Chains](docs/screenshots/update-chains.png) |
+
+More screenshots: [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md)
+
 ## License
 
 [MIT](LICENSE)
