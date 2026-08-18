@@ -285,7 +285,10 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 		// remote ARM host look compatible merely because Vibewatch runs on amd64
 		// (or vice versa). We can still prove registry/manifest reachability, but
 		// architecture compatibility is a safety-critical red check.
-		regCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 20*time.Second, 35*time.Second))
+		// Registry requests are globally coordinated and automatically back off on
+		// HTTP 429. Leave enough room for those retries instead of turning a short
+		// provider rate limit into an immediate failed preflight.
+		regCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 45*time.Second, 60*time.Second))
 		digest, regErr := a.Registry.RemoteDigest(regCtx, imageRef)
 		cancel()
 		if regErr != nil {
@@ -295,7 +298,7 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 		}
 		result.add("architecture", preflightRed, "Host architecture not verified", "Vibewatch could not determine the target Docker host architecture, so image compatibility cannot be proven safely.", "")
 	} else {
-		regCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 20*time.Second, 35*time.Second))
+		regCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 45*time.Second, 60*time.Second))
 		remote, regErr := a.Registry.RemoteStateForPlatform(regCtx, imageRef, platform)
 		cancel()
 		if regErr != nil {
@@ -490,7 +493,7 @@ func (a *App) handleUpdatePreflight(w http.ResponseWriter, r *http.Request, host
 		writeErr(w, 409, "Vibewatch system containers are maintained from Owner Settings")
 		return
 	}
-	if cm, chainManaged := a.stackChainForMember(r.Context(), hostID, container); chainManaged {
+	if cm, chainManaged := a.chainForMember(r.Context(), hostID, container); chainManaged {
 		writeErr(w, 409, fmt.Sprintf("%s is managed by update chain %s for stack %s; run the chain to preserve the configured update order", container, cm.ChainName, cm.ScopeKey))
 		return
 	}

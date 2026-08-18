@@ -1,7 +1,10 @@
 package app
 
 import (
+	"context"
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/m9rph/vibewatch/internal/db"
@@ -38,8 +41,8 @@ func TestNormalizeStackChainOwnsPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if custom.ScopeKey != "" || custom.PolicyMode != "inherit" {
-		t.Fatalf("custom chains must retain legacy per-container policy semantics: %#v", custom)
+	if custom.ScopeKey != "" || custom.PolicyMode != "auto" {
+		t.Fatalf("custom chains must own member policy just like stack chains: %#v", custom)
 	}
 }
 
@@ -74,5 +77,43 @@ func TestNormalizeChainCurrentAction(t *testing.T) {
 	}
 	if _, err := normalizeChainInput(updateChainInput{Name: "bad-action", HostID: 1, Steps: []db.UpdateChainStep{{ContainerName: "a", CurrentAction: "destroy"}}}); err == nil {
 		t.Fatal("invalid current action must be rejected")
+	}
+}
+
+func TestChainMemberManagementLocksEveryMember(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not available")
+	}
+	ctx := context.Background()
+	store := db.New(filepath.Join(t.TempDir(), "vibewatch.db"))
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.SaveUpdateChain(ctx, db.UpdateChain{Name: "Photos", HostID: 7, ScopeType: "stack", ScopeKey: "photos", PolicyMode: "auto"}, []db.UpdateChainStep{{ContainerName: "photos-web"}, {ContainerName: "photos-db"}, {ContainerName: "photos-cache"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.SaveUpdateChain(ctx, db.UpdateChain{Name: "Custom", HostID: 7, ScopeType: "custom", PolicyMode: "manual"}, []db.UpdateChainStep{{ContainerName: "standalone"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{Store: store}
+	managed, err := a.chainMemberManagement(ctx, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"photos-web", "photos-db", "photos-cache"} {
+		cm, ok := managed[name]
+		if !ok {
+			t.Fatalf("expected %s to be chain managed: %#v", name, managed)
+		}
+		if cm.ChainName != "Photos" || cm.PolicyMode != "auto" {
+			t.Fatalf("unexpected chain management for %s: %#v", name, cm)
+		}
+	}
+	if cm, ok := managed["standalone"]; !ok {
+		t.Fatal("custom-chain member must be chain managed")
+	} else if cm.ChainName != "Custom" || cm.PolicyMode != "manual" {
+		t.Fatalf("unexpected custom chain management: %#v", cm)
 	}
 }

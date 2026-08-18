@@ -29,18 +29,23 @@ type restorePointDataMountView struct {
 
 type restorePointView struct {
 	db.RestorePoint
-	HostName          string                       `json:"host_name"`
-	RollbackAvailable bool                         `json:"rollback_available"`
-	SnapshotAvailable bool                         `json:"snapshot_available"`
-	ProtectionLevel   string                       `json:"protection_level"`
-	Dependencies      []networkNamespaceDependency `json:"dependencies,omitempty"`
-	DataScopeType     string                       `json:"data_scope_type,omitempty"`
-	DataScopeKey      string                       `json:"data_scope_key,omitempty"`
-	DataMounts        []restorePointDataMountView  `json:"data_mounts,omitempty"`
-	ChainRunID        int64                        `json:"chain_run_id,omitempty"`
-	ChainID           int64                        `json:"chain_id,omitempty"`
-	ChainName         string                       `json:"chain_name,omitempty"`
-	ChainTrigger      string                       `json:"chain_trigger,omitempty"`
+	HostName           string                       `json:"host_name"`
+	RollbackAvailable  bool                         `json:"rollback_available"`
+	SnapshotAvailable  bool                         `json:"snapshot_available"`
+	ProtectionLevel    string                       `json:"protection_level"`
+	Dependencies       []networkNamespaceDependency `json:"dependencies,omitempty"`
+	DataScopeType      string                       `json:"data_scope_type,omitempty"`
+	DataScopeKey       string                       `json:"data_scope_key,omitempty"`
+	DataMounts         []restorePointDataMountView  `json:"data_mounts,omitempty"`
+	SnapshotBytes      int64                        `json:"snapshot_bytes"`
+	RestoreImageBytes  int64                        `json:"restore_image_bytes"`
+	ArchiveBytes       int64                        `json:"archive_bytes"`
+	FootprintBytes     int64                        `json:"footprint_bytes"`
+	FootprintEstimated bool                         `json:"footprint_estimated"`
+	ChainRunID         int64                        `json:"chain_run_id,omitempty"`
+	ChainID            int64                        `json:"chain_id,omitempty"`
+	ChainName          string                       `json:"chain_name,omitempty"`
+	ChainTrigger       string                       `json:"chain_trigger,omitempty"`
 }
 
 var restoreRepoClean = regexp.MustCompile(`[^a-z0-9._-]+`)
@@ -107,15 +112,6 @@ type restorePointCaptureOptions struct {
 type restorePointCaptureResult struct {
 	RestorePoint    db.RestorePoint
 	DeferredWriters []string
-}
-
-func defaultRestorePointCaptureOptions() restorePointCaptureOptions {
-	return restorePointCaptureOptions{CaptureData: true}
-}
-
-func (a *App) createRestorePointForSnapshot(ctx context.Context, hostID int64, container string, snap ContainerBackupSnapshot, reason, trigger string, deps []networkNamespaceDependencyRuntime) (db.RestorePoint, error) {
-	res, err := a.createRestorePointForSnapshotWithOptions(ctx, hostID, container, snap, reason, trigger, deps, defaultRestorePointCaptureOptions())
-	return res.RestorePoint, err
 }
 
 func (a *App) createRestorePointForSnapshotWithOptions(ctx context.Context, hostID int64, container string, snap ContainerBackupSnapshot, reason, trigger string, deps []networkNamespaceDependencyRuntime, opts restorePointCaptureOptions) (restorePointCaptureResult, error) {
@@ -386,6 +382,25 @@ func (a *App) restorePointAvailable(ctx context.Context, rp db.RestorePoint) (bo
 	return a.Docker.ImageExists(ctx, h.Endpoint, rp.ImageRef), snapshotAvailable
 }
 
+func restorePointStorageMetrics(rp db.RestorePoint, snapshotBytes, imageBytes int64) (archiveBytes, footprintBytes int64, estimated bool) {
+	if snapshotBytes < 0 {
+		snapshotBytes = 0
+	}
+	dataBytes := rp.DataBytes
+	if dataBytes < 0 {
+		dataBytes = 0
+	}
+	if imageBytes < 0 {
+		imageBytes = 0
+	}
+	archiveBytes = snapshotBytes + dataBytes
+	footprintBytes = archiveBytes + imageBytes
+	// Docker reports the logical image size. Restore images normally share base
+	// layers with the source image, so physical disk consumption can be lower.
+	estimated = imageBytes > 0
+	return
+}
+
 func (a *App) handleRestorePoints(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	hostID, _ := strconv.ParseInt(r.URL.Query().Get("host_id"), 10, 64)
@@ -398,6 +413,8 @@ func (a *App) handleRestorePoints(w http.ResponseWriter, r *http.Request) {
 	out := make([]restorePointView, 0, len(rows))
 	chainRunCache := map[int64]db.UpdateChainRun{}
 	chainRunMissing := map[int64]bool{}
+	imageSizeCache := map[int64]map[string]int64{}
+	imageSizeLoaded := map[int64]bool{}
 	for _, rp := range rows {
 		if !a.hostAllowed(r, rp.HostID) {
 			continue
@@ -423,7 +440,42 @@ func (a *App) handleRestorePoints(w http.ResponseWriter, r *http.Request) {
 			rp.LastError = reason
 		}
 		dataScopeType, dataScopeKey, dataMounts := restorePointDataDetails(rp)
-		view := restorePointView{RestorePoint: rp, HostName: hostName, RollbackAvailable: available, SnapshotAvailable: snapshotAvailable, ProtectionLevel: restorePointProtectionLevel(rp), Dependencies: restorePointDependencies(rp), DataScopeType: dataScopeType, DataScopeKey: dataScopeKey, DataMounts: dataMounts}
+		snapshotBytes := int64(0)
+		if snapshotPath, _, snapshotErr := a.findSnapshotByID(rp.HostID, rp.SnapshotID, rp.ContainerName); snapshotErr == nil {
+			if stat, statErr := os.Stat(snapshotPath); statErr == nil {
+				snapshotBytes = stat.Size()
+			}
+		}
+		restoreImageBytes := int64(0)
+		if bool(rp.WritableLayer) && (strings.TrimSpace(rp.ImageID) != "" || strings.TrimSpace(rp.ImageRef) != "") {
+			if !imageSizeLoaded[rp.HostID] {
+				imageSizeLoaded[rp.HostID] = true
+				index := map[string]int64{}
+				if h, hostErr := a.Store.Host(r.Context(), rp.HostID); hostErr == nil {
+					if images, imageErr := a.Docker.ImageInventory(r.Context(), h.Endpoint); imageErr == nil {
+						for _, image := range images {
+							if strings.TrimSpace(image.ID) != "" {
+								index[strings.TrimSpace(image.ID)] = image.SizeBytes
+							}
+							for _, tag := range image.RepoTags {
+								if strings.TrimSpace(tag) != "" {
+									index[strings.TrimSpace(tag)] = image.SizeBytes
+								}
+							}
+						}
+					}
+				}
+				imageSizeCache[rp.HostID] = index
+			}
+			if index := imageSizeCache[rp.HostID]; index != nil {
+				restoreImageBytes = index[strings.TrimSpace(rp.ImageID)]
+				if restoreImageBytes <= 0 {
+					restoreImageBytes = index[strings.TrimSpace(rp.ImageRef)]
+				}
+			}
+		}
+		archiveBytes, footprintBytes, footprintEstimated := restorePointStorageMetrics(rp, snapshotBytes, restoreImageBytes)
+		view := restorePointView{RestorePoint: rp, HostName: hostName, RollbackAvailable: available, SnapshotAvailable: snapshotAvailable, ProtectionLevel: restorePointProtectionLevel(rp), Dependencies: restorePointDependencies(rp), DataScopeType: dataScopeType, DataScopeKey: dataScopeKey, DataMounts: dataMounts, SnapshotBytes: snapshotBytes, RestoreImageBytes: restoreImageBytes, ArchiveBytes: archiveBytes, FootprintBytes: footprintBytes, FootprintEstimated: footprintEstimated}
 		if runID := restorePointChainRunID(rp.Trigger); runID > 0 {
 			view.ChainRunID = runID
 			run, cached := chainRunCache[runID]

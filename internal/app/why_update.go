@@ -31,26 +31,7 @@ type updateWhyResponse struct {
 }
 
 func (a *App) automationTargetsHost(ctx context.Context, automation db.Automation, hostID int64) bool {
-	if normalizeAutomationKind(automation.Kind) != "policy" || !bool(automation.Enabled) {
-		return false
-	}
-	switch automation.TargetType {
-	case "all":
-		return true
-	case "host":
-		return automation.TargetID == hostID
-	case "group":
-		ids, err := a.Store.HostsForGroup(ctx, automation.TargetID)
-		if err != nil {
-			return false
-		}
-		for _, id := range ids {
-			if id == hostID {
-				return true
-			}
-		}
-	}
-	return false
+	return normalizeAutomationKind(automation.Kind) == "policy" && bool(automation.Enabled) && a.automationIncludesHost(ctx, automation, hostID)
 }
 
 func (a *App) enabledAutomationForHost(ctx context.Context, hostID int64) (db.Automation, bool) {
@@ -136,7 +117,7 @@ func (a *App) handleWhyUpdate(w http.ResponseWriter, r *http.Request, hostID int
 	if mode == "" {
 		mode = "manual"
 	}
-	if cm, ok := a.stackChainForMember(r.Context(), hostID, container); ok {
+	if cm, ok := a.chainForMember(r.Context(), hostID, container); ok {
 		mode = cm.PolicyMode
 		add("blue", "Managed by update chain", fmt.Sprintf("%s · stack %s · policy %s", cm.ChainName, cm.ScopeKey, cm.PolicyMode))
 		switch mode {
@@ -245,7 +226,7 @@ func (a *App) handleWhyUpdate(w http.ResponseWriter, r *http.Request, hostID int
 		add("green", "Image is current", fmt.Sprintf("Last checked %s", cache.LastCheckedAt))
 	}
 
-	if cm, ok := a.stackChainForMember(r.Context(), hostID, container); ok && cm.PolicyMode == "auto" && cm.LastStatus == "blocked" && bool(cache.UpdateAvailable) && !cacheHasSnoozedUpdate(cache) {
+	if cm, ok := a.chainForMember(r.Context(), hostID, container); ok && cm.PolicyMode == "auto" && cm.LastStatus == "blocked" && bool(cache.UpdateAvailable) && !cacheHasSnoozedUpdate(cache) {
 		add("yellow", "Last automatic chain was held by Preflight", fmt.Sprintf("%s · review Chain history for the blocked step.", cm.ChainName))
 		res.Status = "held"
 		res.Summary = "The latest automatic chain run was safely held by Preflight."

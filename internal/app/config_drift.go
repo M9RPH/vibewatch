@@ -94,21 +94,6 @@ func inspectIdentity(c inspectContainer) string {
 	return "container:" + strings.TrimPrefix(c.Name, "/")
 }
 
-func stableUserLabels(labels map[string]string) []string {
-	out := []string{}
-	for k, v := range labels {
-		if strings.HasPrefix(k, "com.docker.compose.") || strings.HasPrefix(k, "com.docker.swarm.") || strings.HasPrefix(k, "com.docker.stack.") {
-			continue
-		}
-		if strings.HasPrefix(k, "io.vibewatch.") {
-			continue
-		}
-		out = append(out, k+"="+v)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func stableMounts(c inspectContainer) []string {
 	out := []string{}
 	for _, m := range c.Mounts {
@@ -378,10 +363,6 @@ func compareDriftBaseline(before configDriftBaseline, current inspectContainer) 
 		changes = append(changes, *ch)
 	}
 	return changes
-}
-
-func compareInspectConfig(before, current inspectContainer) []ConfigDriftChange {
-	return compareDriftBaseline(baselineFromInspect(before), current)
 }
 
 func driftBaselineJSON(c inspectContainer) string {

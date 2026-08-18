@@ -1,6 +1,6 @@
 # Official Vibewatch release Compose file. Keep compose.yml and docker-compose.yml identical.
 x-vibewatch-image: &vibewatch-image
-  image: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}}"
+  image: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:1.0.0}}"
 
 services:
   # Compatibility bridge for upgrades from the pre-Vibewatch Docker runtime
@@ -32,14 +32,18 @@ services:
       - "${VIBEWATCH_PORT:-${WTUI_PORT:-8085}}:8080"
     environment:
       TZ: "${TZ:-Europe/Berlin}"
-      # Canonical VIBEWATCH_* names. Existing WTUI_* values in older .env files
-      # remain accepted through the interpolation fallbacks below.
-      VIBEWATCH_ADMIN_PASSWORD: "${VIBEWATCH_ADMIN_PASSWORD:-${WTUI_ADMIN_PASSWORD:?Set VIBEWATCH_ADMIN_PASSWORD in .env}}"
-      VIBEWATCH_SESSION_SECRET: "${VIBEWATCH_SESSION_SECRET:-${WTUI_SESSION_SECRET:?Set VIBEWATCH_SESSION_SECRET in .env}}"
+      # Canonical VIBEWATCH_* names. Pass legacy credentials separately instead
+      # of nesting required Compose substitutions: the application resolves the
+      # canonical value first and then WTUI_* for upgrade compatibility. This is
+      # also safe when the independent development updater invokes Compose.
+      VIBEWATCH_ADMIN_PASSWORD: "${VIBEWATCH_ADMIN_PASSWORD:-}"
+      WTUI_ADMIN_PASSWORD: "${WTUI_ADMIN_PASSWORD:-}"
+      VIBEWATCH_SESSION_SECRET: "${VIBEWATCH_SESSION_SECRET:-}"
+      WTUI_SESSION_SECRET: "${WTUI_SESSION_SECRET:-}"
       VIBEWATCH_LOG_LEVEL: "${VIBEWATCH_LOG_LEVEL:-${WTUI_LOG_LEVEL:-INFO}}"
       VIBEWATCH_WATCHTOWER_IMAGE: "${VIBEWATCH_WATCHTOWER_IMAGE:-${WTUI_WATCHTOWER_IMAGE:-nickfedor/watchtower:latest}}"
       VIBEWATCH_WORKER_NETWORK: "vibewatch-internal"
-      VIBEWATCH_APP_IMAGE: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:0.9.5}}"
+      VIBEWATCH_APP_IMAGE: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:1.0.0}}"
       VIBEWATCH_CONTAINER_NAME: "vibewatch"
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       # Legacy migration only; V0.4.8+ sends with each account's own App Token + User Key.

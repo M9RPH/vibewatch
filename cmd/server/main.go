@@ -81,7 +81,7 @@ func main() {
 	dbPath := filepath.Join(data, "vibewatch.db")
 	// One-time in-place migration from the pre-rebrand database filename. The
 	// entire /data directory is persistent, so an atomic rename preserves all
-	// hosts, users, policies, schedules, tokens, jobs and logs.
+	// hosts, users, policies, automations, tokens, jobs and logs.
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		if _, legacyErr := os.Stat(legacyDBPath); legacyErr == nil {
 			if renameErr := os.Rename(legacyDBPath, dbPath); renameErr != nil {
@@ -193,7 +193,9 @@ func main() {
 	if legacyPersistentToken != "" && strings.TrimSpace(ownerNotifications.PushoverAppToken) != "" {
 		_ = store.SetSetting(context.Background(), "pushover_app_token", "")
 	}
-	a := app.New(app.Config{DataDir: data, WebDir: vibewatchEnv("VIBEWATCH_WEB_DIR", "WTUI_WEB_DIR", "/app/web"), Timezone: env("TZ", "Europe/Berlin"), Version: version, AppImage: vibewatchEnv("VIBEWATCH_APP_IMAGE", "WTUI_APP_IMAGE", ""), ControllerName: vibewatchEnv("VIBEWATCH_CONTAINER_NAME", "WTUI_CONTAINER_NAME", "vibewatch")}, store, d, watchtower.New(), releases.New(), registry.New(), notify.NewPushover(), sshsetup.New(data), logger, authm)
+	devUpdates := strings.EqualFold(vibewatchEnv("VIBEWATCH_DEVELOPER_UPDATES", "WTUI_DEVELOPER_UPDATES", "false"), "true")
+	projectDir := vibewatchEnv("VIBEWATCH_PROJECT_DIR", "WTUI_PROJECT_DIR", "/workspace")
+	a := app.New(app.Config{DataDir: data, WebDir: vibewatchEnv("VIBEWATCH_WEB_DIR", "WTUI_WEB_DIR", "/app/web"), Timezone: env("TZ", "Europe/Berlin"), Version: version, AppImage: vibewatchEnv("VIBEWATCH_APP_IMAGE", "WTUI_APP_IMAGE", ""), ControllerName: vibewatchEnv("VIBEWATCH_CONTAINER_NAME", "WTUI_CONTAINER_NAME", "vibewatch"), DeveloperUpdates: devUpdates, ProjectDir: projectDir}, store, d, watchtower.New(), releases.New(), registry.New(), notify.NewPushover(), sshsetup.New(data), logger, authm)
 	a.Start()
 	defer a.Stop()
 	srv := &http.Server{Addr: vibewatchEnv("VIBEWATCH_LISTEN", "WTUI_LISTEN", ":8080"), Handler: a.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}

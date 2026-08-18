@@ -157,6 +157,17 @@ func (a *App) createApplicationBackupBundle(ctx context.Context, actor string) (
 				return applicationBackupBundle{}, fmt.Errorf("include TLS credentials for %s: %w", h.Name, e)
 			}
 		}
+		// Vibewatch-managed secure quick setup keeps the private host CA only on
+		// the controller. Include it when present so a controller backup can
+		// retain certificate-management continuity. Manually supplied TLS hosts
+		// simply do not have this optional file.
+		if _, statErr := os.Stat(filepath.Join(a.Docker.TLSCredentialDir(h.Endpoint), "ca-key.pem")); statErr == nil {
+			if _, e := addZipFile(zw, filepath.Join("host-tls", credID, "ca-key.pem"), filepath.Join(a.Docker.TLSCredentialDir(h.Endpoint), "ca-key.pem"), 0o600); e != nil {
+				_ = zw.Close()
+				_ = tmp.Close()
+				return applicationBackupBundle{}, fmt.Errorf("include managed TLS CA for %s: %w", h.Name, e)
+			}
+		}
 		manifest.TLSCredentials = append(manifest.TLSCredentials, entry)
 	}
 	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")

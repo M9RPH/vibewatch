@@ -1,6 +1,6 @@
 # Vibewatch Architecture
 
-This document describes the public architecture of Vibewatch v0.9.5. It focuses on stable concepts and operator-visible behavior rather than internal development notes.
+This document describes the public architecture of Vibewatch v1.0.0. It focuses on stable concepts and operator-visible behavior rather than internal development notes. The 1.0 release ships with the Web UI v2 and the current staged operation inspectors, but the core architecture remains the same: one controller orchestrates many Docker Engines safely from a single UI.
 
 ## Overview
 
@@ -73,7 +73,7 @@ queued
  -> success
 ```
 
-Failure after mutation can enter rollback. v0.9.5 persists transaction state so a controller restart can reconcile the real Docker runtime instead of blindly declaring the update failed.
+Failure after mutation can enter rollback. v1.0.0 persists transaction state so a controller restart can reconcile the real Docker runtime instead of blindly declaring the update failed.
 
 Before mutation, an interrupted transaction can be safely aborted. After mutation, Vibewatch first checks the current runtime and verification state. If the updated service is healthy, it can keep the successfully updated runtime. If it is not healthy and a valid restore point exists, Vibewatch can restore the pre-update state. An unresolved case is marked `recovery_required` and blocks another update of the same target until recovery is resolved.
 
@@ -114,7 +114,7 @@ The helper is used for:
 - archive creation/validation;
 - data restore/cleanup.
 
-Helper containers are labeled as Vibewatch system containers and are excluded from normal container management. v0.9.5 recovery maintenance removes orphaned helpers only after acquiring the same host-level operation lease used to protect destructive Docker operations.
+Helper containers are labeled as Vibewatch system containers and are excluded from normal container management. v1.0.0 recovery maintenance removes orphaned helpers only after acquiring the same host-level operation lease used to protect destructive Docker operations.
 
 ### Local vs external storage
 
@@ -130,7 +130,7 @@ Vibewatch does not try to infer arbitrary application dependencies. The configur
 
 For automatic Chains, the complete update plan is Preflight-checked before the first mutation, and each actual update step runs its normal Preflight again immediately before execution.
 
-### Chain crash recovery in v0.9.5
+### Chain crash recovery in v1.0.0
 
 A Chain run stores its controller job ID and recovery context. After a controller restart:
 

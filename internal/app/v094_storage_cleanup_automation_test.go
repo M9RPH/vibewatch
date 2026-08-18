@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"testing"
 
 	"github.com/m9rph/vibewatch/internal/db"
@@ -29,5 +30,24 @@ func TestV094CleanupAutomationActionsAreExplicit(t *testing.T) {
 	}
 	if got := normalizeAutomationKind(""); got != "policy" {
 		t.Fatalf("legacy automations must default to policy, got %q", got)
+	}
+}
+
+func TestPhase9AutomationTargetsHostKeepsPolicyAndEnabledGuards(t *testing.T) {
+	a := &App{}
+	if !a.automationTargetsHost(context.Background(), db.Automation{Kind: "policy", Enabled: db.Bool(true), TargetType: "all"}, 9) {
+		t.Fatal("enabled policy automation targeting all hosts must include the host")
+	}
+	if !a.automationTargetsHost(context.Background(), db.Automation{Kind: "", Enabled: db.Bool(true), TargetType: "host", TargetID: 9}, 9) {
+		t.Fatal("legacy empty-kind automation must retain policy semantics")
+	}
+	if a.automationTargetsHost(context.Background(), db.Automation{Kind: "cleanup", Enabled: db.Bool(true), TargetType: "all"}, 9) {
+		t.Fatal("cleanup automation must not be treated as a policy automation")
+	}
+	if a.automationTargetsHost(context.Background(), db.Automation{Kind: "policy", Enabled: db.Bool(false), TargetType: "all"}, 9) {
+		t.Fatal("disabled policy automation must not be treated as active")
+	}
+	if a.automationTargetsHost(context.Background(), db.Automation{Kind: "policy", Enabled: db.Bool(true), TargetType: "host", TargetID: 10}, 9) {
+		t.Fatal("host-targeted automation must not include a different host")
 	}
 }

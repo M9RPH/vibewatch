@@ -125,3 +125,56 @@ func TestV092BackupBundleRoundTripValidation(t *testing.T) {
 		t.Fatalf("generated bundle did not validate: %+v", res.Checks)
 	}
 }
+
+func TestManagedMTLSBundleHasCorrectUsagesAndSAN(t *testing.T) {
+	now := time.Date(2026, 8, 17, 18, 0, 0, 0, time.UTC)
+	bundle, err := generateManagedMTLS("192.168.1.60", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTLSCredentials(bundle.CAPEM, bundle.ClientCertPEM, bundle.ClientKeyPEM); err != nil {
+		t.Fatalf("generated client credentials rejected: %v", err)
+	}
+	decodeCert := func(raw string) *x509.Certificate {
+		t.Helper()
+		block, _ := pem.Decode([]byte(raw))
+		if block == nil {
+			t.Fatal("certificate PEM did not decode")
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert
+	}
+	ca := decodeCert(bundle.CAPEM)
+	server := decodeCert(bundle.ServerCertPEM)
+	client := decodeCert(bundle.ClientCertPEM)
+	if !ca.IsCA {
+		t.Fatal("generated CA is not marked as a CA")
+	}
+	if len(server.IPAddresses) != 1 || server.IPAddresses[0].String() != "192.168.1.60" {
+		t.Fatalf("server SANs=%v", server.IPAddresses)
+	}
+	if len(server.ExtKeyUsage) != 1 || server.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth {
+		t.Fatalf("server EKU=%v", server.ExtKeyUsage)
+	}
+	if len(client.ExtKeyUsage) != 1 || client.ExtKeyUsage[0] != x509.ExtKeyUsageClientAuth {
+		t.Fatalf("client EKU=%v", client.ExtKeyUsage)
+	}
+	if !bundle.ClientNotAfter.After(now.Add(300 * 24 * time.Hour)) {
+		t.Fatalf("client certificate lifetime too short: %s", bundle.ClientNotAfter)
+	}
+}
+
+func TestDockerEndpointHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"tcp://192.168.1.20:2375":  "192.168.1.20",
+		"tls://192.168.1.20:2376":  "192.168.1.20",
+		"tls://[2001:db8::1]:2376": "2001:db8::1",
+	} {
+		if got := dockerEndpointHost(in); got != want {
+			t.Fatalf("dockerEndpointHost(%q)=%q want %q", in, got, want)
+		}
+	}
+}

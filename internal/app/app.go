@@ -31,12 +31,14 @@ import (
 )
 
 type Config struct {
-	DataDir        string
-	WebDir         string
-	Timezone       string
-	Version        string
-	AppImage       string
-	ControllerName string
+	DataDir          string
+	WebDir           string
+	Timezone         string
+	Version          string
+	AppImage         string
+	ControllerName   string
+	DeveloperUpdates bool
+	ProjectDir       string
 }
 type App struct {
 	Cfg           Config
@@ -64,6 +66,8 @@ type App struct {
 	hostHealthMu  sync.Mutex
 	hostHealth    map[int64]hostHealthState
 	hostHealthRun map[int64]bool
+	quickSetupMu  sync.Mutex
+	quickSetupOps map[string]quickSetupProgress
 	chainMu       sync.Mutex
 	chainReserved map[string]int64
 }
@@ -143,6 +147,8 @@ type HostView struct {
 	db.Host
 	ConnectionType          string                `json:"connection_type"`
 	TLSConfigured           bool                  `json:"tls_configured"`
+	TLSManaged              bool                  `json:"tls_managed"`
+	TLSExpiresAt            string                `json:"tls_expires_at,omitempty"`
 	Worker                  dockercli.WorkerState `json:"worker"`
 	DockerReachable         bool                  `json:"docker_reachable"`
 	DockerReachabilityKnown bool                  `json:"docker_reachability_known"`
@@ -170,15 +176,6 @@ type policyInput struct {
 	CheckIntervalMinutes   int    `json:"check_interval_minutes"`
 	ReleaseRepo            string `json:"release_repo"`
 	AllowPreflightWarnings bool   `json:"allow_preflight_warnings"`
-}
-type scheduleInput struct {
-	ID         int64    `json:"id"`
-	Name       string   `json:"name"`
-	Cron       string   `json:"cron"`
-	Action     string   `json:"action"`
-	HostID     int64    `json:"host_id"`
-	Containers []string `json:"containers"`
-	Enabled    bool     `json:"enabled"`
 }
 type automationInput struct {
 	ID                int64  `json:"id"`
@@ -241,17 +238,28 @@ type systemSettingsInput struct {
 	ContainerSnapshotRetention int    `json:"container_snapshot_retention"`
 }
 type quickSetupInput struct {
+	HostID                 int64  `json:"host_id"`
 	Name                   string `json:"name"`
 	IP                     string `json:"ip"`
 	SSHPort                int    `json:"ssh_port"`
 	Username               string `json:"username"`
 	Password               string `json:"password"`
+	Mode                   string `json:"mode"`
 	AcknowledgeInsecureTCP bool   `json:"acknowledge_insecure_tcp"`
+	OperationID            string `json:"operation_id"`
+}
+
+type quickSetupProgress struct {
+	OperationID string `json:"operation_id"`
+	Stage       string `json:"stage"`
+	Message     string `json:"message"`
+	Status      string `json:"status"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
 func New(cfg Config, store *db.Store, docker *dockercli.Client, wt *watchtower.Client, gh *releases.GitHubClient, reg *registry.Client, po *notify.Pushover, ssh *sshsetup.Client, logger *slog.Logger, authm *auth.Manager) *App {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}, ensureLocks: map[int64]*sync.Mutex{}, hostHealth: map[int64]hostHealthState{}, hostHealthRun: map[int64]bool{}, chainReserved: map[string]int64{}}
+	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}, ensureLocks: map[int64]*sync.Mutex{}, hostHealth: map[int64]hostHealthState{}, hostHealthRun: map[int64]bool{}, quickSetupOps: map[string]quickSetupProgress{}, chainReserved: map[string]int64{}}
 }
 func remoteDockerEndpoint(endpoint string) bool {
 	v := strings.ToLower(strings.TrimSpace(endpoint))
@@ -481,6 +489,7 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("GET /api/hosts", a.handleHosts)
 	protected.HandleFunc("POST /api/hosts", a.handleHosts)
 	protected.HandleFunc("POST /api/hosts/quick-setup", a.handleHostQuickSetup)
+	protected.HandleFunc("GET /api/hosts/quick-setup/progress", a.handleHostQuickSetupProgress)
 	protected.HandleFunc("/api/hosts/", a.handleHostSubroutes)
 	protected.HandleFunc("GET /api/jobs", a.handleJobs)
 	protected.HandleFunc("POST /api/jobs/{id}/cancel", a.handleJobCancel)
@@ -497,6 +506,8 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("DELETE /api/users/", a.handleUserDelete)
 	protected.HandleFunc("GET /api/notifications/me", a.handleNotificationSettings)
 	protected.HandleFunc("PUT /api/notifications/me", a.handleNotificationSettings)
+	protected.HandleFunc("GET /api/notifications/read-state", a.handleNotificationReadState)
+	protected.HandleFunc("POST /api/notifications/read-state", a.handleNotificationReadState)
 	protected.HandleFunc("POST /api/notifications/test", a.handleNotificationTest)
 	protected.HandleFunc("GET /api/system/settings", a.handleSystemSettings)
 	protected.HandleFunc("PUT /api/system/settings", a.handleSystemSettings)
@@ -507,8 +518,10 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("/api/system/backups/", a.handleSystemBackupSubroutes)
 	protected.HandleFunc("GET /api/system/self-update", a.handleSelfUpdate)
 	protected.HandleFunc("POST /api/system/self-update", a.handleSelfUpdate)
-	// Legacy V0.1 schedule endpoints remain readable for diagnostics only.
-	protected.HandleFunc("GET /api/schedules", a.handleSchedules)
+	protected.HandleFunc("GET /api/system/developer-update", a.handleDeveloperUpdateInfo)
+	protected.HandleFunc("POST /api/system/developer-update/upload", a.handleDeveloperUpdateUpload)
+	protected.HandleFunc("POST /api/system/developer-update/install", a.handleDeveloperUpdateInstall)
+	protected.HandleFunc("GET /api/system/developer-update/status", a.handleDeveloperUpdateStatus)
 	protected.HandleFunc("GET /api/audit", a.handleAudit)
 	protected.HandleFunc("GET /api/docker-events", a.handleDockerEvents)
 	protected.HandleFunc("GET /api/logs/application", a.handleApplicationLogs)
@@ -531,6 +544,11 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("POST /api/recovery/gc", a.handleRecoveryGC)
 	protected.HandleFunc("POST /api/recovery/cleanup-unusable", a.handleRecoveryCleanupUnusable)
 	protected.HandleFunc("POST /api/rollback", a.handleRollback)
+	protected.HandleFunc("GET /api/service-icons/resolve", a.handleServiceIconResolve)
+	protected.HandleFunc("GET /api/service-icons/catalog", a.handleServiceIconCatalog)
+	protected.HandleFunc("GET /api/service-icons/file/{slug}", a.handleServiceIconFile)
+	protected.HandleFunc("PUT /api/service-icons/override", a.handleServiceIconOverride)
+	protected.HandleFunc("DELETE /api/service-icons/override", a.handleServiceIconOverride)
 	protected.HandleFunc("GET /api/system/registry-credentials", a.handleRegistryCredentials)
 	protected.HandleFunc("POST /api/system/registry-credentials", a.handleRegistryCredentials)
 	protected.HandleFunc("PUT /api/system/registry-credentials", a.handleRegistryCredentials)
@@ -676,10 +694,13 @@ func (a *App) handleHosts(w http.ResponseWriter, r *http.Request) {
 				a.scheduleHostProbe(h, false)
 			}
 			health := a.hostHealthView(h.ID)
+			managedTLS, tlsExpiresAt := a.hostTLSInfo(h.Endpoint)
 			views[i] = HostView{
 				Host:                    h,
 				ConnectionType:          dockercli.ConnectionType(h.Endpoint),
 				TLSConfigured:           a.Docker.TLSConfigured(h.Endpoint),
+				TLSManaged:              managedTLS,
+				TLSExpiresAt:            tlsExpiresAt,
 				Worker:                  a.Docker.WorkerState(r.Context(), h.ID),
 				DockerReachable:         health.Reachable,
 				DockerReachabilityKnown: health.Known,
@@ -746,6 +767,61 @@ func (a *App) handleHosts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, h)
 }
 
+func validQuickSetupOperationID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" || len(id) > 96 {
+		return false
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (a *App) setQuickSetupProgress(id, stage, message, status string) {
+	id = strings.TrimSpace(id)
+	if !validQuickSetupOperationID(id) {
+		return
+	}
+	now := time.Now().UTC()
+	a.quickSetupMu.Lock()
+	defer a.quickSetupMu.Unlock()
+	for key, item := range a.quickSetupOps {
+		ts, err := time.Parse(time.RFC3339Nano, item.UpdatedAt)
+		if err == nil && now.Sub(ts) > 20*time.Minute {
+			delete(a.quickSetupOps, key)
+		}
+	}
+	a.quickSetupOps[id] = quickSetupProgress{OperationID: id, Stage: stage, Message: message, Status: status, UpdatedAt: now.Format(time.RFC3339Nano)}
+}
+
+func (a *App) quickSetupProgress(id string) (quickSetupProgress, bool) {
+	a.quickSetupMu.Lock()
+	defer a.quickSetupMu.Unlock()
+	v, ok := a.quickSetupOps[strings.TrimSpace(id)]
+	return v, ok
+}
+
+func (a *App) handleHostQuickSetupProgress(w http.ResponseWriter, r *http.Request) {
+	if !a.requireOwner(w, r) {
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if !validQuickSetupOperationID(id) {
+		writeErr(w, 400, "invalid quick setup operation id")
+		return
+	}
+	progress, ok := a.quickSetupProgress(id)
+	if !ok {
+		writeErr(w, 404, "quick setup operation not found")
+		return
+	}
+	writeJSON(w, 200, progress)
+}
+
 func (a *App) handleHostQuickSetup(w http.ResponseWriter, r *http.Request) {
 	if !a.requireOwner(w, r) {
 		return
@@ -759,51 +835,284 @@ func (a *App) handleHostQuickSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid json")
 		return
 	}
+	in.OperationID = strings.TrimSpace(in.OperationID)
+	if in.OperationID != "" && !validQuickSetupOperationID(in.OperationID) {
+		writeErr(w, 400, "invalid quick setup operation id")
+		return
+	}
+	progressDone := false
+	progress := func(stage, message string) { a.setQuickSetupProgress(in.OperationID, stage, message, "running") }
+	if in.OperationID != "" {
+		progress("prepare", "Validating Quick Setup request and target host.")
+		defer func() {
+			if progressDone {
+				return
+			}
+			if current, ok := a.quickSetupProgress(in.OperationID); ok && current.Status == "running" {
+				a.setQuickSetupProgress(in.OperationID, current.Stage, "Quick Setup stopped during this stage. See the error details below.", "failed")
+			}
+		}()
+	}
 	in.Name, in.IP, in.Username = strings.TrimSpace(in.Name), strings.TrimSpace(in.IP), strings.TrimSpace(in.Username)
+	in.Mode = strings.ToLower(strings.TrimSpace(in.Mode))
+	if in.Mode == "" {
+		in.Mode = "tcp" // backwards compatibility with the original quick-setup request
+	}
 	if in.SSHPort == 0 {
 		in.SSHPort = 22
 	}
-	if in.Name == "" || in.Password == "" {
+	if in.Name == "" || in.IP == "" || in.Username == "" || in.Password == "" {
 		writeErr(w, 400, "host name, IP, username and SSH password are required")
 		return
 	}
-	if !in.AcknowledgeInsecureTCP {
-		writeErr(w, 400, "confirm the Docker TCP 2375 security warning before running quick setup")
+	if in.Mode != "secure" && in.Mode != "tcp" {
+		writeErr(w, 400, "quick setup mode must be secure or tcp")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	if in.HostID > 0 && in.Mode != "secure" {
+		writeErr(w, 400, "existing hosts can only be reconfigured through secure quick setup")
+		return
+	}
+	if in.Mode == "tcp" && !in.AcknowledgeInsecureTCP {
+		writeErr(w, 400, "confirm the Docker TCP 2375 security warning before running legacy TCP quick setup")
+		return
+	}
+	var existingHost db.Host
+	if in.HostID > 0 {
+		var hostErr error
+		existingHost, hostErr = a.Store.Host(r.Context(), in.HostID)
+		if hostErr != nil {
+			writeErr(w, 404, "host selected for secure reconfiguration was not found")
+			return
+		}
+		if oldHost := dockerEndpointHost(existingHost.Endpoint); oldHost != "" && !strings.EqualFold(oldHost, in.IP) {
+			writeErr(w, 409, "secure repair must use the existing Docker host IP; change the host connection explicitly before moving a managed certificate identity to another address")
+			return
+		}
+		if strings.TrimSpace(in.Name) == "" {
+			in.Name = existingHost.Name
+		}
+	}
+	if existing, listErr := a.Store.Hosts(r.Context()); listErr == nil {
+		for _, h := range existing {
+			if h.ID == in.HostID {
+				continue
+			}
+			otherIP := dockerEndpointHost(h.Endpoint)
+			if otherIP == "" || !strings.EqualFold(otherIP, in.IP) {
+				continue
+			}
+			if in.HostID == 0 && in.Mode == "secure" && dockercli.ConnectionType(h.Endpoint) == "tcp" {
+				writeErr(w, http.StatusConflict, "this Docker host already exists as a legacy TCP connection; select that host and use Secure this host to upgrade it in place")
+				return
+			}
+			writeErr(w, http.StatusConflict, "this Docker host IP already belongs to another Vibewatch host")
+			return
+		}
+	}
+
+	if in.Mode == "secure" {
+		progress("remote", "Connecting over SSH, inspecting Docker configuration, staging certificates and restarting Docker safely.")
+	} else {
+		progress("remote", "Connecting over SSH, inspecting Docker configuration and staging the legacy TCP listener safely.")
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
 	defer cancel()
-	res, err := a.SSH.ConfigureDockerTCP(ctx, in.IP, in.Username, in.Password, in.SSHPort)
-	in.Password = ""
+
+	var (
+		res        sshsetup.Result
+		err        error
+		managed    *managedMTLSBundle
+		setupLabel string
+	)
+	if in.Mode == "secure" {
+		bundle, genErr := generateManagedMTLS(in.IP, time.Now().UTC())
+		if genErr != nil {
+			writeErr(w, 500, "failed to generate secure connection credentials: "+genErr.Error())
+			return
+		}
+		managed = &bundle
+		res, err = a.SSH.ConfigureDockerMTLS(ctx, in.IP, in.Username, in.Password, in.SSHPort, bundle.CAPEM, bundle.ServerCertPEM, bundle.ServerKeyPEM)
+		setupLabel = "secure"
+	} else {
+		res, err = a.SSH.ConfigureDockerTCP(ctx, in.IP, in.Username, in.Password, in.SSHPort)
+		setupLabel = "legacy-tcp"
+	}
 	if err != nil {
-		a.Logger.Warn("SSH Docker quick setup failed", "actor", a.actor(r), "ip", in.IP, "username", in.Username, "error", err)
+		in.Password = ""
+		a.Logger.Warn("SSH Docker quick setup failed", "actor", a.actor(r), "mode", setupLabel, "ip", in.IP, "username", in.Username, "error", err)
 		writeErr(w, 502, err.Error())
 		return
 	}
-	pingCtx, pingCancel := context.WithTimeout(r.Context(), 22*time.Second)
-	version, pingErr := a.Docker.PingReliable(pingCtx, res.Endpoint)
+
+	progress("verify", "Remote Docker setup passed local validation. Verifying the new endpoint from the Vibewatch controller.")
+
+	rollbackMode := in.Mode
+	if rollbackMode != "secure" {
+		rollbackMode = "tcp"
+	}
+	rollbackRemote := func(reason string) (string, error) {
+		if strings.TrimSpace(res.TransactionToken) == "" {
+			return "no staged remote transaction", nil
+		}
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer rbCancel()
+		out, rbErr := a.SSH.RollbackDockerSetup(rbCtx, in.IP, in.Username, in.Password, in.SSHPort, res.TransactionToken, rollbackMode)
+		if rbErr != nil {
+			a.Logger.Error("SSH Docker quick setup rollback failed", "actor", a.actor(r), "mode", setupLabel, "ip", in.IP, "reason", reason, "error", rbErr, "output", out)
+		} else {
+			a.Logger.Info("SSH Docker quick setup rollback completed", "actor", a.actor(r), "mode", setupLabel, "ip", in.IP, "reason", reason, "output", out)
+		}
+		return out, rbErr
+	}
+	remoteDiagnostics := func() string {
+		diagCtx, diagCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer diagCancel()
+		out, diagErr := a.SSH.DockerSetupDiagnostics(diagCtx, in.IP, in.Username, in.Password, in.SSHPort)
+		if diagErr != nil {
+			return "diagnostics unavailable: " + diagErr.Error()
+		}
+		return out
+	}
+
+	trustedCA := ""
+	pingCtx, pingCancel := context.WithTimeout(r.Context(), 30*time.Second)
+	var version string
+	var pingErr error
+	if managed != nil {
+		trustedCA = managed.CAPEM
+		if strings.TrimSpace(res.CAPEM) != "" {
+			trustedCA = res.CAPEM
+		}
+		// Probe with temporary credentials first. Existing managed client files are
+		// intentionally left untouched until the new identity has proved it can
+		// complete an mTLS handshake from this controller.
+		version, pingErr = a.Docker.PingTLSCredentials(pingCtx, res.Endpoint, trustedCA, managed.ClientCertPEM, managed.ClientKeyPEM)
+	} else {
+		version, pingErr = a.Docker.PingReliable(pingCtx, res.Endpoint)
+	}
 	pingCancel()
 	if pingErr != nil {
-		a.Logger.Warn("SSH Docker quick setup configured endpoint but controller cannot reach it", "actor", a.actor(r), "endpoint", res.Endpoint, "error", pingErr)
-		writeJSON(w, 502, map[string]any{"configured": true, "host_created": false, "endpoint": res.Endpoint, "error": "Docker was configured on the remote host, but Vibewatch cannot reach " + res.Endpoint + ": " + pingErr.Error()})
+		diagnostics := remoteDiagnostics()
+		rollbackOut, rollbackErr := rollbackRemote("controller endpoint validation failed")
+		in.Password = ""
+		a.Logger.Warn("SSH Docker quick setup endpoint validation failed", "actor", a.actor(r), "mode", setupLabel, "endpoint", res.Endpoint, "error", pingErr, "remote_diagnostics", diagnostics, "rollback_output", rollbackOut, "rollback_error", rollbackErr)
+		errText := "Docker accepted the staged configuration, but Vibewatch could not reach " + res.Endpoint + ": " + pingErr.Error()
+		if rollbackErr == nil {
+			errText += ". The previous Docker configuration was restored automatically."
+		} else {
+			errText += ". Automatic rollback also failed; check the Docker host immediately."
+		}
+		writeJSON(w, 502, map[string]any{
+			"configured": false, "rolled_back": rollbackErr == nil, "host_created": false, "endpoint": res.Endpoint,
+			"secure": in.Mode == "secure", "error": errText,
+		})
 		return
 	}
-	token, tokenErr := randomToken(32)
-	if tokenErr != nil {
-		writeErr(w, 500, "failed to generate worker API token")
+
+	progress("integrate", "Docker endpoint verified. Saving the connection, credentials and host integration in Vibewatch.")
+
+	var id int64
+	if in.HostID > 0 {
+		id = in.HostID
+		a.Events.Stop(id)
+		_ = a.Docker.RemoveWorker(context.Background(), id)
+		if updateErr := a.Store.UpdateHostEndpoint(r.Context(), id, res.Endpoint); updateErr != nil {
+			rollbackOut, rollbackErr := rollbackRemote("existing host endpoint persistence failed")
+			in.Password = ""
+			a.Events.Start(a.ctx, a.Docker, a.Store, existingHost)
+			go a.startHostWorker(existingHost, "ssh-quick-setup-rollback")
+			a.Logger.Error("secure Docker reachable but existing host endpoint update failed", "host_id", id, "error", updateErr, "rollback_output", rollbackOut, "rollback_error", rollbackErr)
+			writeErr(w, 500, "secure Docker is reachable, but Vibewatch could not update the existing host connection: "+updateErr.Error())
+			return
+		}
+	} else {
+		token, tokenErr := randomToken(32)
+		if tokenErr != nil {
+			_, _ = rollbackRemote("worker token generation failed")
+			in.Password = ""
+			writeErr(w, 500, "failed to generate worker API token")
+			return
+		}
+		var createErr error
+		id, createErr = a.Store.CreateHost(r.Context(), in.Name, res.Endpoint, token, db.Bool(true))
+		if createErr != nil {
+			rollbackOut, rollbackErr := rollbackRemote("host creation failed")
+			in.Password = ""
+			a.Logger.Error("Docker endpoint reachable but host creation failed", "endpoint", res.Endpoint, "error", createErr, "rollback_output", rollbackOut, "rollback_error", rollbackErr)
+			writeErr(w, 400, "Docker endpoint is reachable, but the Vibewatch host could not be created: "+createErr.Error())
+			return
+		}
+	}
+
+	if managed != nil {
+		if saveErr := a.saveManagedHostTLSCredentialsAtomic(res.Endpoint, trustedCA, managed.ClientCertPEM, managed.ClientKeyPEM, managed.CAKeyPEM); saveErr != nil {
+			if in.HostID > 0 {
+				_ = a.Store.UpdateHostEndpoint(r.Context(), id, existingHost.Endpoint)
+				a.Events.Start(a.ctx, a.Docker, a.Store, existingHost)
+				go a.startHostWorker(existingHost, "ssh-quick-setup-rollback")
+			} else {
+				_ = a.Store.DeleteHost(r.Context(), id)
+			}
+			if in.HostID == 0 || !strings.EqualFold(strings.TrimSpace(existingHost.Endpoint), strings.TrimSpace(res.Endpoint)) {
+				_ = a.removeHostTLSCredentials(res.Endpoint)
+			}
+			rollbackOut, rollbackErr := rollbackRemote("managed client credential persistence failed")
+			in.Password = ""
+			a.Logger.Error("secure Docker reachable but managed client credential persistence failed", "host_id", id, "error", saveErr, "rollback_output", rollbackOut, "rollback_error", rollbackErr)
+			writeErr(w, 500, "secure Docker was reachable, but Vibewatch could not atomically persist its managed client identity; the host change was rolled back: "+saveErr.Error())
+			return
+		}
+	}
+
+	if in.HostID > 0 {
+		if dockercli.ConnectionType(existingHost.Endpoint) == "tls" && !strings.EqualFold(strings.TrimSpace(existingHost.Endpoint), strings.TrimSpace(res.Endpoint)) {
+			_ = a.removeHostTLSCredentials(existingHost.Endpoint)
+		}
+		if strings.TrimSpace(in.Name) != "" && strings.TrimSpace(in.Name) != existingHost.Name {
+			_ = a.Store.RenameHost(r.Context(), id, strings.TrimSpace(in.Name))
+		}
+	}
+
+	h, hostErr := a.Store.Host(r.Context(), id)
+	if hostErr != nil {
+		// The endpoint + credentials are already consistent at this point. Do not
+		// risk rolling a healthy remote daemon back because a post-write DB read
+		// unexpectedly failed; surface the storage error and leave the transaction
+		// backup available for a later repair.
+		in.Password = ""
+		writeErr(w, 500, "host was updated but could not be read back: "+hostErr.Error())
 		return
 	}
-	id, createErr := a.Store.CreateHost(r.Context(), in.Name, res.Endpoint, token, db.Bool(true))
-	if createErr != nil {
-		writeErr(w, 400, "Docker endpoint is reachable, but the Vibewatch host could not be created: "+createErr.Error())
-		return
+
+	progress("finalize", "Vibewatch integration saved. Finalizing the remote transaction and starting the host worker.")
+
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	commitOut, commitErr := a.SSH.CommitDockerSetup(commitCtx, in.IP, in.Username, in.Password, in.SSHPort, res.TransactionToken)
+	commitCancel()
+	if commitErr != nil {
+		// A commit failure only leaves the remote rollback snapshot behind; the
+		// active Docker endpoint and Vibewatch state are already mutually valid.
+		a.Logger.Warn("SSH Docker quick setup could not remove remote rollback snapshot", "host_id", id, "mode", setupLabel, "error", commitErr, "output", commitOut)
 	}
-	h, _ := a.Store.Host(r.Context(), id)
+	in.Password = ""
+
 	a.Events.Start(a.ctx, a.Docker, a.Store, h)
-	go a.startHostWorker(h, "ssh-quick-setup")
-	_ = a.Store.Audit(r.Context(), a.actor(r), "host.quick-setup", id, "", fmt.Sprintf("endpoint=%s ssh_user=%s", res.Endpoint, res.Username))
-	a.Logger.Info("SSH Docker quick setup completed", "actor", a.actor(r), "host_id", id, "endpoint", res.Endpoint, "docker_version", version)
-	writeJSON(w, 201, map[string]any{"configured": true, "host_created": true, "host": h, "endpoint": res.Endpoint, "docker_version": version})
+	go a.startHostWorker(h, "ssh-quick-setup-"+setupLabel)
+	action := "host.quick-setup"
+	if in.HostID > 0 {
+		action = "host.connection.secure"
+	}
+	_ = a.Store.Audit(r.Context(), a.actor(r), action, id, "", fmt.Sprintf("mode=%s endpoint=%s ssh_user=%s", setupLabel, res.Endpoint, res.Username))
+	a.Logger.Info("SSH Docker quick setup completed", "actor", a.actor(r), "mode", setupLabel, "host_id", id, "endpoint", res.Endpoint, "docker_version", version)
+	response := map[string]any{"configured": true, "host_created": in.HostID == 0, "host_reconfigured": in.HostID > 0, "host": h, "endpoint": res.Endpoint, "docker_version": version, "secure": in.Mode == "secure"}
+	if managed != nil {
+		response["certificate_expires_at"] = managed.ClientNotAfter.UTC().Format(time.RFC3339)
+	}
+	a.setQuickSetupProgress(in.OperationID, "complete", "Quick Setup completed successfully. The Docker host is ready in Vibewatch.", "completed")
+	progressDone = true
+	writeJSON(w, 201, response)
 }
 
 func (a *App) systemManagedContainer(name string) (bool, string) {
@@ -812,10 +1121,13 @@ func (a *App) systemManagedContainer(name string) (bool, string) {
 	if name != "" && (name == controller || name == "watchtower-ui" || name == "vibewatch") {
 		return true, "controller"
 	}
-	for _, prefix := range []string{"watchtower-ui-worker-", "vibewatch-worker-", "vibewatch-helper-"} {
+	for _, prefix := range []string{"watchtower-ui-worker-", "vibewatch-worker-", "vibewatch-helper-", "vibewatch-dev-updater-"} {
 		if strings.HasPrefix(name, prefix) {
 			if prefix == "vibewatch-helper-" {
 				return true, "helper"
+			}
+			if prefix == "vibewatch-dev-updater-" {
+				return true, "maintenance"
 			}
 			return true, "worker"
 		}
@@ -1001,7 +1313,7 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p, _ := a.Store.Policy(r.Context(), id, container)
-		if cm, managedByChain := a.stackChainForMember(r.Context(), id, container); managedByChain {
+		if cm, managedByChain := a.chainForMember(r.Context(), id, container); managedByChain {
 			if cm.PolicyMode == "ignore" {
 				writeErr(w, 409, fmt.Sprintf("stack %s is Excluded by update chain %s", cm.ScopeKey, cm.ChainName))
 				return
@@ -1118,14 +1430,24 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "mode must be manual, auto or ignore")
 			return
 		}
-		if cm, chainManaged := a.stackChainForMember(r.Context(), id, container); chainManaged {
+		if cm, chainManaged := a.chainForMember(r.Context(), id, container); chainManaged {
 			current, _ := a.Store.Policy(r.Context(), id, container)
 			if in.Mode != current.Mode {
 				writeErr(w, 409, fmt.Sprintf("policy is managed by update chain %s for stack %s", cm.ChainName, cm.ScopeKey))
 				return
 			}
 		}
-		p := db.Policy{HostID: id, ContainerName: container, Mode: in.Mode, CheckIntervalMinutes: in.CheckIntervalMinutes, ReleaseRepo: in.ReleaseRepo, AllowPreflightWarnings: db.Bool(in.AllowPreflightWarnings)}
+		interval := in.CheckIntervalMinutes
+		if interval < 1 {
+			// Web UI V2 no longer exposes per-container polling cadence; Automations own
+			// scheduling. Preserve a legacy value when an older database/client still has one.
+			if current, err := a.Store.Policy(r.Context(), id, container); err == nil && current.CheckIntervalMinutes > 0 {
+				interval = current.CheckIntervalMinutes
+			} else {
+				interval = 30
+			}
+		}
+		p := db.Policy{HostID: id, ContainerName: container, Mode: in.Mode, CheckIntervalMinutes: interval, ReleaseRepo: in.ReleaseRepo, AllowPreflightWarnings: db.Bool(in.AllowPreflightWarnings)}
 		if err := a.Store.SavePolicy(r.Context(), p); err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -1481,7 +1803,7 @@ func (a *App) readOnlyRegistryCheck(ctx context.Context, hostID int64, c dockerc
 	cache.LastCheckedAt = now
 	cache.LastError = ""
 
-	item := watchtower.CheckItem{Name: c.Name, Image: c.Image, ImageID: c.ImageID, Timestamp: now}
+	item := watchtower.CheckItem{Name: c.Name, Image: c.Image, ImageID: c.ImageID}
 	var errs []string
 	var h db.Host
 	var platform registry.Platform
@@ -1554,7 +1876,7 @@ func (a *App) readOnlyRegistryCheck(ctx context.Context, hostID int64, c dockerc
 		}
 	}
 
-	res := watchtower.CheckResponse{Containers: []watchtower.CheckItem{item}, Count: 1, Timestamp: now}
+	res := watchtower.CheckResponse{Containers: []watchtower.CheckItem{item}, Count: 1}
 	if cache.LastError != "" {
 		return res, errors.New(cache.LastError)
 	}
@@ -1590,6 +1912,7 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 	}
 	latestRestorePoints, _ := a.Store.LatestRestorePointsForHost(ctx, hostID)
 	stackManagement, _ := a.stackChainManagement(ctx, hostID)
+	chainMemberManagement, _ := a.chainMemberManagement(ctx, hostID)
 
 	// Inspect image labels/platforms in batches. Previously first-load rendering
 	// could issue an image-inspect round-trip for every container, which becomes
@@ -1669,7 +1992,11 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 		if c.StackName != "" {
 			if cm, ok := stackManagement[c.StackName]; ok {
 				effectiveMode = cm.PolicyMode
+			} else if cm, ok := chainMemberManagement[c.Name]; ok {
+				effectiveMode = cm.PolicyMode
 			}
+		} else if cm, ok := chainMemberManagement[c.Name]; ok {
+			effectiveMode = cm.PolicyMode
 		}
 		if !managed && effectiveMode == "ignore" && imageStateStale(cache.LastCheckedAt, cache.LastError) {
 			go a.refreshExcludedImageState(hostID, c)
@@ -1715,6 +2042,15 @@ func (a *App) handleContainers(w http.ResponseWriter, r *http.Request, hostID in
 		var chainManagement *ChainManagementView
 		if c.StackName != "" {
 			if cm, ok := stackManagement[c.StackName]; ok {
+				copy := cm
+				chainManagement = &copy
+			}
+		}
+		// A stack chain owns the policy of every chain member. Fall back to
+		// explicit step membership as well so the UI stays read-only even when
+		// Docker stack metadata is temporarily incomplete or stale.
+		if chainManagement == nil {
+			if cm, ok := chainMemberManagement[c.Name]; ok {
 				copy := cm
 				chainManagement = &copy
 			}
@@ -2050,7 +2386,7 @@ func (a *App) runCheck(ctx context.Context, jobID, hostID int64, container, trig
 		_ = a.Store.TouchPolicy(ctx, hostID, item.Name)
 		if p, e := a.Store.Policy(ctx, hostID, item.Name); e == nil {
 			effectiveMode := p.Mode
-			if cm, chainManaged := a.stackChainForMember(ctx, hostID, item.Name); chainManaged {
+			if cm, chainManaged := a.chainForMember(ctx, hostID, item.Name); chainManaged {
 				effectiveMode = cm.PolicyMode
 			}
 			if effectiveMode == "manual" && item.UpdateAvailable {
@@ -2101,7 +2437,7 @@ func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigge
 		return 0, fmt.Errorf("%s is reserved by running update chain #%d", container, chainID)
 	}
 	if !isChainTrigger {
-		if cm, chainManaged := a.stackChainForMember(ctx, hostID, container); chainManaged {
+		if cm, chainManaged := a.chainForMember(ctx, hostID, container); chainManaged {
 			return 0, fmt.Errorf("%s is managed by update chain %s for stack %s; run the chain instead of updating an individual member", container, cm.ChainName, cm.ScopeKey)
 		}
 	}
@@ -3218,76 +3554,6 @@ func (a *App) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"job": job, "progress": map[string]any{"percent": percent, "stage": stage}})
 }
 
-func (a *App) handleSchedules(w http.ResponseWriter, r *http.Request) {
-	if !a.requireAdmin(w, r) {
-		return
-	}
-	if r.Method == http.MethodGet {
-		x, err := a.Store.Schedules(r.Context())
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		writeJSON(w, 200, x)
-		return
-	}
-	var in scheduleInput
-	if json.NewDecoder(r.Body).Decode(&in) != nil {
-		writeErr(w, 400, "invalid json")
-		return
-	}
-	if err := scheduler.Validate(in.Cron); err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	if in.Action != "check" && in.Action != "update" {
-		writeErr(w, 400, "action must be check or update")
-		return
-	}
-	if strings.TrimSpace(in.Name) == "" {
-		writeErr(w, 400, "schedule name is required")
-		return
-	}
-	if in.HostID <= 0 {
-		writeErr(w, 400, "host is required")
-		return
-	}
-	cleanTargets := make([]string, 0, len(in.Containers))
-	seenTargets := map[string]bool{}
-	for _, target := range in.Containers {
-		target = strings.TrimSpace(target)
-		if target == "" || seenTargets[target] {
-			continue
-		}
-		seenTargets[target] = true
-		cleanTargets = append(cleanTargets, target)
-	}
-	if len(cleanTargets) == 0 {
-		writeErr(w, 400, "select at least one container or all running containers")
-		return
-	}
-	if seenTargets["*"] && len(cleanTargets) > 1 {
-		writeErr(w, 400, "all running containers cannot be combined with individual containers")
-		return
-	}
-	b, _ := json.Marshal(cleanTargets)
-	x := db.Schedule{ID: in.ID, Name: in.Name, Cron: in.Cron, Action: in.Action, HostID: in.HostID, Containers: string(b), Enabled: db.Bool(in.Enabled)}
-	id, err := a.Store.SaveSchedule(r.Context(), x)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	_ = a.Store.Audit(r.Context(), "admin", "schedule.save", in.HostID, "", in.Name)
-	writeJSON(w, 200, map[string]any{"id": id})
-}
-func (a *App) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/schedules/"), "/"), 10, 64)
-	if err := a.Store.DeleteSchedule(r.Context(), id); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"ok": true})
-}
 func (a *App) handleAudit(w http.ResponseWriter, r *http.Request) {
 	x, err := a.Store.Audits(r.Context(), 200)
 	if err != nil {
@@ -3979,6 +4245,45 @@ func maskSecret(v string) string {
 		return "configured"
 	}
 	return "••••••" + v[len(v)-6:]
+}
+
+func (a *App) handleNotificationReadState(w http.ResponseWriter, r *http.Request) {
+	uid := a.identity(r).UserID
+	if r.Method == http.MethodGet {
+		reads, err := a.Store.UINotificationReads(r.Context(), uid)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"reads": reads})
+		return
+	}
+	var in struct {
+		Items []db.UINotificationRead `json:"items"`
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&in) != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	if len(in.Items) == 0 || len(in.Items) > 100 {
+		writeErr(w, 400, "notification items must contain between 1 and 100 entries")
+		return
+	}
+	items := make([]db.UINotificationRead, 0, len(in.Items))
+	for _, item := range in.Items {
+		id := strings.TrimSpace(item.NotificationID)
+		fingerprint := strings.TrimSpace(item.Fingerprint)
+		if id == "" || fingerprint == "" || len(id) > 256 || len(fingerprint) > 2048 {
+			writeErr(w, 400, "invalid notification read state")
+			return
+		}
+		items = append(items, db.UINotificationRead{NotificationID: id, Fingerprint: fingerprint})
+	}
+	if err := a.Store.SaveUINotificationReads(r.Context(), uid, items); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (a *App) handleNotificationSettings(w http.ResponseWriter, r *http.Request) {

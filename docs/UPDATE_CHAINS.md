@@ -36,7 +36,7 @@ If a destructive failure means protected data must return to the pre-Chain basel
 
 ## Controller restart recovery
 
-v0.9.5 treats a controller restart as a recovery event, not a reason to blindly continue a multi-service Chain.
+v1.0.0 treats a controller restart as a recovery event, not a reason to blindly continue a multi-service Chain.
 
 - Child update transactions reconcile first.
 - A started restart/recreate is verified or restored where possible.

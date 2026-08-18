@@ -7,14 +7,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+const (
+	// Keep registry bursts deliberately small. A single Vibewatch controller can
+	// fan out policy runs to many Docker hosts at once, but public registries see
+	// those requests as one client/IP and can rate-limit a sudden manifest storm.
+	defaultRegistryConcurrency = 3
+	manifestCacheTTL           = 90 * time.Second
+	rateLimitMaxRetries        = 3
+)
+
+var rateLimitBackoff = [...]time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}
 
 type ImageRef struct {
 	Registry   string `json:"registry"`
@@ -38,17 +51,35 @@ type RemoteImageState struct {
 }
 
 type Version struct {
-	Version    string `json:"version"`
-	Source     string `json:"source"`
-	Registry   string `json:"registry"`
-	Repository string `json:"repository"`
-	Tag        string `json:"tag"`
-	Digest     string `json:"digest"`
+	Version string
+	Source  string
 }
 
 type cached struct {
 	V  Version
 	At time.Time
+}
+
+type cachedManifest struct {
+	Manifest map[string]any
+	Digest   string
+	Token    string
+	At       time.Time
+}
+
+type manifestFlight struct {
+	done     chan struct{}
+	manifest map[string]any
+	digest   string
+	token    string
+	err      error
+}
+
+type registryLimiter struct {
+	sem chan struct{}
+	mu  sync.Mutex
+
+	blockedUntil time.Time
 }
 
 type Credential struct {
@@ -58,14 +89,25 @@ type Credential struct {
 }
 
 type Client struct {
-	HTTP  *http.Client
-	mu    sync.Mutex
-	cache map[string]cached
-	creds map[string]Credential
+	HTTP            *http.Client
+	mu              sync.Mutex
+	cache           map[string]cached
+	manifestCache   map[string]cachedManifest
+	manifestFlights map[string]*manifestFlight
+	creds           map[string]Credential
+	authGeneration  uint64
+	limiters        map[string]*registryLimiter
 }
 
 func New() *Client {
-	return &Client{HTTP: &http.Client{Timeout: 15 * time.Second}, cache: map[string]cached{}, creds: map[string]Credential{}}
+	return &Client{
+		HTTP:            &http.Client{Timeout: 15 * time.Second},
+		cache:           map[string]cached{},
+		manifestCache:   map[string]cachedManifest{},
+		manifestFlights: map[string]*manifestFlight{},
+		creds:           map[string]Credential{},
+		limiters:        map[string]*registryLimiter{},
+	}
 }
 
 func normalizeRegistryHost(v string) string {
@@ -94,6 +136,8 @@ func (c *Client) SetCredentials(xs []Credential) {
 	// Authentication can change the readable manifest/version, so never retain
 	// metadata cached under a previous credential set.
 	c.cache = map[string]cached{}
+	c.manifestCache = map[string]cachedManifest{}
+	c.authGeneration++
 }
 
 func (c *Client) credential(registry string) Credential {
@@ -334,7 +378,7 @@ func (c *Client) RemoteVersionForPlatform(ctx context.Context, image string, p P
 		return x.V, nil
 	}
 	c.mu.Unlock()
-	manifest, digest, auth, _, err := c.getPlatformManifest(ctx, ref, p)
+	manifest, _, auth, _, err := c.getPlatformManifest(ctx, ref, p)
 	if err != nil {
 		return Version{}, err
 	}
@@ -364,7 +408,7 @@ func (c *Client) RemoteVersionForPlatform(ctx context.Context, image string, p P
 	if ref.Registry == "ghcr.io" {
 		source = "ghcr"
 	}
-	out := Version{Version: version, Source: source, Registry: ref.Registry, Repository: ref.Repository, Tag: ref.Tag, Digest: digest}
+	out := Version{Version: version, Source: source}
 	c.mu.Lock()
 	c.cache[key] = cached{V: out, At: time.Now()}
 	c.mu.Unlock()
@@ -399,7 +443,158 @@ func parseChallenge(v string) (string, map[string]string) {
 	}
 	return "bearer", out
 }
-func (c *Client) token(ctx context.Context, ch map[string]string, cred Credential) (string, error) {
+
+type releaseBody struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (b *releaseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+func (c *Client) limiter(registry string) *registryLimiter {
+	registry = normalizeRegistryHost(registry)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.limiters == nil {
+		c.limiters = map[string]*registryLimiter{}
+	}
+	if lim := c.limiters[registry]; lim != nil {
+		return lim
+	}
+	lim := &registryLimiter{sem: make(chan struct{}, defaultRegistryConcurrency)}
+	c.limiters[registry] = lim
+	return lim
+}
+
+func (l *registryLimiter) wait(ctx context.Context) error {
+	l.mu.Lock()
+	wait := time.Until(l.blockedUntil)
+	l.mu.Unlock()
+	if wait <= 0 {
+		return nil
+	}
+	return sleepContext(ctx, wait)
+}
+
+func (l *registryLimiter) coolDown(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	until := time.Now().Add(d)
+	l.mu.Lock()
+	if until.After(l.blockedUntil) {
+		l.blockedUntil = until
+	}
+	l.mu.Unlock()
+}
+
+func (c *Client) httpDo(ctx context.Context, registry string, req *http.Request) (*http.Response, error) {
+	lim := c.limiter(registry)
+	select {
+	case lim.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	release := func() { <-lim.sem }
+	if err := lim.wait(ctx); err != nil {
+		release()
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if resp.Body == nil {
+		release()
+		return resp, nil
+	}
+	resp.Body = &releaseBody{ReadCloser: resp.Body, release: release}
+	return resp, nil
+}
+
+func retryAfterDelay(v string, now time.Time) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(v); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := t.Sub(now)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
+}
+
+func rateLimitDelay(resp *http.Response, retry int) time.Duration {
+	if resp != nil {
+		if d, ok := retryAfterDelay(resp.Header.Get("Retry-After"), time.Now()); ok {
+			return d
+		}
+	}
+	if retry < 0 {
+		retry = 0
+	}
+	if retry >= len(rateLimitBackoff) {
+		retry = len(rateLimitBackoff) - 1
+	}
+	// Jitter prevents simultaneous jobs that were released from the same
+	// registry bucket from retrying on exactly the same millisecond.
+	return rateLimitBackoff[retry] + time.Duration(rand.Intn(501))*time.Millisecond
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) httpDoRateLimited(ctx context.Context, registry string, makeRequest func() (*http.Request, error)) (*http.Response, error) {
+	lim := c.limiter(registry)
+	for attempt := 0; ; attempt++ {
+		req, err := makeRequest()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpDo(ctx, registry, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusTooManyRequests || attempt >= rateLimitMaxRetries {
+			return resp, nil
+		}
+		delay := rateLimitDelay(resp, attempt)
+		// A 429 applies to the registry/client as a whole, not just one container.
+		// Publish the cooldown to every concurrent policy run before this request
+		// releases its slot, so new work waits instead of immediately hammering the
+		// provider with the next manifest request.
+		lim.coolDown(delay)
+		// Drain a bounded response so keep-alive connections remain reusable, then
+		// release the per-registry slot before waiting for the next attempt.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256<<10))
+		_ = resp.Body.Close()
+	}
+}
+
+func (c *Client) token(ctx context.Context, registry string, ch map[string]string, cred Credential) (string, error) {
 	realm := ch["realm"]
 	if realm == "" {
 		return "", fmt.Errorf("registry auth challenge missing realm")
@@ -416,18 +611,26 @@ func (c *Client) token(ctx context.Context, ch map[string]string, cred Credentia
 		q.Set("scope", v)
 	}
 	u.RawQuery = q.Encode()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	req.Header.Set("User-Agent", "vibewatch")
-	if strings.TrimSpace(cred.Secret) != "" {
-		req.SetBasicAuth(cred.Username, cred.Secret)
-	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpDoRateLimited(ctx, registry, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "vibewatch")
+		if strings.TrimSpace(cred.Secret) != "" {
+			req.SetBasicAuth(cred.Username, cred.Secret)
+		}
+		return req, nil
+	})
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode/100 != 2 {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return "", fmt.Errorf("registry token HTTP 429 (rate limited after automatic retries): %s", strings.TrimSpace(string(b)))
+		}
 		return "", fmt.Errorf("registry token HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	var x struct {
@@ -448,17 +651,25 @@ func (c *Client) token(ctx context.Context, ch map[string]string, cred Credentia
 func (c *Client) do(ctx context.Context, ref ImageRef, path, accept, token string) (*http.Response, string, error) {
 	u := "https://" + ref.Registry + path
 	cred := c.credential(ref.Registry)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", "vibewatch")
-	if accept != "" {
-		req.Header.Set("Accept", accept)
+	makeRequest := func(authToken string) func() (*http.Request, error) {
+		return func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("User-Agent", "vibewatch")
+			if accept != "" {
+				req.Header.Set("Accept", accept)
+			}
+			if authToken != "" {
+				req.Header.Set("Authorization", "Bearer "+authToken)
+			} else if strings.TrimSpace(cred.Secret) != "" {
+				req.SetBasicAuth(cred.Username, cred.Secret)
+			}
+			return req, nil
+		}
 	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	} else if strings.TrimSpace(cred.Secret) != "" {
-		req.SetBasicAuth(cred.Username, cred.Secret)
-	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpDoRateLimited(ctx, ref.Registry, makeRequest(token))
 	if err != nil {
 		return nil, token, err
 	}
@@ -473,36 +684,106 @@ func (c *Client) do(ctx context.Context, ref ImageRef, path, accept, token strin
 	if ch["scope"] == "" {
 		ch["scope"] = "repository:" + ref.Repository + ":pull"
 	}
-	tok, err := c.token(ctx, ch, cred)
+	tok, err := c.token(ctx, ref.Registry, ch, cred)
 	if err != nil {
 		return nil, "", err
 	}
-	req, _ = http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", "vibewatch")
-	if accept != "" {
-		req.Header.Set("Accept", accept)
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	resp, err = c.HTTP.Do(req)
+	resp, err = c.httpDoRateLimited(ctx, ref.Registry, makeRequest(tok))
 	return resp, tok, err
 }
+
+func (c *Client) manifestKey(ref ImageRef, target string) string {
+	c.mu.Lock()
+	generation := c.authGeneration
+	c.mu.Unlock()
+	return fmt.Sprintf("%d|%s/%s@%s", generation, normalizeRegistryHost(ref.Registry), ref.Repository, target)
+}
+
+func (c *Client) cachedManifest(key string) (cachedManifest, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.manifestCache == nil {
+		c.manifestCache = map[string]cachedManifest{}
+	}
+	x, ok := c.manifestCache[key]
+	if !ok {
+		return cachedManifest{}, false
+	}
+	if time.Since(x.At) >= manifestCacheTTL {
+		delete(c.manifestCache, key)
+		return cachedManifest{}, false
+	}
+	return x, true
+}
+
+func (c *Client) beginManifestFlight(key string) (*manifestFlight, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.manifestFlights == nil {
+		c.manifestFlights = map[string]*manifestFlight{}
+	}
+	if flight := c.manifestFlights[key]; flight != nil {
+		return flight, false
+	}
+	flight := &manifestFlight{done: make(chan struct{})}
+	c.manifestFlights[key] = flight
+	return flight, true
+}
+
+func (c *Client) finishManifestFlight(key string, flight *manifestFlight, manifest map[string]any, digest, token string, err error) {
+	c.mu.Lock()
+	flight.manifest, flight.digest, flight.token, flight.err = manifest, digest, token, err
+	if err == nil {
+		if c.manifestCache == nil {
+			c.manifestCache = map[string]cachedManifest{}
+		}
+		c.manifestCache[key] = cachedManifest{Manifest: manifest, Digest: digest, Token: token, At: time.Now()}
+	}
+	delete(c.manifestFlights, key)
+	close(flight.done)
+	c.mu.Unlock()
+}
+
 func (c *Client) getManifest(ctx context.Context, ref ImageRef, override, token string) (map[string]any, string, string, error) {
 	target := ref.Tag
 	if override != "" {
 		target = override
 	}
+	key := c.manifestKey(ref, target)
+	if x, ok := c.cachedManifest(key); ok {
+		return x.Manifest, x.Digest, x.Token, nil
+	}
+	flight, leader := c.beginManifestFlight(key)
+	if !leader {
+		select {
+		case <-flight.done:
+			return flight.manifest, flight.digest, flight.token, flight.err
+		case <-ctx.Done():
+			return nil, "", token, ctx.Err()
+		}
+	}
+
 	accept := "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
 	resp, tok, err := c.do(ctx, ref, "/v2/"+ref.Repository+"/manifests/"+url.PathEscape(target), accept, token)
 	if err != nil {
+		c.finishManifestFlight(key, flight, nil, "", tok, err)
 		return nil, "", tok, err
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode/100 != 2 {
-		return nil, "", tok, fmt.Errorf("registry manifest HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		var responseErr error
+		if resp.StatusCode == http.StatusTooManyRequests {
+			responseErr = fmt.Errorf("registry manifest HTTP 429 (rate limited after automatic retries): %s", strings.TrimSpace(string(b)))
+		} else {
+			responseErr = fmt.Errorf("registry manifest HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		}
+		c.finishManifestFlight(key, flight, nil, "", tok, responseErr)
+		return nil, "", tok, responseErr
 	}
 	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
+		c.finishManifestFlight(key, flight, nil, "", tok, err)
 		return nil, "", tok, err
 	}
 	digest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest"))
@@ -510,6 +791,7 @@ func (c *Client) getManifest(ctx context.Context, ref ImageRef, override, token 
 		sum := sha256.Sum256(b)
 		digest = "sha256:" + hex.EncodeToString(sum[:])
 	}
+	c.finishManifestFlight(key, flight, m, digest, tok, nil)
 	return m, digest, tok, nil
 }
 func (c *Client) getConfigLabels(ctx context.Context, ref ImageRef, digest, token string) (map[string]string, error) {
@@ -520,6 +802,9 @@ func (c *Client) getConfigLabels(ctx context.Context, ref ImageRef, digest, toke
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode/100 != 2 {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("registry config HTTP 429 (rate limited after automatic retries): %s", strings.TrimSpace(string(b)))
+		}
 		return nil, fmt.Errorf("registry config HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	var x struct {

@@ -8,22 +8,18 @@ Do not expose an unauthenticated Docker API to untrusted networks.
 
 ## Remote Docker
 
-Preferred remote mode:
+Preferred remote mode is **Secure connection**. Owner-only Secure Quick Setup uses SSH once to configure Docker on `2376` with mutual TLS, generates a per-host CA plus server/client identities and stores only the controller credentials in Vibewatch persistent storage.
 
-```text
-tls://host:2376
-```
+If a host already has TLS/mTLS configuration owned by another application, Vibewatch refuses to overwrite it. Use the Advanced connection path with an existing CA/client certificate/key instead. Secure and Legacy TCP Quick Setup also preflight Docker's existing systemd/daemon configuration before changing it. Remote changes are staged transactionally: the previous Docker configuration is retained until the controller has successfully reached the new endpoint, and failures restore the previous listener automatically when possible.
 
-with a trusted CA and client certificate/key.
-
-Legacy unencrypted `tcp://host:2375` is supported for compatibility but should only exist on a trusted isolated network.
+Legacy unencrypted `tcp://host:2375` remains supported for compatibility but should only exist on a trusted isolated network.
 
 ## Controller secrets
 
 - Keep `.env` private.
 - Use a strong Owner password.
 - Use a long random session secret.
-- Docker TLS/mTLS private keys are stored in the persistent data directory with restrictive permissions.
+- Docker TLS/mTLS private keys are stored in the persistent data directory with restrictive permissions. Vibewatch-managed Secure Quick Setup also retains the per-host CA key so future credential rotation can preserve host identity.
 - Registry credentials are stored encrypted by Vibewatch.
 - Review diagnostic/support archives before publishing them.
 

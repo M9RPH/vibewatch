@@ -401,36 +401,6 @@ func (a *App) runRecoveryGC(ctx context.Context, trigger string) db.RecoveryGCRu
 	return run
 }
 
-func (a *App) recoveryStorageSummary(ctx context.Context) recoverySummary {
-	out := recoverySummary{}
-	points, _ := a.Store.RestorePoints(ctx, 5000, 0, "")
-	for _, rp := range points {
-		out.RestorePoints++
-		switch {
-		case rp.Status == "expired" || rp.IntegrityStatus == "expired":
-			out.Expired++
-		case rp.Status == "degraded" || rp.Status == "failed" || rp.IntegrityStatus == "degraded":
-			out.Degraded++
-		default:
-			out.Ready++
-		}
-	}
-	hostSeen := map[int64]bool{}
-	for _, rp := range points {
-		hostSeen[rp.HostID] = true
-	}
-	for hostID := range hostSeen {
-		images, nets, vols := a.rollbackProtectedDockerObjects(hostID)
-		out.ProtectedImages += len(images)
-		out.ProtectedNetworks += len(nets)
-		out.ProtectedVolumes += len(vols)
-	}
-	if runs, _ := a.Store.RecoveryGCRuns(ctx, 1); len(runs) > 0 {
-		out.LatestGC = &runs[0]
-	}
-	return out
-}
-
 func (a *App) handleUpdateTransactions(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconvAtoiDefault(r.URL.Query().Get("limit"), 200)
 	rows, err := a.Store.UpdateTransactions(r.Context(), limit)

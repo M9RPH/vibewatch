@@ -1,7 +1,6 @@
 package logging
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -105,35 +104,4 @@ func New(path, level string) (*slog.Logger, *slog.LevelVar, error) {
 	out := io.MultiWriter(os.Stdout, rw)
 	h := slog.NewJSONHandler(out, &slog.HandlerOptions{Level: lv})
 	return slog.New(h), lv, nil
-}
-
-func RedactJSON(raw []byte) []byte {
-	var v any
-	if json.Unmarshal(raw, &v) != nil {
-		return raw
-	}
-	redact(v)
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return raw
-	}
-	return b
-}
-
-func redact(v any) {
-	switch x := v.(type) {
-	case map[string]any:
-		for k, val := range x {
-			lower := strings.ToLower(k)
-			if strings.Contains(lower, "token") || strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "authorization") {
-				x[k] = "REDACTED"
-			} else {
-				redact(val)
-			}
-		}
-	case []any:
-		for _, val := range x {
-			redact(val)
-		}
-	}
 }

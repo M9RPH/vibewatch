@@ -70,13 +70,9 @@ func TestV084VerificationHistoryAndChainsRoundTrip(t *testing.T) {
 	if _, err := s.AddUpdateChainRunStep(ctx, UpdateChainRunStep{RunID: rid, Position: 1, ContainerName: "redis", Status: "updating"}); err != nil {
 		t.Fatal(err)
 	}
-	n, err := s.FailActiveUpdateChainRuns(ctx, "controller restarted")
-	if err != nil || n != 1 {
-		t.Fatalf("recovery failed n=%d err=%v", n, err)
-	}
-	runs, err := s.UpdateChainRuns(ctx, cid, 10)
-	if err != nil || len(runs) != 1 || runs[0].Status != "failed" {
-		t.Fatalf("interrupted run not failed: %#v err=%v", runs, err)
+	runs, err := s.ActiveUpdateChainRuns(ctx)
+	if err != nil || len(runs) != 1 || runs[0].Status != "running" {
+		t.Fatalf("active chain run was not preserved for crash recovery: %#v err=%v", runs, err)
 	}
 }
 

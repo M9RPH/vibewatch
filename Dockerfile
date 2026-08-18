@@ -12,19 +12,22 @@ COPY go.mod ./
 COPY VERSION ./VERSION
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
-RUN VIBEWATCH_VERSION="$(cat VERSION)" && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$VIBEWATCH_VERSION" -o /out/vibewatch ./cmd/server
+RUN VIBEWATCH_VERSION="$(cat VERSION)" && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$VIBEWATCH_VERSION" -o /out/vibewatch ./cmd/server && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/vibewatch-dev-updater ./cmd/devupdater
 
 FROM alpine:3.20
-ARG VIBEWATCH_VERSION=0.9.5
+ARG VIBEWATCH_VERSION=1.0.0
 LABEL org.opencontainers.image.title="Vibewatch" \
       org.opencontainers.image.version="$VIBEWATCH_VERSION" \
       org.opencontainers.image.description="Self-hosted Docker update and recovery platform" \
       org.opencontainers.image.source="https://github.com/M9RPH/vibewatch" \
       org.opencontainers.image.url="https://github.com/M9RPH/vibewatch" \
       org.opencontainers.image.licenses="MIT"
-RUN apk add --no-cache ca-certificates tzdata sqlite docker-cli openssh-client sshpass && addgroup -S vibewatch && adduser -S -G vibewatch vibewatch
+RUN apk add --no-cache ca-certificates tzdata sqlite docker-cli docker-cli-compose openssh-client sshpass && addgroup -S vibewatch && adduser -S -G vibewatch vibewatch
 WORKDIR /app
 COPY --from=go-build /out/vibewatch /usr/local/bin/vibewatch
+COPY --from=go-build /out/vibewatch-dev-updater /usr/local/bin/vibewatch-dev-updater
 COPY --from=web-build /src/web/dist /app/web
 RUN mkdir -p /data/logs && chown -R vibewatch:vibewatch /data /app
 # The Docker socket normally requires root/docker-group access. The container

@@ -27,31 +27,19 @@ type CheckItem struct {
 	LatestImageID   string `json:"latest_image_id"`
 	LatestDigest    string `json:"latest_digest"`
 	Error           string `json:"error"`
-	Timestamp       string `json:"timestamp"`
 }
 type CheckResponse struct {
 	Containers []CheckItem `json:"containers"`
 	Count      int         `json:"count"`
-	Timestamp  string      `json:"timestamp"`
-	APIVersion string      `json:"api_version"`
 }
 type UpdateSummary struct {
-	Scanned   int `json:"scanned"`
-	Updated   int `json:"updated"`
-	Failed    int `json:"failed"`
-	Restarted int `json:"restarted"`
-	Skipped   int `json:"skipped"`
-}
-type UpdateTiming struct {
-	DurationMS int64  `json:"duration_ms"`
-	Duration   string `json:"duration"`
+	Updated int `json:"updated"`
+	Failed  int `json:"failed"`
+	Skipped int `json:"skipped"`
 }
 type UpdateResponse struct {
-	Summary    UpdateSummary `json:"summary"`
-	Timing     UpdateTiming  `json:"timing"`
-	Timestamp  string        `json:"timestamp"`
-	APIVersion string        `json:"api_version"`
-	Error      string        `json:"error,omitempty"`
+	Summary UpdateSummary `json:"summary"`
+	Error   string        `json:"error,omitempty"`
 }
 
 func (c *Client) request(ctx context.Context, method, rawURL, token string, dst any) ([]byte, error) {
@@ -76,9 +64,6 @@ func (c *Client) request(ctx context.Context, method, rawURL, token string, dst 
 		}
 	}
 	return body, nil
-}
-func (c *Client) WaitReady(ctx context.Context, base string) error {
-	return c.WaitReadyFor(ctx, base, 30*time.Second)
 }
 
 func (c *Client) WaitReadyFor(ctx context.Context, base string, timeout time.Duration) error {

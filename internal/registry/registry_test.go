@@ -4,8 +4,12 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestParse(t *testing.T) {
@@ -152,5 +156,220 @@ func TestPrivateRegistryCredentialIsUsedForBearerTokenExchange(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("calls=%d, want 3", calls)
+	}
+}
+
+func TestRegistry429RetriesAndRecovers(t *testing.T) {
+	var calls atomic.Int32
+	c := New()
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		n := calls.Add(1)
+		if n <= 2 {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Retry-After": []string{"0"}},
+				Body:       io.NopCloser(strings.NewReader(`{"errors":[{"code":"TOOMANYREQUESTS"}]}`)),
+				Request:    r,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Docker-Content-Digest": []string{"sha256:recovered"}},
+			Body:       io.NopCloser(strings.NewReader(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:config"}}`)),
+			Request:    r,
+		}, nil
+	})}
+
+	digest, err := c.RemoteDigest(context.Background(), "rate.test/example/app:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != "sha256:recovered" {
+		t.Fatalf("digest=%q", digest)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("calls=%d, want 3", got)
+	}
+}
+
+func TestRegistry429FailsOnlyAfterAutomaticRetries(t *testing.T) {
+	var calls atomic.Int32
+	c := New()
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"0"}},
+			Body:       io.NopCloser(strings.NewReader(`{"errors":[{"code":"TOOMANYREQUESTS"}]}`)),
+			Request:    r,
+		}, nil
+	})}
+
+	_, err := c.RemoteDigest(context.Background(), "rate.test/example/app:latest")
+	if err == nil || !strings.Contains(err.Error(), "rate limited after automatic retries") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := calls.Load(); got != rateLimitMaxRetries+1 {
+		t.Fatalf("calls=%d, want %d", got, rateLimitMaxRetries+1)
+	}
+}
+
+func TestManifestCacheAvoidsRepeatedRegistryRequest(t *testing.T) {
+	var calls atomic.Int32
+	c := New()
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Docker-Content-Digest": []string{"sha256:cached"}},
+			Body:       io.NopCloser(strings.NewReader(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:config"}}`)),
+			Request:    r,
+		}, nil
+	})}
+
+	for i := 0; i < 2; i++ {
+		if _, err := c.RemoteDigest(context.Background(), "cache.test/example/app:latest"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("registry calls=%d, want 1 cached request", got)
+	}
+}
+
+func TestManifestBurstIsCoalesced(t *testing.T) {
+	var calls atomic.Int32
+	requestStarted := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	c := New()
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		startOnce.Do(func() { close(requestStarted) })
+		<-release
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Docker-Content-Digest": []string{"sha256:singleflight"}},
+			Body:       io.NopCloser(strings.NewReader(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:config"}}`)),
+			Request:    r,
+		}, nil
+	})}
+
+	const workers = 12
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := c.RemoteDigest(context.Background(), "burst.test/example/app:latest")
+			errCh <- err
+		}()
+	}
+	close(start)
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("registry request did not start")
+	}
+	// Give the remaining goroutines time to join the in-flight request before
+	// the leader is allowed to complete.
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("registry calls=%d, want one coalesced request", got)
+	}
+}
+
+type blockingTrackedBody struct {
+	release <-chan struct{}
+	reader  *strings.Reader
+	active  *atomic.Int32
+	once    sync.Once
+	waited  bool
+}
+
+func (b *blockingTrackedBody) Read(p []byte) (int, error) {
+	if !b.waited {
+		b.waited = true
+		<-b.release
+	}
+	return b.reader.Read(p)
+}
+
+func (b *blockingTrackedBody) Close() error {
+	b.once.Do(func() { b.active.Add(-1) })
+	return nil
+}
+
+func TestRegistryConcurrencyIsBoundedPerRegistry(t *testing.T) {
+	var active atomic.Int32
+	var maximum atomic.Int32
+	release := make(chan struct{})
+	c := New()
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		current := active.Add(1)
+		for {
+			old := maximum.Load()
+			if current <= old || maximum.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		body := &blockingTrackedBody{
+			release: release,
+			reader:  strings.NewReader(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:config"}}`),
+			active:  &active,
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Docker-Content-Digest": []string{"sha256:ok"}},
+			Body:       body,
+			Request:    r,
+		}, nil
+	})}
+
+	const workers = 10
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := c.RemoteDigest(context.Background(), "limit.test/example/app"+strconv.Itoa(i)+":latest")
+			errCh <- err
+		}(i)
+	}
+	close(start)
+
+	deadline := time.Now().Add(time.Second)
+	for maximum.Load() < defaultRegistryConcurrency && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := maximum.Load(); got != defaultRegistryConcurrency {
+		close(release)
+		wg.Wait()
+		t.Fatalf("maximum concurrent requests=%d, want %d", got, defaultRegistryConcurrency)
+	}
+	close(release)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := maximum.Load(); got > defaultRegistryConcurrency {
+		t.Fatalf("maximum concurrent requests=%d, limit=%d", got, defaultRegistryConcurrency)
 	}
 }

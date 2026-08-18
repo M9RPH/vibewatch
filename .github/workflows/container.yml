@@ -31,6 +31,17 @@ jobs:
       - name: Verify Compose release files stay in sync
         run: cmp -s compose.yml docker-compose.yml
 
+      - name: Public docs sanity
+        shell: bash
+        run: |
+          version="$(cat VERSION)"
+          grep -q "raw.githubusercontent.com/M9RPH/vibewatch/v${version}/compose.yml" README.md
+          test -f docs/SCREENSHOTS.md
+          test -f docs/screenshots/dashboard.png
+          test -f docs/screenshots/containers.png
+          test -f docs/screenshots/hosts.png
+          test -f docs/screenshots/rollback.png
+
       - name: Install SQLite CLI
         run: sudo apt-get update && sudo apt-get install -y sqlite3
 

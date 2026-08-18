@@ -6,6 +6,10 @@ import (
 	"testing"
 )
 
+func compareInspectConfig(before, current inspectContainer) []ConfigDriftChange {
+	return compareDriftBaseline(baselineFromInspect(before), current)
+}
+
 func TestRegistryCredentialEncryptionRoundTrip(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
 	enc, err := encryptRegistrySecret(key, "super-secret-token")

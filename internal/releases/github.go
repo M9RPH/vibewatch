@@ -48,7 +48,7 @@ func New() *GitHubClient {
 
 var ghRE = regexp.MustCompile(`(?i)(?:https?://)?github\.com/([^/]+)/([^/#]+)`)
 
-func NormalizeRepo(v string) (string, bool) {
+func normalizeRepo(v string) (string, bool) {
 	v = strings.TrimSpace(strings.TrimSuffix(v, ".git"))
 	if v == "" {
 		return "", false
@@ -65,7 +65,7 @@ func NormalizeRepo(v string) (string, bool) {
 
 func DetectFromLabels(labels map[string]string) (string, bool) {
 	for _, k := range []string{"org.opencontainers.image.source", "org.label-schema.vcs-url", "maintainer.source"} {
-		if r, ok := NormalizeRepo(labels[k]); ok {
+		if r, ok := normalizeRepo(labels[k]); ok {
 			return r, true
 		}
 	}
@@ -91,7 +91,7 @@ func FallbackFromImage(image string) (string, bool) {
 }
 
 func (g *GitHubClient) Latest(ctx context.Context, repo string) (Release, error) {
-	repo, ok := NormalizeRepo(repo)
+	repo, ok := normalizeRepo(repo)
 	if !ok {
 		return Release{}, fmt.Errorf("invalid GitHub repository")
 	}

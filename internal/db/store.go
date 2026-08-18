@@ -116,16 +116,6 @@ type JobLog struct {
 	Source  string `json:"source"`
 	Message string `json:"message"`
 }
-type Schedule struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Cron       string `json:"cron"`
-	Action     string `json:"action"`
-	HostID     int64  `json:"host_id"`
-	Containers string `json:"containers"`
-	Enabled    Bool   `json:"enabled"`
-	LastRunAt  string `json:"last_run_at"`
-}
 type Audit struct {
 	ID            int64  `json:"id"`
 	TS            string `json:"ts"`
@@ -243,11 +233,10 @@ func (n *NotificationSettings) UnmarshalJSON(data []byte) error {
 }
 
 type NotificationTarget struct {
-	UserID           int64  `json:"user_id"`
-	Username         string `json:"username"`
-	Role             string `json:"role"`
-	PushoverAppToken string `json:"-"`
-	PushoverUserKey  string `json:"-"`
+	UserID           int64
+	Username         string
+	PushoverAppToken string
+	PushoverUserKey  string
 }
 
 type NotificationDelivery struct {
@@ -261,6 +250,12 @@ type NotificationDelivery struct {
 	Title         string `json:"title"`
 	Status        string `json:"status"`
 	Error         string `json:"error"`
+}
+
+type UINotificationRead struct {
+	NotificationID string `json:"notification_id"`
+	Fingerprint    string `json:"fingerprint"`
+	ReadAt         string `json:"read_at"`
 }
 
 type UpdateHistory struct {
@@ -529,7 +524,7 @@ CREATE TABLE IF NOT EXISTS policies (host_id INTEGER NOT NULL, container_name TE
 CREATE TABLE IF NOT EXISTS container_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, image TEXT NOT NULL DEFAULT '', image_id TEXT NOT NULL DEFAULT '', current_digest TEXT NOT NULL DEFAULT '', latest_digest TEXT NOT NULL DEFAULT '', update_available INTEGER NOT NULL DEFAULT 0, first_detected_at TEXT NOT NULL DEFAULT '', snoozed_digest TEXT NOT NULL DEFAULT '', snoozed_at TEXT NOT NULL DEFAULT '', last_checked_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
 CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, trigger TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', summary_json TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS job_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL, ts TEXT NOT NULL, level TEXT NOT NULL, source TEXT NOT NULL, message TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, cron TEXT NOT NULL, action TEXT NOT NULL, host_id INTEGER NOT NULL, containers TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT NOT NULL DEFAULT '');
+-- Legacy V0.1 schedules are no longer created for fresh databases. Existing upgraded databases keep the table untouched for backup compatibility.
 CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, host_id INTEGER NOT NULL DEFAULT 0, container_name TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS version_cache (host_id INTEGER NOT NULL, container_name TEXT NOT NULL, installed_version TEXT NOT NULL DEFAULT '', installed_source TEXT NOT NULL DEFAULT '', latest_version TEXT NOT NULL DEFAULT '', latest_source TEXT NOT NULL DEFAULT '', update_kind TEXT NOT NULL DEFAULT '', security_update INTEGER NOT NULL DEFAULT 0, release_repo TEXT NOT NULL DEFAULT '', published_at TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', PRIMARY KEY(host_id,container_name));
@@ -541,6 +536,7 @@ CREATE TABLE IF NOT EXISTS user_hosts (user_id INTEGER NOT NULL, host_id INTEGER
 CREATE TABLE IF NOT EXISTS user_groups (user_id INTEGER NOT NULL, group_id INTEGER NOT NULL, PRIMARY KEY(user_id,group_id));
 CREATE TABLE IF NOT EXISTS notification_settings (user_id INTEGER PRIMARY KEY, pushover_app_token TEXT NOT NULL DEFAULT '', pushover_user_key TEXT NOT NULL DEFAULT '', notify_auto_updates INTEGER NOT NULL DEFAULT 1, notify_manual_available INTEGER NOT NULL DEFAULT 1, notify_manual_updates INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS notification_state (user_id INTEGER NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, event TEXT NOT NULL, fingerprint TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(user_id,host_id,container_name,event));
+CREATE TABLE IF NOT EXISTS notification_ui_reads (user_id INTEGER NOT NULL, notification_id TEXT NOT NULL, fingerprint TEXT NOT NULL DEFAULT '', read_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(user_id,notification_id));
 CREATE TABLE IF NOT EXISTS notification_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, user_id INTEGER NOT NULL, username TEXT NOT NULL, host_id INTEGER NOT NULL DEFAULT 0, container_name TEXT NOT NULL DEFAULT '', event TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS update_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, action TEXT NOT NULL DEFAULT 'update', trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, from_version TEXT NOT NULL DEFAULT '', to_version TEXT NOT NULL DEFAULT '', from_image_ref TEXT NOT NULL DEFAULT '', to_image_ref TEXT NOT NULL DEFAULT '', from_digest TEXT NOT NULL DEFAULT '', to_digest TEXT NOT NULL DEFAULT '', snapshot_id TEXT NOT NULL DEFAULT '', restore_point_id INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', dependency_count INTEGER NOT NULL DEFAULT 0, dependency_status TEXT NOT NULL DEFAULT '', dependency_details TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS restore_points (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, snapshot_id TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', trigger TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'ready', image_ref TEXT NOT NULL DEFAULT '', image_id TEXT NOT NULL DEFAULT '', original_image_ref TEXT NOT NULL DEFAULT '', original_image_id TEXT NOT NULL DEFAULT '', target_digest TEXT NOT NULL DEFAULT '', from_version TEXT NOT NULL DEFAULT '', unit_kind TEXT NOT NULL DEFAULT '', unit_key TEXT NOT NULL DEFAULT '', stack_type TEXT NOT NULL DEFAULT '', writable_layer INTEGER NOT NULL DEFAULT 0, config_protected INTEGER NOT NULL DEFAULT 1, volume_data_protected INTEGER NOT NULL DEFAULT 0, volume_count INTEGER NOT NULL DEFAULT 0, bind_count INTEGER NOT NULL DEFAULT 0, restore_count INTEGER NOT NULL DEFAULT 0, last_restored_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', dependency_count INTEGER NOT NULL DEFAULT 0, dependencies_json TEXT NOT NULL DEFAULT '[]');
@@ -574,116 +570,96 @@ FROM verification_history h
 JOIN (SELECT host_id,scope_type,scope_key,MAX(id) AS id FROM verification_history WHERE scope_type='stack' AND scope_key<>'' GROUP BY host_id,scope_type,scope_key) latest ON latest.id=h.id;`); err != nil {
 		return err
 	}
-	// Safe migrations for databases created by older Vibewatch releases.
-	if err := s.exec(ctx, "ALTER TABLE version_cache ADD COLUMN latest_source TEXT NOT NULL DEFAULT '';"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	// Safe additive migrations for databases created by older Vibewatch releases.
+	// The previous implementation attempted every ALTER TABLE on every startup and
+	// ignored duplicate-column errors. Checking table metadata first keeps startup
+	// quiet and makes the compatibility surface explicit without changing schema
+	// semantics for upgraded databases.
+	migrations := []columnMigration{
+		{"version_cache", "latest_source", "TEXT NOT NULL DEFAULT ''"},
+		{"version_cache", "update_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"version_cache", "security_update", "INTEGER NOT NULL DEFAULT 0"},
+		{"notification_settings", "pushover_app_token", "TEXT NOT NULL DEFAULT ''"},
+		{"notification_settings", "notify_manual_updates", "INTEGER NOT NULL DEFAULT 1"},
+		{"container_cache", "first_detected_at", "TEXT NOT NULL DEFAULT ''"},
+		{"container_cache", "snoozed_digest", "TEXT NOT NULL DEFAULT ''"},
+		{"container_cache", "snoozed_at", "TEXT NOT NULL DEFAULT ''"},
+		{"update_history", "restore_point_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"update_history", "dependency_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"update_history", "dependency_status", "TEXT NOT NULL DEFAULT ''"},
+		{"update_history", "dependency_details", "TEXT NOT NULL DEFAULT ''"},
+		{"restore_points", "dependency_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"restore_points", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"update_chains", "scope_type", "TEXT NOT NULL DEFAULT 'custom'"},
+		{"update_chains", "scope_key", "TEXT NOT NULL DEFAULT ''"},
+		{"update_chains", "policy_mode", "TEXT NOT NULL DEFAULT 'inherit'"},
+		{"update_chains", "allow_preflight_warnings", "INTEGER NOT NULL DEFAULT 0"},
+		{"policies", "allow_preflight_warnings", "INTEGER NOT NULL DEFAULT 0"},
+		{"update_chain_steps", "current_action", "TEXT NOT NULL DEFAULT 'skip'"},
+		{"update_history", "preflight_status", "TEXT NOT NULL DEFAULT ''"},
+		{"update_history", "preflight_details", "TEXT NOT NULL DEFAULT ''"},
+		{"update_history", "verification_status", "TEXT NOT NULL DEFAULT ''"},
+		{"update_history", "verification_details", "TEXT NOT NULL DEFAULT ''"},
+		{"config_drift_cache", "baseline_json", "TEXT NOT NULL DEFAULT ''"},
+		{"config_drift_cache", "baseline_source", "TEXT NOT NULL DEFAULT ''"},
+		{"restore_points", "integrity_status", "TEXT NOT NULL DEFAULT 'not_checked'"},
+		{"restore_points", "integrity_checked_at", "TEXT NOT NULL DEFAULT ''"},
+		{"restore_points", "integrity_details", "TEXT NOT NULL DEFAULT ''"},
+		{"automations", "kind", "TEXT NOT NULL DEFAULT 'policy'"},
+		{"automations", "cleanup_images", "INTEGER NOT NULL DEFAULT 0"},
+		{"automations", "cleanup_networks", "INTEGER NOT NULL DEFAULT 0"},
+		{"automations", "cleanup_build_cache", "INTEGER NOT NULL DEFAULT 0"},
+		{"automations", "cleanup_volumes", "INTEGER NOT NULL DEFAULT 0"},
+		{"restore_points", "data_manifest_json", "TEXT NOT NULL DEFAULT '{}'"},
+		{"restore_points", "data_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"data_mount_cache", "size_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"data_mount_cache", "size_checked_at", "TEXT NOT NULL DEFAULT ''"},
+		{"data_mount_cache", "size_error", "TEXT NOT NULL DEFAULT ''"},
+		{"update_chain_runs", "job_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"update_chain_runs", "recovery_action", "TEXT NOT NULL DEFAULT ''"},
+		{"update_chain_runs", "recovered_at", "TEXT NOT NULL DEFAULT ''"},
+		{"recovery_gc_runs", "helpers_removed", "INTEGER NOT NULL DEFAULT 0"},
+		{"recovery_gc_runs", "unusable_removed", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	if err := s.ensureColumns(ctx, migrations); err != nil {
 		return err
 	}
+	return nil
+}
 
-	for _, stmt := range []string{
-		"ALTER TABLE version_cache ADD COLUMN update_kind TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE version_cache ADD COLUMN security_update INTEGER NOT NULL DEFAULT 0;",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
+type columnMigration struct {
+	Table      string
+	Column     string
+	Definition string
+}
+
+func (s *Store) ensureColumns(ctx context.Context, migrations []columnMigration) error {
+	byTable := make(map[string][]columnMigration)
+	order := make([]string, 0)
+	for _, migration := range migrations {
+		if _, ok := byTable[migration.Table]; !ok {
+			order = append(order, migration.Table)
 		}
+		byTable[migration.Table] = append(byTable[migration.Table], migration)
 	}
-	if err := s.exec(ctx, "ALTER TABLE notification_settings ADD COLUMN pushover_app_token TEXT NOT NULL DEFAULT '';"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return err
-	}
-	if err := s.exec(ctx, "ALTER TABLE notification_settings ADD COLUMN notify_manual_updates INTEGER NOT NULL DEFAULT 1;"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return err
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE container_cache ADD COLUMN first_detected_at TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE container_cache ADD COLUMN snoozed_digest TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE container_cache ADD COLUMN snoozed_at TEXT NOT NULL DEFAULT '';",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
+	for _, table := range order {
+		columns, err := s.tableColumns(ctx, table)
+		if err != nil {
+			return fmt.Errorf("inspect schema for %s: %w", table, err)
 		}
-	}
-	if err := s.exec(ctx, "ALTER TABLE update_history ADD COLUMN restore_point_id INTEGER NOT NULL DEFAULT 0;"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return err
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE update_history ADD COLUMN dependency_count INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE update_history ADD COLUMN dependency_status TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE update_history ADD COLUMN dependency_details TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE restore_points ADD COLUMN dependency_count INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE restore_points ADD COLUMN dependencies_json TEXT NOT NULL DEFAULT '[]';",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
+		present := make(map[string]struct{}, len(columns))
+		for _, column := range columns {
+			present[column] = struct{}{}
 		}
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE update_chains ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'custom';",
-		"ALTER TABLE update_chains ADD COLUMN scope_key TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE update_chains ADD COLUMN policy_mode TEXT NOT NULL DEFAULT 'inherit';",
-		"ALTER TABLE update_chains ADD COLUMN allow_preflight_warnings INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE policies ADD COLUMN allow_preflight_warnings INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE update_chain_steps ADD COLUMN current_action TEXT NOT NULL DEFAULT 'skip';",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
-		}
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE update_history ADD COLUMN preflight_status TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE update_history ADD COLUMN preflight_details TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE update_history ADD COLUMN verification_status TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE update_history ADD COLUMN verification_details TEXT NOT NULL DEFAULT '';",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
-		}
-	}
-	if err := s.exec(ctx, "ALTER TABLE config_drift_cache ADD COLUMN baseline_json TEXT NOT NULL DEFAULT '';"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return err
-	}
-	if err := s.exec(ctx, "ALTER TABLE config_drift_cache ADD COLUMN baseline_source TEXT NOT NULL DEFAULT '';"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return err
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE restore_points ADD COLUMN integrity_status TEXT NOT NULL DEFAULT 'not_checked';",
-		"ALTER TABLE restore_points ADD COLUMN integrity_checked_at TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE restore_points ADD COLUMN integrity_details TEXT NOT NULL DEFAULT '';",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
-		}
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE automations ADD COLUMN kind TEXT NOT NULL DEFAULT 'policy';",
-		"ALTER TABLE automations ADD COLUMN cleanup_images INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE automations ADD COLUMN cleanup_networks INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE automations ADD COLUMN cleanup_build_cache INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE automations ADD COLUMN cleanup_volumes INTEGER NOT NULL DEFAULT 0;",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
-		}
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE restore_points ADD COLUMN data_manifest_json TEXT NOT NULL DEFAULT '{}';",
-		"ALTER TABLE restore_points ADD COLUMN data_bytes INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE data_mount_cache ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE data_mount_cache ADD COLUMN size_checked_at TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE data_mount_cache ADD COLUMN size_error TEXT NOT NULL DEFAULT '';",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
-		}
-	}
-	for _, stmt := range []string{
-		"ALTER TABLE update_chain_runs ADD COLUMN job_id INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE update_chain_runs ADD COLUMN recovery_action TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE update_chain_runs ADD COLUMN recovered_at TEXT NOT NULL DEFAULT '';",
-		"ALTER TABLE recovery_gc_runs ADD COLUMN helpers_removed INTEGER NOT NULL DEFAULT 0;",
-		"ALTER TABLE recovery_gc_runs ADD COLUMN unusable_removed INTEGER NOT NULL DEFAULT 0;",
-	} {
-		if err := s.exec(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
+		for _, migration := range byTable[table] {
+			if _, ok := present[migration.Column]; ok {
+				continue
+			}
+			stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;", quoteIdent(table), quoteIdent(migration.Column), migration.Definition)
+			if err := s.exec(ctx, stmt); err != nil {
+				return fmt.Errorf("add %s.%s: %w", table, migration.Column, err)
+			}
+			present[migration.Column] = struct{}{}
 		}
 	}
 	return nil
@@ -771,7 +747,10 @@ func (s *Store) IntegrityCheck(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-var recoverableCoreTables = []string{
+// Tables copied during narrowly-scoped Docker-event corruption repair. The legacy
+// schedules table is optional: fresh V2 databases no longer create it, but an
+// upgraded database may still contain it and must keep that data during repair.
+var recoverablePrimaryTables = []string{
 	"hosts", "policies", "container_cache", "jobs", "job_logs", "schedules",
 	"audit_events", "settings", "version_cache", "automations", "host_groups",
 	"host_group_members", "users", "user_hosts", "user_groups",
@@ -813,8 +792,8 @@ func (s *Store) RepairDockerEventCorruption(ctx context.Context, backupDir strin
 	if !knownEventMarker {
 		return false, "", fmt.Errorf("database integrity check failed outside the known Docker-event failure mode: %s", result)
 	}
-	tables := make([]string, 0, len(recoverableCoreTables))
-	for _, table := range recoverableCoreTables {
+	tables := make([]string, 0, len(recoverablePrimaryTables))
+	for _, table := range recoverablePrimaryTables {
 		exists, existsErr := s.tableExists(ctx, table)
 		if existsErr != nil {
 			return false, "", fmt.Errorf("core table %s existence check failed: %w", table, existsErr)
@@ -1016,8 +995,24 @@ func (s *Store) RenameHost(ctx context.Context, id int64, name string) error {
 	}
 	return s.exec(ctx, fmt.Sprintf(`UPDATE hosts SET name=%s WHERE id=%d`, q(name), id))
 }
+func (s *Store) UpdateHostEndpoint(ctx context.Context, id int64, endpoint string) error {
+	endpoint = strings.TrimSpace(endpoint)
+	if id <= 0 || endpoint == "" {
+		return fmt.Errorf("valid host id and endpoint are required")
+	}
+	return s.exec(ctx, fmt.Sprintf(`UPDATE hosts SET endpoint=%s WHERE id=%d`, q(endpoint), id))
+}
 func (s *Store) DeleteHost(ctx context.Context, id int64) error {
-	return s.exec(ctx, fmt.Sprintf(`DELETE FROM policies WHERE host_id=%d; DELETE FROM container_cache WHERE host_id=%d; DELETE FROM version_cache WHERE host_id=%d; DELETE FROM schedules WHERE host_id=%d; DELETE FROM host_group_members WHERE host_id=%d; DELETE FROM user_hosts WHERE host_id=%d; DELETE FROM notification_state WHERE host_id=%d; DELETE FROM config_drift_cache WHERE host_id=%d; DELETE FROM verification_profiles WHERE host_id=%d; DELETE FROM verification_state WHERE host_id=%d; DELETE FROM verification_scope_state WHERE host_id=%d; DELETE FROM verification_history WHERE host_id=%d; DELETE FROM operation_leases WHERE host_id=%d; DELETE FROM update_transaction_events WHERE transaction_id IN (SELECT id FROM update_transactions WHERE host_id=%d); DELETE FROM update_transactions WHERE host_id=%d; DELETE FROM update_chain_steps WHERE chain_id IN (SELECT id FROM update_chains WHERE host_id=%d); DELETE FROM update_chains WHERE host_id=%d; DELETE FROM automations WHERE target_type='host' AND target_id=%d; DELETE FROM restore_points WHERE host_id=%d; DELETE FROM data_protection_profiles WHERE host_id=%d; DELETE FROM data_mount_cache WHERE host_id=%d; DELETE FROM host_storage_cache WHERE host_id=%d; DELETE FROM hosts WHERE id=%d;`, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id))
+	// Pre-Automation databases may still have the V0.1 schedules table. Fresh V2
+	// databases deliberately do not create it, so legacy cleanup must be optional.
+	if exists, err := s.tableExists(ctx, "schedules"); err != nil {
+		return err
+	} else if exists {
+		if err := s.exec(ctx, fmt.Sprintf(`DELETE FROM schedules WHERE host_id=%d;`, id)); err != nil {
+			return err
+		}
+	}
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM policies WHERE host_id=%d; DELETE FROM container_cache WHERE host_id=%d; DELETE FROM version_cache WHERE host_id=%d; DELETE FROM host_group_members WHERE host_id=%d; DELETE FROM user_hosts WHERE host_id=%d; DELETE FROM notification_state WHERE host_id=%d; DELETE FROM config_drift_cache WHERE host_id=%d; DELETE FROM verification_profiles WHERE host_id=%d; DELETE FROM verification_state WHERE host_id=%d; DELETE FROM verification_scope_state WHERE host_id=%d; DELETE FROM verification_history WHERE host_id=%d; DELETE FROM operation_leases WHERE host_id=%d; DELETE FROM update_transaction_events WHERE transaction_id IN (SELECT id FROM update_transactions WHERE host_id=%d); DELETE FROM update_transactions WHERE host_id=%d; DELETE FROM update_chain_steps WHERE chain_id IN (SELECT id FROM update_chains WHERE host_id=%d); DELETE FROM update_chains WHERE host_id=%d; DELETE FROM automations WHERE target_type='host' AND target_id=%d; DELETE FROM restore_points WHERE host_id=%d; DELETE FROM data_protection_profiles WHERE host_id=%d; DELETE FROM data_mount_cache WHERE host_id=%d; DELETE FROM host_storage_cache WHERE host_id=%d; DELETE FROM hosts WHERE id=%d;`, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id, id))
 }
 
 func (s *Store) Policy(ctx context.Context, hostID int64, name string) (Policy, error) {
@@ -1113,38 +1108,6 @@ func (s *Store) Job(ctx context.Context, id int64) (Job, error) {
 func (s *Store) HasActiveJob(ctx context.Context, hostID int64, name string) (bool, error) {
 	n, err := s.scalarInt(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE host_id=%d AND container_name=%s AND status IN ('queued','running');`, hostID, q(name)))
 	return n > 0, err
-}
-func (s *Store) FailActiveJobs(ctx context.Context, reason string) (int, error) {
-	n, err := s.scalarInt(ctx, `SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running');`)
-	if err != nil || n == 0 {
-		return int(n), err
-	}
-	if strings.TrimSpace(reason) == "" {
-		reason = "operation interrupted"
-	}
-	err = s.exec(ctx, fmt.Sprintf(`UPDATE jobs SET status='failed',finished_at=%s,error=CASE WHEN error='' THEN %s ELSE error END WHERE status IN ('queued','running');`, q(now()), q(reason)))
-	return int(n), err
-}
-
-func (s *Store) FailActiveUpdateChainRuns(ctx context.Context, reason string) (int, error) {
-	n, err := s.scalarInt(ctx, `SELECT COUNT(*) FROM update_chain_runs WHERE status IN ('queued','running');`)
-	if err != nil || n == 0 {
-		return int(n), err
-	}
-	if strings.TrimSpace(reason) == "" {
-		reason = "update chain interrupted"
-	}
-	stamp := now()
-	if err := s.exec(ctx, fmt.Sprintf(`UPDATE update_chains SET last_status='failed' WHERE id IN (SELECT chain_id FROM update_chain_runs WHERE status IN ('queued','running'));`)); err != nil {
-		return int(n), err
-	}
-	if err := s.exec(ctx, fmt.Sprintf(`UPDATE update_chain_run_steps SET status='failed',finished_at=CASE WHEN finished_at='' THEN %s ELSE finished_at END,error=CASE WHEN error='' THEN %s ELSE error END WHERE run_id IN (SELECT id FROM update_chain_runs WHERE status IN ('queued','running')) AND status NOT IN ('success','failed','skipped_current');`, q(stamp), q(reason))); err != nil {
-		return int(n), err
-	}
-	if err := s.exec(ctx, fmt.Sprintf(`UPDATE update_chain_runs SET status='failed',finished_at=%s,error=CASE WHEN error='' THEN %s ELSE error END WHERE status IN ('queued','running');`, q(stamp), q(reason))); err != nil {
-		return int(n), err
-	}
-	return int(n), nil
 }
 
 func (s *Store) AddJobLog(ctx context.Context, jobID int64, level, source, message string) error {
@@ -1387,9 +1350,6 @@ func (s *Store) SaveDataProtectionProfile(ctx context.Context, x DataProtectionP
 	}
 	ts := now()
 	return s.exec(ctx, fmt.Sprintf(`INSERT INTO data_protection_profiles(host_id,scope_type,scope_key,enabled,mounts_json,updated_at) VALUES(%d,%s,%s,%d,%s,%s) ON CONFLICT(host_id,scope_type,scope_key) DO UPDATE SET enabled=excluded.enabled,mounts_json=excluded.mounts_json,updated_at=excluded.updated_at`, x.HostID, q(x.ScopeType), q(x.ScopeKey), b(x.Enabled), q(x.MountsJSON), q(ts)))
-}
-func (s *Store) DeleteDataProtectionProfile(ctx context.Context, hostID int64, scopeType, scopeKey string) error {
-	return s.exec(ctx, fmt.Sprintf(`DELETE FROM data_protection_profiles WHERE host_id=%d AND scope_type=%s AND scope_key=%s`, hostID, q(scopeType), q(scopeKey)))
 }
 func (s *Store) DataMountCache(ctx context.Context, hostID int64, mountKey string) (DataMountCache, error) {
 	var xs []DataMountCache
@@ -1640,24 +1600,6 @@ func (s *Store) UpdateChainRunSteps(ctx context.Context, runID int64) ([]UpdateC
 	var x []UpdateChainRunStep
 	err := s.query(ctx, fmt.Sprintf(`SELECT id,run_id,position,container_name,status,job_id,started_at,finished_at,error FROM update_chain_run_steps WHERE run_id=%d ORDER BY position,id`, runID), &x)
 	return x, err
-}
-
-func (s *Store) Schedules(ctx context.Context) ([]Schedule, error) {
-	var x []Schedule
-	err := s.query(ctx, `SELECT id,name,cron,action,host_id,containers,enabled,last_run_at FROM schedules ORDER BY name`, &x)
-	return x, err
-}
-func (s *Store) SaveSchedule(ctx context.Context, x Schedule) (int64, error) {
-	if x.ID == 0 {
-		return s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO schedules(name,cron,action,host_id,containers,enabled) VALUES(%s,%s,%s,%d,%s,%d); SELECT last_insert_rowid();`, q(x.Name), q(x.Cron), q(x.Action), x.HostID, q(x.Containers), b(x.Enabled)))
-	}
-	return x.ID, s.exec(ctx, fmt.Sprintf(`UPDATE schedules SET name=%s,cron=%s,action=%s,host_id=%d,containers=%s,enabled=%d WHERE id=%d;`, q(x.Name), q(x.Cron), q(x.Action), x.HostID, q(x.Containers), b(x.Enabled), x.ID))
-}
-func (s *Store) DeleteSchedule(ctx context.Context, id int64) error {
-	return s.exec(ctx, fmt.Sprintf(`DELETE FROM schedules WHERE id=%d;`, id))
-}
-func (s *Store) TouchSchedule(ctx context.Context, id int64) error {
-	return s.exec(ctx, fmt.Sprintf(`UPDATE schedules SET last_run_at=%s WHERE id=%d;`, q(now()), id))
 }
 
 const auditRetention = 5000
@@ -2066,7 +2008,7 @@ func (s *Store) SaveUser(ctx context.Context, u User) (int64, error) {
 	return id, s.exec(ctx, strings.Join(parts, ";")+";")
 }
 func (s *Store) DeleteUser(ctx context.Context, id int64) error {
-	return s.exec(ctx, fmt.Sprintf(`DELETE FROM notification_state WHERE user_id=%d; DELETE FROM notification_settings WHERE user_id=%d; DELETE FROM user_hosts WHERE user_id=%d; DELETE FROM user_groups WHERE user_id=%d; DELETE FROM users WHERE id=%d;`, id, id, id, id, id))
+	return s.exec(ctx, fmt.Sprintf(`DELETE FROM notification_state WHERE user_id=%d; DELETE FROM notification_ui_reads WHERE user_id=%d; DELETE FROM notification_settings WHERE user_id=%d; DELETE FROM user_hosts WHERE user_id=%d; DELETE FROM user_groups WHERE user_id=%d; DELETE FROM users WHERE id=%d;`, id, id, id, id, id, id))
 }
 func (s *Store) AllowedHostIDs(ctx context.Context, userID int64) ([]int64, error) {
 	var rows []struct {
@@ -2109,6 +2051,31 @@ func (s *Store) NotificationFingerprint(ctx context.Context, userID, hostID int6
 func (s *Store) SaveNotificationFingerprint(ctx context.Context, userID, hostID int64, container, event, fingerprint string) error {
 	return s.exec(ctx, fmt.Sprintf("INSERT INTO notification_state(user_id,host_id,container_name,event,fingerprint,updated_at) VALUES(%d,%d,%s,%s,%s,%s) ON CONFLICT(user_id,host_id,container_name,event) DO UPDATE SET fingerprint=excluded.fingerprint,updated_at=excluded.updated_at", userID, hostID, q(container), q(event), q(fingerprint), q(now())))
 }
+func (s *Store) UINotificationReads(ctx context.Context, userID int64) ([]UINotificationRead, error) {
+	xs := []UINotificationRead{}
+	err := s.query(ctx, fmt.Sprintf("SELECT notification_id,fingerprint,read_at FROM notification_ui_reads WHERE user_id=%d ORDER BY read_at DESC", userID), &xs)
+	return xs, err
+}
+
+func (s *Store) SaveUINotificationReads(ctx context.Context, userID int64, items []UINotificationRead) error {
+	if len(items) == 0 {
+		return nil
+	}
+	parts := []string{"DELETE FROM notification_ui_reads WHERE datetime(read_at) < datetime('now','-180 days')"}
+	for _, item := range items {
+		id := strings.TrimSpace(item.NotificationID)
+		fp := strings.TrimSpace(item.Fingerprint)
+		if id == "" || fp == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("INSERT INTO notification_ui_reads(user_id,notification_id,fingerprint,read_at) VALUES(%d,%s,%s,%s) ON CONFLICT(user_id,notification_id) DO UPDATE SET fingerprint=excluded.fingerprint,read_at=excluded.read_at", userID, q(id), q(fp), q(now())))
+	}
+	if len(parts) == 1 {
+		return nil
+	}
+	return s.exec(ctx, strings.Join(parts, ";")+";")
+}
+
 func (s *Store) NotificationTargets(ctx context.Context, hostID int64, event string) ([]NotificationTarget, error) {
 	users, err := s.Users(ctx)
 	if err != nil {
@@ -2135,14 +2102,14 @@ func (s *Store) NotificationTargets(ctx context.Context, hostID int64, event str
 		ns, _ := s.NotificationSettings(ctx, u.ID)
 		enabled := event == "auto" && bool(ns.NotifyAutoUpdates) || event == "manual" && bool(ns.NotifyManualAvailable) || event == "manual_update" && bool(ns.NotifyManualUpdates)
 		if enabled && strings.TrimSpace(ns.PushoverAppToken) != "" && strings.TrimSpace(ns.PushoverUserKey) != "" {
-			out = append(out, NotificationTarget{UserID: u.ID, Username: u.Username, Role: u.Role, PushoverAppToken: ns.PushoverAppToken, PushoverUserKey: ns.PushoverUserKey})
+			out = append(out, NotificationTarget{UserID: u.ID, Username: u.Username, PushoverAppToken: ns.PushoverAppToken, PushoverUserKey: ns.PushoverUserKey})
 		}
 	}
 	// The environment-backed owner uses reserved user_id 0 and has global host access.
 	ns, _ := s.NotificationSettings(ctx, 0)
 	ownerEnabled := event == "auto" && bool(ns.NotifyAutoUpdates) || event == "manual" && bool(ns.NotifyManualAvailable) || event == "manual_update" && bool(ns.NotifyManualUpdates)
 	if ownerEnabled && strings.TrimSpace(ns.PushoverAppToken) != "" && strings.TrimSpace(ns.PushoverUserKey) != "" {
-		out = append(out, NotificationTarget{UserID: 0, Username: "admin", Role: "owner", PushoverAppToken: ns.PushoverAppToken, PushoverUserKey: ns.PushoverUserKey})
+		out = append(out, NotificationTarget{UserID: 0, Username: "admin", PushoverAppToken: ns.PushoverAppToken, PushoverUserKey: ns.PushoverUserKey})
 	}
 	return out, nil
 }

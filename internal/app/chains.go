@@ -93,13 +93,38 @@ func (a *App) stackChainManagement(ctx context.Context, hostID int64) (map[strin
 	return out, nil
 }
 
-func (a *App) stackChainForMember(ctx context.Context, hostID int64, container string) (ChainManagementView, bool) {
+func (a *App) chainMemberManagement(ctx context.Context, hostID int64) (map[string]ChainManagementView, error) {
+	chains, err := a.Store.UpdateChains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]ChainManagementView{}
+	for _, c := range chains {
+		if c.HostID != hostID {
+			continue
+		}
+		steps, err := a.Store.UpdateChainSteps(ctx, c.ID)
+		if err != nil {
+			continue
+		}
+		view := ChainManagementView{ChainID: c.ID, ChainName: c.Name, AutomationID: c.AutomationID, ScopeType: c.ScopeType, ScopeKey: c.ScopeKey, PolicyMode: normalizeChainPolicyMode(c.PolicyMode), AllowPreflightWarnings: bool(c.AllowPreflightWarnings), LastRunAt: c.LastRunAt, LastStatus: c.LastStatus}
+		for _, st := range steps {
+			name := strings.TrimSpace(st.ContainerName)
+			if name != "" {
+				out[name] = view
+			}
+		}
+	}
+	return out, nil
+}
+
+func (a *App) chainForMember(ctx context.Context, hostID int64, container string) (ChainManagementView, bool) {
 	chains, err := a.Store.UpdateChains(ctx)
 	if err != nil {
 		return ChainManagementView{}, false
 	}
 	for _, c := range chains {
-		if c.HostID != hostID || c.ScopeType != "stack" {
+		if c.HostID != hostID {
 			continue
 		}
 		steps, err := a.Store.UpdateChainSteps(ctx, c.ID)
@@ -110,28 +135,6 @@ func (a *App) stackChainForMember(ctx context.Context, hostID int64, container s
 			if st.ContainerName == container {
 				return ChainManagementView{ChainID: c.ID, ChainName: c.Name, AutomationID: c.AutomationID, ScopeType: c.ScopeType, ScopeKey: c.ScopeKey, PolicyMode: normalizeChainPolicyMode(c.PolicyMode), AllowPreflightWarnings: bool(c.AllowPreflightWarnings), LastRunAt: c.LastRunAt, LastStatus: c.LastStatus}, true
 			}
-		}
-	}
-	return ChainManagementView{}, false
-}
-
-func (a *App) chainManagementForContainer(ctx context.Context, hostID int64, container string) (ChainManagementView, bool) {
-	h, err := a.Store.Host(ctx, hostID)
-	if err != nil {
-		return ChainManagementView{}, false
-	}
-	cs, err := a.Docker.ListContainers(ctx, h.Endpoint)
-	if err != nil {
-		return ChainManagementView{}, false
-	}
-	managed, err := a.stackChainManagement(ctx, hostID)
-	if err != nil {
-		return ChainManagementView{}, false
-	}
-	for _, c := range cs {
-		if c.Name == container && c.StackName != "" {
-			x, ok := managed[c.StackName]
-			return x, ok
 		}
 	}
 	return ChainManagementView{}, false
@@ -279,11 +282,12 @@ func normalizeChainInput(in updateChainInput) (updateChainInput, error) {
 		if in.ScopeKey == "" {
 			return in, fmt.Errorf("stack is required")
 		}
-		in.PolicyMode = normalizeChainPolicyMode(in.PolicyMode)
 	} else {
 		in.ScopeKey = ""
-		in.PolicyMode = "inherit"
 	}
+	// Every update chain owns the policy of its members. Legacy custom chains
+	// stored as "inherit" normalize safely to Manual until explicitly changed.
+	in.PolicyMode = normalizeChainPolicyMode(in.PolicyMode)
 	if len(in.Steps) == 0 {
 		return in, fmt.Errorf("at least one chain step is required")
 	}
@@ -465,16 +469,9 @@ func (a *App) previewUpdateChain(ctx context.Context, chainID int64, actor strin
 		if err := a.validateStackChainMembers(ctx, chain.HostID, chain.ScopeKey, steps); err != nil {
 			return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: %w", err)
 		}
-		if normalizeChainPolicyMode(chain.PolicyMode) == "ignore" {
-			return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: stack policy is Excluded")
-		}
-	} else {
-		for _, st := range steps {
-			p, _ := a.Store.Policy(ctx, chain.HostID, st.ContainerName)
-			if p.Mode == "ignore" {
-				return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: %s is excluded", st.ContainerName)
-			}
-		}
+	}
+	if normalizeChainPolicyMode(chain.PolicyMode) == "ignore" {
+		return ChainPreflightPlanView{}, fmt.Errorf("chain blocked: chain policy is Excluded")
 	}
 
 	plan := ChainPreflightPlanView{ChainID: chain.ID, ChainName: chain.Name, HostID: chain.HostID, Status: "ready", Steps: make([]ChainPreflightStepView, 0, len(steps))}
@@ -543,7 +540,22 @@ func (a *App) handleUpdateChainSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if len(parts) == 1 && r.Method == http.MethodDelete {
-		chain, _ := a.Store.UpdateChain(r.Context(), id)
+		chain, err := a.Store.UpdateChain(r.Context(), id)
+		if err != nil {
+			writeErr(w, 404, "update chain not found")
+			return
+		}
+		activeRuns, err := a.Store.ActiveUpdateChainRuns(r.Context())
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		for _, run := range activeRuns {
+			if run.ChainID == id {
+				writeErr(w, 409, fmt.Sprintf("update chain %s has an active %s run and cannot be deleted yet", chain.Name, run.Status))
+				return
+			}
+		}
 		if err := a.Store.DeleteUpdateChain(r.Context(), id); err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -599,29 +611,19 @@ func (a *App) startUpdateChain(ctx context.Context, chainID int64, trigger, acto
 		}
 		return 0, 0, err
 	}
-	// Stack chains own policy at the chain level. Legacy/custom chains retain
-	// their v0.8.4.1 per-container policy behaviour for backwards compatibility.
+	// Every chain owns the policy of its members. Stack chains additionally
+	// validate that every configured member still belongs to the selected stack.
 	if chain.ScopeType == "stack" {
 		if err := a.validateStackChainMembers(ctx, chain.HostID, chain.ScopeKey, steps); err != nil {
 			return 0, 0, fmt.Errorf("chain blocked: %w", err)
 		}
-		mode := normalizeChainPolicyMode(chain.PolicyMode)
-		if mode == "ignore" {
-			return 0, 0, fmt.Errorf("chain blocked: stack policy is Excluded")
-		}
-		if trigger == "automatic" && mode != "auto" {
-			return 0, 0, fmt.Errorf("chain blocked: stack policy is not Auto Update")
-		}
-	} else {
-		for _, st := range steps {
-			p, _ := a.Store.Policy(ctx, chain.HostID, st.ContainerName)
-			if p.Mode == "ignore" {
-				return 0, 0, fmt.Errorf("chain blocked: %s is excluded", st.ContainerName)
-			}
-			if trigger == "automatic" && p.Mode != "auto" {
-				return 0, 0, fmt.Errorf("chain blocked: automatic chain member %s is not Auto Update policy", st.ContainerName)
-			}
-		}
+	}
+	mode := normalizeChainPolicyMode(chain.PolicyMode)
+	if mode == "ignore" {
+		return 0, 0, fmt.Errorf("chain blocked: chain policy is Excluded")
+	}
+	if trigger == "automatic" && mode != "auto" {
+		return 0, 0, fmt.Errorf("chain blocked: chain policy is not Auto Update")
 	}
 	if err := a.reserveChainMembers(ctx, chain.ID, chain.HostID, steps); err != nil {
 		return 0, 0, err
@@ -1266,7 +1268,7 @@ func (a *App) startAutomationChains(ctx context.Context, automation db.Automatio
 		if chain.AutomationID != automation.ID || !hostSet[chain.HostID] {
 			continue
 		}
-		if chain.ScopeType == "stack" && normalizeChainPolicyMode(chain.PolicyMode) != "auto" {
+		if normalizeChainPolicyMode(chain.PolicyMode) != "auto" {
 			continue
 		}
 		if _, _, err := a.startUpdateChain(ctx, chain.ID, "automatic", "scheduler"); err != nil {

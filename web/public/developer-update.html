@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Vibewatch Development Update</title>
+  <style>
+    :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#263149;background:#eef2fb;color-scheme:light}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at top left,#f7eefa 0,transparent 34%),radial-gradient(circle at top right,#e8f7f1 0,transparent 32%),#eef2fb;padding:28px}
+    .shell{max-width:860px;margin:0 auto;min-height:calc(100vh - 56px);display:flex;align-items:center}.panel{width:100%;background:rgba(255,255,255,.82);border:1px solid rgba(57,70,98,.1);border-radius:28px;box-shadow:0 26px 70px rgba(35,44,68,.14);padding:28px;backdrop-filter:blur(18px)}
+    .brand{display:flex;align-items:center;gap:13px}.brand img{width:48px;height:48px;object-fit:contain}.brand b{font-size:17px;display:block}.brand span{font-size:12px;color:#7a8498;display:block;margin-top:2px}
+    .top{display:flex;justify-content:space-between;gap:24px;align-items:flex-start}.pill{border-radius:999px;padding:7px 11px;font-size:11px;font-weight:800;background:#e8f7f1;color:#327960;white-space:nowrap}
+    h1{font-size:31px;line-height:1.1;margin:30px 0 8px;letter-spacing:-.035em}.lead{margin:0;color:#707b90;line-height:1.6;font-size:14px;max-width:670px}
+    .progress-wrap{margin-top:26px;background:#e9edf5;border-radius:999px;height:10px;overflow:hidden}.progress{height:100%;width:2%;border-radius:999px;background:linear-gradient(90deg,#86b7e8,#ae9bd8);transition:width .4s ease}
+    .status{display:grid;grid-template-columns:46px 1fr;gap:14px;align-items:center;margin-top:22px;padding:18px;border-radius:18px;background:#f8f9fc;border:1px solid #e8ebf2}.orb{width:46px;height:46px;border-radius:15px;display:grid;place-items:center;background:#edf4fb;color:#557ca4;font-weight:900}.status h2{font-size:16px;margin:0 0 5px}.status p{margin:0;color:#727d92;font-size:13px;line-height:1.5}
+    .meta{margin-top:18px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.meta>div{padding:13px 14px;border-radius:15px;background:#fff;border:1px solid #e9ecf3}.meta span,.meta b{display:block}.meta span{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#929bad;font-weight:800}.meta b{margin-top:5px;font-size:12px;overflow-wrap:anywhere}
+    .connection{margin-top:16px;padding:12px 14px;border-radius:14px;background:#fff6e9;color:#87602f;font-size:12px;display:none}.connection.show{display:block}.log-head{margin-top:22px;display:flex;justify-content:space-between;align-items:center;gap:12px}.log-head b{font-size:12px}.log-head span{font-size:11px;color:#9099aa}.logs{margin-top:9px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;padding:15px;border-radius:16px;background:#202635;color:#dfe5ef;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;min-height:72px}
+    .actions{margin-top:22px;display:flex;gap:10px;flex-wrap:wrap}.btn{appearance:none;border:0;border-radius:12px;padding:11px 15px;font-weight:800;font-size:12px;cursor:pointer;background:#405676;color:#fff;text-decoration:none}.btn.secondary{background:#eef1f6;color:#4d5870}.hidden{display:none!important}.success .orb{background:#e8f7f1;color:#327960}.failure .orb{background:#fff0f1;color:#aa5560}.rollback .orb{background:#fff6e9;color:#9a6c35}
+    @media(max-width:650px){body{padding:14px}.shell{min-height:calc(100vh - 28px)}.panel{padding:20px;border-radius:22px}.top{align-items:center}.meta{grid-template-columns:1fr}h1{font-size:26px}}
+  </style>
+</head>
+<body>
+<div class="shell"><main class="panel" id="panel">
+  <div class="top"><div class="brand"><img src="/logo.png" alt="Vibewatch"><div><b>Vibewatch</b><span>Development updater</span></div></div><span class="pill" id="mode">SOURCE UPDATE</span></div>
+  <h1 id="title">Preparing development update</h1>
+  <p class="lead" id="lead">This page can stay open while Vibewatch rebuilds itself. A brief connection interruption during the final controller switch is expected.</p>
+  <div class="progress-wrap"><div class="progress" id="progress"></div></div>
+  <section class="status" id="status"><div class="orb" id="orb">•••</div><div><h2 id="stage">Connecting to updater…</h2><p id="message">Waiting for the development updater status.</p></div></section>
+  <div class="connection" id="connection">The Vibewatch controller is restarting. This is expected. This page is still running in your browser and will reconnect automatically.</div>
+  <div class="meta"><div><span>Package</span><b id="package">—</b></div><div><span>Version</span><b id="version">—</b></div><div><span>Progress</span><b id="percent">0%</b></div></div>
+  <div class="log-head"><b>Update log</b><span>Latest output</span></div><pre class="logs" id="logs">Waiting for log output…</pre>
+  <div class="actions"><a class="btn hidden" id="return" href="/">Return to Vibewatch</a><button class="btn secondary hidden" id="retry" type="button">Retry status</button></div>
+</main></div>
+<script>
+(() => {
+  const id = new URLSearchParams(location.search).get('update') || '';
+  const el = name => document.getElementById(name);
+  const terminal = new Set(['completed','failed','rolled_back']);
+  let failures = 0, timer = 0, lastState = '';
+  const render = s => {
+    failures = 0; el('connection').classList.remove('show'); el('retry').classList.add('hidden');
+    const pct = Math.max(0,Math.min(100,Number(s.percent||0))); el('progress').style.width = pct+'%'; el('percent').textContent=pct+'%';
+    el('package').textContent=s.filename||'—'; el('version').textContent=s.version?('v'+s.version):'—'; el('stage').textContent=s.stage||s.state||'Updating'; el('message').textContent=s.message||'';
+    const logs=(s.log_tail||[]); el('logs').textContent=logs.length?logs.join('\n'):'No log output yet.'; el('logs').scrollTop=el('logs').scrollHeight;
+    const status=el('status'); status.classList.remove('success','failure','rollback');
+    if(s.state==='completed'){status.classList.add('success');el('orb').textContent='✓';el('title').textContent='Development update complete';el('lead').textContent='The recreated Vibewatch controller is healthy and ready.'}
+    else if(s.state==='rolled_back'){status.classList.add('rollback');el('orb').textContent='↶';el('title').textContent='Previous version restored';el('lead').textContent='The development update failed, but Vibewatch automatically restored the previous source and healthy controller.'}
+    else if(s.state==='failed'){status.classList.add('failure');el('orb').textContent='!';el('title').textContent='Development update stopped';el('lead').textContent=s.error||'The controller was left unchanged or automatic rollback information is shown below.'}
+    else {el('orb').textContent=s.state==='building'?'◌':s.state==='switching'?'↻':'•••';el('title').textContent=s.state==='building'?'Building new Vibewatch image':s.state==='switching'?'Switching controller':s.state==='verifying'?'Verifying recreated controller':'Installing development update'}
+    lastState=s.state||'';
+    if(terminal.has(lastState)){el('return').classList.remove('hidden');clearTimeout(timer)}
+  };
+  async function refresh(){
+    if(!id){el('stage').textContent='Missing update id';el('message').textContent='Open this page from Settings → Developer.';el('retry').classList.remove('hidden');return}
+    try{
+      const r=await fetch('/api/system/developer-update/status?id='+encodeURIComponent(id),{credentials:'same-origin',cache:'no-store'});
+      const body=await r.json().catch(()=>({})); if(!r.ok) throw new Error(body.error||('HTTP '+r.status)); render(body);
+    }catch(err){
+      failures++;el('connection').classList.add('show');if(lastState==='switching'||lastState==='verifying'){el('stage').textContent='Controller restart in progress'}
+      if(failures>15)el('retry').classList.remove('hidden');
+    }
+    if(!terminal.has(lastState))timer=setTimeout(refresh,1500);
+  }
+  el('retry').addEventListener('click',()=>{failures=0;refresh()}); refresh();
+})();
+</script>
+</body>
+</html>

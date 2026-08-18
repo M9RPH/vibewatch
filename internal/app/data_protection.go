@@ -378,7 +378,7 @@ func (a *App) dataProtectionInventory(ctx context.Context, hostID int64, contain
 		return "", nil, fmt.Errorf("container %s not found", container)
 	}
 	if strings.EqualFold(stackType, "swarm") {
-		return "", nil, fmt.Errorf("data protection for Docker Swarm services is not enabled in v0.9.5")
+		return "", nil, fmt.Errorf("data protection for Docker Swarm services is not enabled in v1.0.0")
 	}
 	scopeKey := targetName
 	if scopeType == "stack" {
@@ -858,7 +858,7 @@ func (a *App) containerWritableLayerBytes(ctx context.Context, hostID int64, con
 
 func (a *App) restoreStoragePreflight(ctx context.Context, req updateRequest, target inspectContainer, force bool) PreflightCheck {
 	if strings.TrimSpace(target.Config.Labels["com.docker.swarm.service.name"]) != "" {
-		return PreflightCheck{Key: "restore_storage", Status: preflightInfo, Title: "Host restore storage not required", Description: "This Swarm target uses config-only rollback in v0.9.5; no host-local writable-layer/data restore archive is created.", Source: "Vibewatch restore storage", Blocking: false}
+		return PreflightCheck{Key: "restore_storage", Status: preflightInfo, Title: "Host restore storage not required", Description: "This Swarm target uses config-only rollback in v1.0.0; no host-local writable-layer/data restore archive is created.", Source: "Vibewatch restore storage", Blocking: false}
 	}
 
 	storage := a.probeHostStorage(ctx, req.HostID, force)
@@ -956,7 +956,7 @@ func unconfiguredDataProtectionCheck(scopeType, scopeKey string, mounts int, swa
 	}
 	desc := fmt.Sprintf("%d persistent mount(s) are present in this %s, but none are protected by Data Protection.", mounts, scopeLabel)
 	if swarm {
-		desc = fmt.Sprintf("%d persistent mount(s) are present in this Swarm service. Data Protection for Swarm services is not available in v0.9.5.", mounts)
+		desc = fmt.Sprintf("%d persistent mount(s) are present in this Swarm service. Data Protection for Swarm services is not available in v1.0.0.", mounts)
 	}
 	return PreflightCheck{Key: "data_protection", Status: preflightYellow, Title: "Persistent data not protected", Description: desc, Detail: "Configure Data Protection for rollback-relevant mounts, or explicitly accept this advisory warning for the update.", Source: "Vibewatch data protection", Blocking: false}
 }
@@ -1315,31 +1315,6 @@ func decodeDataManifest(raw string) (dataArchiveManifest, error) {
 		return m, err
 	}
 	return m, nil
-}
-
-func (a *App) validateDataArchive(ctx context.Context, rp db.RestorePoint) error {
-	manifest, err := decodeDataManifest(rp.DataManifestJSON)
-	if err != nil {
-		return err
-	}
-	if len(manifest.Entries) == 0 {
-		return nil
-	}
-	h, err := a.Store.Host(ctx, rp.HostID)
-	if err != nil {
-		return err
-	}
-	commands := []string{"set -eu"}
-	for _, e := range manifest.Entries {
-		if e.Archive == "" || e.SHA256 == "" {
-			return fmt.Errorf("data archive metadata incomplete for %s", e.Key)
-		}
-		commands = append(commands, fmt.Sprintf("test -s /backup/%s", e.Archive), fmt.Sprintf("echo '%s  /backup/%s' | sha256sum -c - >/dev/null", e.SHA256, e.Archive))
-	}
-	args := append([]string{"run"}, dataHelperArgs(rp.HostID, "data-validate")...)
-	args = append(args, "--rm", "--network", "none", "--read-only", "--mount", "type=volume,source="+dataRestoreVolume+",target=/backup,readonly", dataHelperImage, "sh", "-c", strings.Join(commands, "; "))
-	_, err = a.Docker.Run(ctx, h.Endpoint, args...)
-	return err
 }
 
 func (a *App) restoreDataArchivesWithSafety(ctx context.Context, rp db.RestorePoint) ([]string, dataArchiveManifest, error) {

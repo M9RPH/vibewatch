@@ -73,3 +73,24 @@ func TestWaitReadyForToleratesSlowWorkerStartup(t *testing.T) {
 		t.Fatalf("expected readiness retries, got %d", calls.Load())
 	}
 }
+
+func TestUpdateIgnoresUnusedWorkerMetadataFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/update" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"summary":{"scanned":1,"updated":1,"failed":0,"restarted":0,"skipped":0},"timing":{"duration_ms":12,"duration":"12ms"},"timestamp":"2026-08-17T12:00:00Z","api_version":"v1"}`))
+	}))
+	defer srv.Close()
+
+	c := New()
+	res, _, err := c.Update(context.Background(), srv.URL, "token", "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary.Updated != 1 || res.Summary.Failed != 0 || res.Summary.Skipped != 0 {
+		t.Fatalf("unexpected update summary: %#v", res.Summary)
+	}
+}

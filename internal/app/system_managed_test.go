@@ -15,6 +15,7 @@ func TestSystemManagedContainerDetection(t *testing.T) {
 		{"vibewatch-worker-7", true, "worker"},
 		{"vibewatch-helper-data-capture-7-123", true, "helper"},
 		{"watchtower-ui-self-updater", true, "maintenance"},
+		{"vibewatch-dev-updater-abc123", true, "maintenance"},
 		{"nickfedor-watchtower-user", false, ""},
 		{"netbird", false, ""},
 	}

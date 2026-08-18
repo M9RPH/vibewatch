@@ -136,7 +136,7 @@ exit 0
 }
 
 func TestStackMetadataCompose(t *testing.T) {
-	name, service, typ := StackMetadata(map[string]string{
+	name, service, typ := stackMetadata(map[string]string{
 		"com.docker.compose.project": "paperless",
 		"com.docker.compose.service": "webserver",
 	})
@@ -146,7 +146,7 @@ func TestStackMetadataCompose(t *testing.T) {
 }
 
 func TestStackMetadataSwarm(t *testing.T) {
-	name, service, typ := StackMetadata(map[string]string{
+	name, service, typ := stackMetadata(map[string]string{
 		"com.docker.stack.namespace":    "media",
 		"com.docker.swarm.service.name": "media_sonarr",
 	})
@@ -156,13 +156,13 @@ func TestStackMetadataSwarm(t *testing.T) {
 }
 
 func TestStackMetadataStandalone(t *testing.T) {
-	name, service, typ := StackMetadata(map[string]string{"foo": "bar"})
+	name, service, typ := stackMetadata(map[string]string{"foo": "bar"})
 	if name != "" || service != "" || typ != "" {
 		t.Fatalf("standalone container must not be assigned to a stack: %q %q %q", name, service, typ)
 	}
 }
 
-func TestListContainersIncludesComposeStackMetadata(t *testing.T) {
+func TestListContainersIncludesComposestackMetadata(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "docker")
 	body := `#!/bin/sh
@@ -412,40 +412,6 @@ exit 0
 	}
 }
 
-func TestImageRepoDigestSelectsMatchingRepository(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "docker")
-	body := `#!/bin/sh
-case "$*" in
-  *"image inspect sha256:abc --format"*)
-    printf '%s\n' '["other/app@sha256:111","ghcr.io/example/app@sha256:222"]'
-    exit 0 ;;
-esac
-printf 'unexpected: %s\n' "$*" >&2
-exit 1
-`
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	c := New(slog.Default())
-	c.Binary = script
-	got, err := c.ImageRepoDigest(context.Background(), "tcp://docker:2375", "sha256:abc", "ghcr.io/example/app:latest")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "sha256:222" {
-		t.Fatalf("digest=%q want sha256:222", got)
-	}
-}
-
-func TestNormalizeRepoNameDockerHubAliases(t *testing.T) {
-	for _, v := range []string{"nginx:latest", "docker.io/library/nginx:latest", "registry-1.docker.io/library/nginx@sha256:abc"} {
-		if got := normalizeRepoName(v); got != "library/nginx" {
-			t.Fatalf("normalizeRepoName(%q)=%q", v, got)
-		}
-	}
-}
-
 func TestImagePlatform(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "docker")
@@ -504,7 +470,7 @@ exit 0
 	}
 	c := New(slog.Default())
 	c.Binary = script
-	if _, err := c.PruneUnusedAnonymousVolumes(context.Background(), "tcp://docker:2375", nil); err != nil {
+	if _, err := c.PruneUnusedAnonymousVolumesWithProgress(context.Background(), "tcp://docker:2375", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(logPath)
@@ -536,7 +502,7 @@ exit 0
 	}
 	c := New(slog.Default())
 	c.Binary = script
-	result, err := c.PruneUnusedAnonymousVolumes(context.Background(), "tcp://docker:2375", map[string]bool{anon: true})
+	result, err := c.PruneUnusedAnonymousVolumesWithProgress(context.Background(), "tcp://docker:2375", map[string]bool{anon: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -781,7 +747,7 @@ func TestDockerRunReportsContextDeadlineInsteadOfSignalKilled(t *testing.T) {
 	c.Binary = script
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := c.Ping(ctx, "tcp://192.168.178.66:2375")
+	_, err := c.ping(ctx, "tcp://192.168.178.66:2375")
 	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("expected deadline error, got %v", err)
 	}
@@ -959,6 +925,92 @@ exit 0
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("worker invocation missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestLaunchDevelopmentUpdaterUsesControllerImageAndInheritedMounts(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  "inspect vibewatch --format {{.Config.Image}}") echo vibewatch:1.0.0; exit 0 ;;
+  "rm -f "*) exit 0 ;;
+  "run "*) echo helper-id; exit 0 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	if err := c.LaunchDevelopmentUpdater(context.Background(), "vibewatch", "20260817-abc123", "/workspace", "/data", "/home/user/vibewatch", "/home/user/vibewatch/data", "/data/backups/pre-dev.db"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if !strings.Contains(got, "--volumes-from vibewatch") || !strings.Contains(got, "--entrypoint /usr/local/bin/vibewatch-dev-updater vibewatch:1.0.0") {
+		t.Fatalf("development updater helper launch is incomplete:\n%s", got)
+	}
+	if strings.Contains(got, "-v /var/run/docker.sock:/var/run/docker.sock") {
+		t.Fatalf("docker socket must be inherited once through --volumes-from, not mounted twice:\n%s", got)
+	}
+	for _, want := range []string{
+		"VIBEWATCH_DEV_UPDATE_PROJECT_SOURCE=/home/user/vibewatch",
+		"VIBEWATCH_DEV_UPDATE_DATA_SOURCE=/home/user/vibewatch/data",
+		"VIBEWATCH_DEV_UPDATE_DB_BACKUP=/data/backups/pre-dev.db",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("development updater helper launch missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestPingTLSCredentialsUsesTemporaryFilesWithoutPersistedHostState(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" > "` + logPath + `"
+printf '%s\n' '28.1.1'
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	c.HostTLSRoot = filepath.Join(dir, "persisted")
+	endpoint := "tls://192.0.2.10:2376"
+	version, err := c.PingTLSCredentials(context.Background(), endpoint, "TEST CA", "TEST CERT", "TEST KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "28.1.1" {
+		t.Fatalf("version=%q", version)
+	}
+	if _, err := os.Stat(c.TLSCredentialDir(endpoint)); !os.IsNotExist(err) {
+		t.Fatalf("temporary probe unexpectedly created persisted credential state: %v", err)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(b)
+	for _, want := range []string{"--tlsverify", "--host tcp://192.0.2.10:2376", "version --format {{.Server.Version}}"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("temporary TLS probe missing %q: %s", want, args)
+		}
+	}
+	for _, secret := range []string{"TEST CA", "TEST CERT", "TEST KEY"} {
+		if strings.Contains(args, secret) {
+			t.Fatalf("TLS secret leaked into process arguments: %q", secret)
 		}
 	}
 }

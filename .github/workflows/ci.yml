@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Read version
+        id: version
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
       - name: Install SQLite CLI
         run: sudo apt-get update && sudo apt-get install -y sqlite3
       - uses: actions/setup-go@v5
@@ -31,10 +34,22 @@ jobs:
           grep -q '^VIBEWATCH_SESSION_SECRET=' .env.example
           if grep -q '^WTUI_' .env.example; then echo "legacy WTUI variables must not be canonical in .env.example"; exit 1; fi
       - name: Release Compose sanity
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
           cmp -s compose.yml docker-compose.yml
-          grep -q 'ghcr.io/m9rph/vibewatch:0.9.5' compose.yml
-          grep -q 'ghcr.io/m9rph/vibewatch:0.9.5' .env.example
+          grep -q "ghcr.io/m9rph/vibewatch:${VERSION}" compose.yml
+          grep -q "ghcr.io/m9rph/vibewatch:${VERSION}" .env.example
+      - name: Public docs sanity
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          grep -q "raw.githubusercontent.com/M9RPH/vibewatch/v${VERSION}/compose.yml" README.md
+          test -f docs/SCREENSHOTS.md
+          test -f docs/screenshots/dashboard.png
+          test -f docs/screenshots/containers.png
+          test -f docs/screenshots/hosts.png
+          test -f docs/screenshots/rollback.png
       - name: Build controller
         run: go build -trimpath -ldflags "-X main.version=$(cat VERSION)" ./cmd/server
       - uses: actions/setup-node@v4

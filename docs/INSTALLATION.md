@@ -15,8 +15,8 @@ Vibewatch release images are published to GitHub Container Registry for `linux/a
 
 ```bash
 mkdir -p vibewatch && cd vibewatch
-curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v0.9.5/.env.example
+curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.0/compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.0/.env.example
 ```
 
 Edit `.env` and set at least:
@@ -48,10 +48,10 @@ username: admin
 password: VIBEWATCH_ADMIN_PASSWORD from .env
 ```
 
-The v0.9.5 Compose file is pinned to:
+The v1.0.0 Compose file is pinned to:
 
 ```text
-ghcr.io/m9rph/vibewatch:0.9.5
+ghcr.io/m9rph/vibewatch:1.0.0
 ```
 
 A public GHCR image can be pulled anonymously; no GitHub login is required on the Docker host.
@@ -84,10 +84,11 @@ Do not delete or replace this directory during an upgrade. It contains the SQLit
 Use **Hosts** in the web UI.
 
 - Local socket: `unix:///var/run/docker.sock`
+- Secure remote connection: use **Secure Quick Setup** (recommended; Docker `2376` with mTLS)
+- Existing secure endpoint: `tls://host:2376` through Advanced connection options
 - Remote legacy TCP: `tcp://host:2375`
-- Remote TLS/mTLS: `tls://host:2376`
 
-TLS/mTLS is recommended for remote Docker Engines. Port 2375 is unencrypted and grants highly privileged Docker access.
+Secure Quick Setup requires SSH/sudo access once during bootstrap. Vibewatch creates and manages the certificates automatically. Existing TLS/mTLS daemon configuration is detected and is not overwritten. Port 2375 is unencrypted and grants highly privileged Docker access.
 
 ## Upgrade
 
@@ -120,7 +121,7 @@ The published GHCR image remains the recommended deployment path.
 
 ## Upgrading from legacy `WTUI_*` variables
 
-Vibewatch v0.9.5 uses `VIBEWATCH_*` as the canonical environment-variable prefix. Existing installations do **not** need to rewrite their live `.env` immediately: the pre-rebrand `WTUI_*` names remain accepted as compatibility fallbacks.
+Vibewatch v1.0.0 uses `VIBEWATCH_*` as the canonical environment-variable prefix. Existing installations do **not** need to rewrite their live `.env` immediately: the pre-rebrand `WTUI_*` names remain accepted as compatibility fallbacks.
 
 For a planned cleanup, rename variables one-for-one:
 
@@ -135,3 +136,8 @@ WTUI_APP_IMAGE        -> VIBEWATCH_APP_IMAGE
 ```
 
 If both names are present, the `VIBEWATCH_*` value wins.
+
+
+## Owner developer updater
+
+Development builds can also be applied from **Settings → Developer**. This owner-only flow uploads a prepared Vibewatch ZIP package, validates the package and performs the controller self-update with automatic source rollback if the replacement build fails. It is intended for development workflows and is not required for normal release upgrades.

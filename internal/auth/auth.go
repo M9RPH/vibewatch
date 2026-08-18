@@ -36,15 +36,6 @@ func (m *Manager) CheckAdminPassword(password string) bool {
 	return subtle.ConstantTimeCompare([]byte(password), []byte(m.Password)) == 1
 }
 
-func (m *Manager) LoginAdmin(w http.ResponseWriter, password string) (Identity, bool) {
-	if !m.CheckAdminPassword(password) {
-		return Identity{}, false
-	}
-	id := Identity{UserID: 0, Username: "admin", Role: "owner"}
-	m.SetSession(w, id)
-	return id, true
-}
-
 func (m *Manager) SetSession(w http.ResponseWriter, id Identity) {
 	id.Expires = time.Now().Add(7 * 24 * time.Hour).Unix()
 	payloadBytes, _ := json.Marshal(id)

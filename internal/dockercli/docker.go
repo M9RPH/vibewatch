@@ -322,7 +322,7 @@ func safeArgs(args []string) []string {
 	return out
 }
 
-func (c *Client) Ping(ctx context.Context, endpoint string) (string, error) {
+func (c *Client) ping(ctx context.Context, endpoint string) (string, error) {
 	return c.run(ctx, endpoint, "version", "--format", "{{.Server.Version}}")
 }
 
@@ -350,6 +350,73 @@ func cleanupObjectTimeout(endpoint string) time.Duration {
 // occasionally add connection/setup latency even when its steady-state RTT is
 // only tens of milliseconds. Each attempt has its own deadline so one stalled
 // Docker CLI process cannot consume the entire retry budget.
+// PingTLSCredentials verifies a TLS Docker endpoint using temporary credentials
+// without replacing the controller's currently persisted host identity. This is
+// used by Secure Quick Setup so an existing managed host can be probed with the
+// new client certificate before the old credentials are committed locally.
+func (c *Client) PingTLSCredentials(ctx context.Context, endpoint, caPEM, certPEM, keyPEM string) (string, error) {
+	if ConnectionType(endpoint) != "tls" {
+		return "", fmt.Errorf("temporary TLS probe requires a tls:// endpoint")
+	}
+	for label, value := range map[string]string{"CA certificate": caPEM, "client certificate": certPEM, "client private key": keyPEM} {
+		if strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("%s is empty", label)
+		}
+	}
+	dir, err := os.MkdirTemp("", "vibewatch-tls-probe-")
+	if err != nil {
+		return "", fmt.Errorf("create temporary TLS probe directory: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	for name, contents := range map[string]string{"ca.pem": caPEM, "cert.pem": certPEM, "key.pem": keyPEM} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.TrimSpace(contents)+"\n"), 0o600); err != nil {
+			return "", fmt.Errorf("write temporary %s: %w", name, err)
+		}
+	}
+
+	attempts := 3
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		args := []string{
+			"--tlsverify",
+			"--tlscacert", filepath.Join(dir, "ca.pem"),
+			"--tlscert", filepath.Join(dir, "cert.pem"),
+			"--tlskey", filepath.Join(dir, "key.pem"),
+			"--host", dockerEndpoint(endpoint),
+			"version", "--format", "{{.Server.Version}}",
+		}
+		cmd := exec.CommandContext(attemptCtx, c.Binary, args...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, runErr := cmd.Output()
+		cancel()
+		if runErr == nil {
+			return strings.TrimSpace(string(out)), nil
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = runErr.Error()
+		}
+		lastErr = fmt.Errorf("docker TLS probe: %s", msg)
+		if attempt < attempts {
+			timer := time.NewTimer(time.Duration(attempt) * 350 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return "", ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return "", lastErr
+}
+
 func (c *Client) PingReliable(ctx context.Context, endpoint string) (string, error) {
 	attempts := 1
 	perAttempt := 4 * time.Second
@@ -363,7 +430,7 @@ func (c *Client) PingReliable(ctx context.Context, endpoint string) (string, err
 			return "", err
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, perAttempt)
-		version, err := c.Ping(attemptCtx, endpoint)
+		version, err := c.ping(attemptCtx, endpoint)
 		cancel()
 		if err == nil {
 			return version, nil
@@ -548,11 +615,6 @@ func (c *Client) diskUsage(ctx context.Context, endpoint string) (imageTotal, im
 			buildTotal, buildReclaimable = parseDockerBytes(row.Size), parseDockerBytes(row.Reclaimable)
 		}
 	}
-	return
-}
-
-func (c *Client) imageDiskUsage(ctx context.Context, endpoint string) (total, reclaimable int64, exact bool) {
-	total, reclaimable, exact, _, _ = c.diskUsage(ctx, endpoint)
 	return
 }
 
@@ -844,10 +906,6 @@ func (c *Client) VolumeInventory(ctx context.Context, endpoint string) ([]Volume
 		return result[i].Name < result[j].Name
 	})
 	return result, nil
-}
-
-func (c *Client) PruneUnusedAnonymousVolumes(ctx context.Context, endpoint string, protected map[string]bool) (VolumePruneResult, error) {
-	return c.PruneUnusedAnonymousVolumesWithProgress(ctx, endpoint, protected, nil)
 }
 
 func (c *Client) PruneUnusedAnonymousVolumesWithProgress(ctx context.Context, endpoint string, protected map[string]bool, progress CleanupProgress) (VolumePruneResult, error) {
@@ -1157,10 +1215,6 @@ func parsePruneReclaimed(output string) int64 {
 	return 0
 }
 
-func (c *Client) PruneUnusedImages(ctx context.Context, endpoint string, protected map[string]bool) (ImagePruneResult, error) {
-	return c.PruneUnusedImagesWithProgress(ctx, endpoint, protected, nil)
-}
-
 func (c *Client) PruneUnusedImagesWithProgress(ctx context.Context, endpoint string, protected map[string]bool, progress CleanupProgress) (ImagePruneResult, error) {
 	if progress != nil {
 		progress(0, 0, "Inventorying images")
@@ -1292,17 +1346,6 @@ func (c *Client) NetworkInventory(ctx context.Context, endpoint string) ([]Netwo
 	return result, nil
 }
 
-func idOr(primary, fallback string) string {
-	if strings.TrimSpace(primary) != "" {
-		return primary
-	}
-	return fallback
-}
-
-func (c *Client) PruneUnusedNetworks(ctx context.Context, endpoint string, protected map[string]bool) (NetworkPruneResult, error) {
-	return c.PruneUnusedNetworksWithProgress(ctx, endpoint, protected, nil)
-}
-
 func (c *Client) PruneUnusedNetworksWithProgress(ctx context.Context, endpoint string, protected map[string]bool, progress CleanupProgress) (NetworkPruneResult, error) {
 	if progress != nil {
 		progress(0, 0, "Inventorying networks")
@@ -1348,10 +1391,6 @@ func (c *Client) PruneUnusedNetworksWithProgress(ctx context.Context, endpoint s
 		}
 	}
 	return result, nil
-}
-
-func (c *Client) PruneBuildCache(ctx context.Context, endpoint string) (BuildCachePruneResult, error) {
-	return c.PruneBuildCacheWithProgress(ctx, endpoint, nil)
 }
 
 func (c *Client) PruneBuildCacheWithProgress(ctx context.Context, endpoint string, progress CleanupProgress) (BuildCachePruneResult, error) {
@@ -1434,14 +1473,14 @@ func (c *Client) ListContainers(ctx context.Context, endpoint string) ([]Contain
 			for i := range result {
 				meta := byID[result[i].ID]
 				result[i].ImageID = meta.Image
-				result[i].StackName, result[i].StackService, result[i].StackType = StackMetadata(meta.Labels)
+				result[i].StackName, result[i].StackService, result[i].StackType = stackMetadata(meta.Labels)
 			}
 		}
 	}
 	return result, nil
 }
 
-func StackMetadata(labels map[string]string) (name, service, stackType string) {
+func stackMetadata(labels map[string]string) (name, service, stackType string) {
 	if len(labels) == 0 {
 		return "", "", ""
 	}
@@ -1508,68 +1547,6 @@ func (c *Client) ImagePlatform(ctx context.Context, endpoint, image string) (Ima
 	}
 	c.platformMu.Unlock()
 	return p, nil
-}
-
-func normalizeRepoName(v string) string {
-	v = strings.TrimSpace(strings.ToLower(v))
-	v = strings.TrimPrefix(v, "https://")
-	v = strings.TrimPrefix(v, "http://")
-	if at := strings.Index(v, "@"); at >= 0 {
-		v = v[:at]
-	}
-	lastSlash := strings.LastIndex(v, "/")
-	lastColon := strings.LastIndex(v, ":")
-	if lastColon > lastSlash {
-		v = v[:lastColon]
-	}
-	for _, prefix := range []string{"registry-1.docker.io/", "index.docker.io/", "docker.io/"} {
-		v = strings.TrimPrefix(v, prefix)
-	}
-	if !strings.Contains(v, "/") && v != "" {
-		v = "library/" + v
-	}
-	return v
-}
-
-// ImageRepoDigest returns the repository digest associated with the locally
-// installed image without pulling anything. image is the inspect reference
-// (normally the image ID), repositoryRef is the container's configured image
-// name and is used to select the matching RepoDigest when several exist.
-func (c *Client) ImageRepoDigest(ctx context.Context, endpoint, image, repositoryRef string) (string, error) {
-	out, err := c.run(ctx, endpoint, "image", "inspect", image, "--format", "{{json .RepoDigests}}")
-	if err != nil {
-		return "", err
-	}
-	var refs []string
-	if strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "null" {
-		if err := json.Unmarshal([]byte(out), &refs); err != nil {
-			return "", err
-		}
-	}
-	if len(refs) == 0 {
-		return "", fmt.Errorf("local image has no repository digest")
-	}
-	want := normalizeRepoName(repositoryRef)
-	fallback := ""
-	for _, ref := range refs {
-		parts := strings.SplitN(strings.TrimSpace(ref), "@", 2)
-		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-			continue
-		}
-		if fallback == "" {
-			fallback = strings.TrimSpace(parts[1])
-		}
-		if want != "" && normalizeRepoName(parts[0]) == want {
-			return strings.TrimSpace(parts[1]), nil
-		}
-	}
-	if fallback != "" && len(refs) == 1 {
-		return fallback, nil
-	}
-	if fallback != "" && want == "" {
-		return fallback, nil
-	}
-	return "", fmt.Errorf("no local repository digest matches %s", repositoryRef)
 }
 
 func (c *Client) ImageLabels(ctx context.Context, endpoint, image string) (map[string]string, error) {
@@ -1922,7 +1899,6 @@ func (c *Client) LaunchSelfUpdate(ctx context.Context, controllerName string) er
 // CleanupLegacyRuntime removes Docker artifacts whose names predate the
 // Vibewatch runtime rebrand. It is best-effort and never touches persistent data.
 func (c *Client) CleanupLegacyRuntime(ctx context.Context) {
-	_, _ = c.run(ctx, "", "rm", "-f", "vibewatch-runtime-migrate")
 	_, _ = c.run(ctx, "", "rm", "-f", "watchtower-ui-self-updater")
 	// The old network can only be removed after every legacy worker/controller
 	// detached from it. Failure is harmless and will be retried on next start.
@@ -1954,4 +1930,55 @@ func (c *Client) ContainerMount(ctx context.Context, containerName, destination 
 		}
 	}
 	return MountInfo{}, false, nil
+}
+
+// LaunchDevelopmentUpdater starts the source-build updater in a helper container
+// that is independent from the controller it will eventually recreate. The
+// helper inherits the controller's /data and /workspace mounts and talks only to
+// the controller-local Docker socket.
+func (c *Client) LaunchDevelopmentUpdater(ctx context.Context, controllerName, updateID, projectDir, dataDir, projectSource, dataSource, dbBackup string) error {
+	controllerName = strings.TrimSpace(controllerName)
+	updateID = strings.TrimSpace(updateID)
+	projectDir = strings.TrimSpace(projectDir)
+	dataDir = strings.TrimSpace(dataDir)
+	projectSource = strings.TrimSpace(projectSource)
+	dataSource = strings.TrimSpace(dataSource)
+	dbBackup = strings.TrimSpace(dbBackup)
+	if controllerName == "" || updateID == "" || projectDir == "" || dataDir == "" || projectSource == "" || dataSource == "" || dbBackup == "" {
+		return fmt.Errorf("development updater launch parameters are incomplete")
+	}
+	image, err := c.run(ctx, "", "inspect", controllerName, "--format", "{{.Config.Image}}")
+	if err != nil {
+		return fmt.Errorf("inspect controller image: %w", err)
+	}
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return fmt.Errorf("controller image is empty")
+	}
+	shortID := updateID
+	if len(shortID) > 24 {
+		shortID = shortID[len(shortID)-24:]
+	}
+	name := "vibewatch-dev-updater-" + strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, shortID)
+	_, _ = c.run(ctx, "", "rm", "-f", name)
+	args := []string{
+		"run", "-d", "--rm", "--name", name,
+		"--volumes-from", controllerName,
+		"-e", "VIBEWATCH_DEV_UPDATE_ID=" + updateID,
+		"-e", "VIBEWATCH_DEV_UPDATE_PROJECT_DIR=" + projectDir,
+		"-e", "VIBEWATCH_DEV_UPDATE_DATA_DIR=" + dataDir,
+		"-e", "VIBEWATCH_DEV_UPDATE_CONTROLLER=" + controllerName,
+		"-e", "VIBEWATCH_DEV_UPDATE_PROJECT_SOURCE=" + projectSource,
+		"-e", "VIBEWATCH_DEV_UPDATE_DATA_SOURCE=" + dataSource,
+		"-e", "VIBEWATCH_DEV_UPDATE_DB_BACKUP=" + dbBackup,
+		"--entrypoint", "/usr/local/bin/vibewatch-dev-updater",
+		image,
+	}
+	_, err = c.run(ctx, "", args...)
+	return err
 }

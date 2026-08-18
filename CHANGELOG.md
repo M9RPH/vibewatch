@@ -2,6 +2,40 @@
 
 All notable public changes to Vibewatch are documented here.
 
+## 1.0.0
+
+### Release milestone
+
+- Promoted Vibewatch to **v1.0.0** as the first stable public release.
+- Updated release packaging, versioned install files and GitHub-facing documentation for the stable release line.
+
+### Web UI v2
+
+- Finalized the new Web UI v2 across Dashboard, Hosts, Containers, Automation, Jobs, History, Logs, Users, Settings, Update Chains and Recovery views.
+- Added the new Vibewatch lighthouse/whale branding and refreshed public screenshots.
+- Standardized banners, icon mini-cards, typography, spacing and inspector styling across the application.
+
+### Live operation inspectors
+
+- Preflight now uses the same staged live transaction window as SSH Quick Setup.
+- Manual container updates and rollbacks now use the same live staged transaction inspector, preserving the exact active/failed stage.
+- SSH Quick Setup now exposes visible live progress so remote host setup is no longer a background black box.
+
+### Connectivity and operations
+
+- Hardened SSH Quick Setup for legacy TCP and managed mTLS with richer Docker diagnostics, transaction-aware rollback and safer handling of existing Docker daemon configuration.
+- Added persistent notification read-state with mark-as-read actions and bell counts based on unread items only.
+- Added Owner-only Developer update/upload flow to apply development ZIP builds directly from the UI.
+- Added service-icon resolution for the container inspector with fallback handling when no dedicated icon exists.
+
+### Documentation and release preparation
+
+- Reduced the public repository landing page to a short description, name origin and installation path.
+- Updated release notes, architecture documentation and operational docs to reflect the stable 1.0 release.
+- Replaced outdated screenshot assets with the current Web UI v2 screenshots.
+- Updated CI release sanity checks to read the version dynamically from `VERSION`.
+
+
 ## 0.9.5
 
 ### Distribution
@@ -40,11 +74,20 @@ All notable public changes to Vibewatch are documented here.
 - Added the public explanation of the Vibewatch name and its AI-assisted development workflow.
 - Internal engineering/context notes remain in `.vibewatch-internal/`, which is excluded from Git and Docker build contexts.
 
+### Host connection hardening
+
+- Hardened SSH Quick Setup for both legacy TCP and managed mTLS with Docker configuration preflight, port/listener checks, preserved local Unix-socket access, full dockerd restart diagnostics and transactional rollback until the controller verifies the new endpoint.
+- Secure in-place host upgrades now test newly generated mTLS client credentials before replacing persisted controller credentials, and managed credential commits are atomic.
+
+### Transaction UI
+
+- Manual container updates and rollbacks now use the same live staged transaction inspector as SSH Quick Setup and Preflight, driven by real job progress and preserving the exact failed stage for diagnosis.
+
 ### Compatibility
 
 - Existing databases migrate automatically with additive Update Chain recovery metadata and Recovery GC counters.
 - Existing policies, automations, restore points and Chain definitions remain compatible.
-- Fixed the v0.9.5 source-build compatibility issue caused by an ES2021-only `String.replaceAll()` call while the frontend target remains ES2020, and escaped the legacy runtime-migration shell variable so Docker Compose no longer emits the `c variable is not set` warning.
+- Fixed the v1.0.0 source-build compatibility issue caused by an ES2021-only `String.replaceAll()` call while the frontend target remains ES2020, and escaped the legacy runtime-migration shell variable so Docker Compose no longer emits the `c variable is not set` warning.
 
 ## 0.9.4
 

@@ -461,19 +461,6 @@ func (a *App) listSnapshotsForUnit(hostID int64, kind, key string) []ContainerBa
 	return out
 }
 
-func (a *App) findBackupUnit(ctx context.Context, hostID int64, kind, key string) (ContainerBackupUnit, error) {
-	units, err := a.discoverContainerBackupUnits(ctx)
-	if err != nil {
-		return ContainerBackupUnit{}, err
-	}
-	for _, u := range units {
-		if u.HostID == hostID && u.Kind == kind && u.Key == key {
-			return u, nil
-		}
-	}
-	return ContainerBackupUnit{}, fmt.Errorf("backup target not found")
-}
-
 func (a *App) createSnapshotForContainer(ctx context.Context, hostID int64, container, reason string) (ContainerBackupSnapshot, error) {
 	h, err := a.Store.Host(ctx, hostID)
 	if err != nil {
