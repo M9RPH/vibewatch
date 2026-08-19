@@ -90,13 +90,13 @@ jobs:
           cache: true
 
       - name: Docker integration smoke tests
-        run: ./scripts/test-integration.sh
+        run: bash ./scripts/test-integration.sh
 
       - name: Install NetEm prerequisites
         run: sudo apt-get update && sudo apt-get install -y iproute2
 
       - name: NetEm ~50 ms RTT regression
-        run: sudo env VIBEWATCH_NETEM_LOSS=0% ./scripts/test-netem.sh
+        run: sudo env VIBEWATCH_NETEM_LOSS=0% bash ./scripts/test-netem.sh
 
   publish:
     name: Publish GHCR multi-arch image

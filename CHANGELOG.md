@@ -2,6 +2,12 @@
 
 All notable public changes to Vibewatch are documented here.
 
+## 1.0.20
+
+- GitHub CI and release-container integration tests now invoke shell scripts explicitly with `bash`, removing dependence on Git executable-mode metadata after CI hit `Permission denied` on `scripts/test-integration.sh`.
+- NetEm regression invocation is hardened the same way.
+- Developer Update packages continue to preserve executable script modes; production runtime/update behavior is unchanged from v1.0.19.
+
 ## 1.0.19
 
 - Restored repository dotfiles and the complete `data/**/.gitkeep` release skeleton to Developer Update packages after CI exposed an incomplete source artifact.

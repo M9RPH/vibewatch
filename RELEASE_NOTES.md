@@ -1,19 +1,19 @@
-# Vibewatch v1.0.19
+# Vibewatch v1.0.20
 
-v1.0.19 fixes Developer Update/repository packaging integrity after GitHub CI exposed that release-skeleton dotfiles were missing from the generated source package. Runtime update, chain, rollback and recovery semantics are unchanged from v1.0.18.
+v1.0.20 hardens GitHub CI script invocation after a checkout exposed that executable mode bits may be recorded as non-executable in the Git index even when Developer Update packages preserve `0755`. Runtime update, chain, rollback, recovery and Developer Update behavior are unchanged from v1.0.19.
 
-## Repository and Developer Update integrity
+## CI script invocation portability
 
-- Restores the complete repository skeleton to Developer Update packages, including `.gitignore`, `.github/workflows/*` and the six `data/**/.gitkeep` markers required by CI.
-- Developer Update staging now rejects an archive that is missing those repository/release-skeleton files instead of accepting an incomplete project tree.
-- Keeps `data/` runtime contents protected during source apply, but safely recreates missing empty `.gitkeep` markers after the source overlay so a mounted development workspace remains GitHub-release compatible.
-- Adds regression tests proving a package missing a release-skeleton marker is rejected and that source apply restores all six markers without copying staged runtime data.
-- Includes the v1.0.18 legacy-restore ancestry fixture correction; production container-update behavior is otherwise unchanged.
+- GitHub CI and release-container workflows now invoke integration scripts explicitly through `bash` instead of relying on the Git executable bit.
+- Covers both `scripts/test-integration.sh` and the privileged NetEm regression script.
+- Developer Update packages continue to preserve executable file modes, so local `./scripts/...` use remains supported when the filesystem/Git checkout retains those modes.
+- This prevents `Process completed with exit code 126` / `Permission denied` from blocking CI solely because a repository checkout recorded a script as `100644`.
 
 ## Validation
 
 - `go test -count=1 ./...`
 - `go vet ./...`
 - version consistency check
-- GitHub CI release-data-skeleton checks
+- workflow syntax/source checks
+- repository release-data-skeleton checks
 - Developer Update ZIP staging through the integrated `StageArchive()` implementation

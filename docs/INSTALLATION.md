@@ -15,8 +15,8 @@ Vibewatch release images are published to GitHub Container Registry for `linux/a
 
 ```bash
 mkdir -p vibewatch && cd vibewatch
-curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.19/compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.19/.env.example
+curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.20/compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.20/.env.example
 ```
 
 Edit `.env` and set at least:
@@ -48,10 +48,10 @@ username: admin
 password: VIBEWATCH_ADMIN_PASSWORD from .env
 ```
 
-The v1.0.19 Compose file is pinned to:
+The v1.0.20 Compose file is pinned to:
 
 ```text
-ghcr.io/m9rph/vibewatch:1.0.19
+ghcr.io/m9rph/vibewatch:1.0.20
 ```
 
 A public GHCR image can be pulled anonymously; no GitHub login is required on the Docker host.
