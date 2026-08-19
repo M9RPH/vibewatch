@@ -10,8 +10,8 @@ Vibewatch publishes release images to **GHCR** for `linux/amd64` and `linux/arm6
 
 ```bash
 mkdir -p vibewatch && cd vibewatch
-curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.17/compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.17/.env.example
+curl -fsSLo compose.yml https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.18/compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/M9RPH/vibewatch/v1.0.18/.env.example
 ```
 
 Set at least these values in `.env`:

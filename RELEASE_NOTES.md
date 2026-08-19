@@ -1,28 +1,20 @@
-# Vibewatch v1.0.17
+# Vibewatch v1.0.18
 
-v1.0.17 hardens the built-in Developer Update path after a real ENOSPC failure showed that a Docker build could exhaust the host filesystem and leave the mounted source tree only partially restored. This release intentionally does not change the normal container or Update Chain engine.
+v1.0.18 is a CI/regression-fixture correction release. It does not change the production update, chain, rollback, recovery, or Developer Update runtime logic introduced through v1.0.17.
 
-## Developer Update hardening
+## Fixed
 
-- Adds a capacity preflight before installation. The controller verifies workspace/data headroom and probes the Docker root filesystem; builds are blocked when Docker has less than 4 GiB free or recovery inode/headroom requirements are not met.
-- Adds a live disk-pressure guard during the build. If Docker free space falls below the 768 MiB recovery reserve, the build is cancelled before the filesystem reaches 100%.
-- Makes source apply and rollback failure-safe: files are copied to sibling temporary files, fsynced, atomically renamed, verified against the staged source, and stale files are removed only after the replacement tree is durable.
-- Validates the complete Vibewatch source contract, including `go.mod`, before a source tree is accepted as ready.
-- Reserves emergency status-write space so an ENOSPC condition has room to persist a terminal/recovery state.
-- Removes the previous four-hour stale-active bypass. Active Developer Update states now remain blocked until they are explicitly reconciled.
-- Reconciles orphaned Developer Update states at controller startup. If the helper is gone and the previous source can be proven, Vibewatch repairs the workspace and terminalizes the interrupted run; ambiguous post-switch states become `recovery_required`.
-- Adds **Safe cancel** for pre-switch Developer Update stages. A build is cooperatively cancelled and the previous source is restored/verified before the run becomes terminal.
-- Adds **Retry recovery** for `recovery_required` Developer Updates.
-- Cleans orphaned `vibewatch-dev-updater-*` helper containers without touching an active helper.
-- Pins the currently running controller image before the build. If post-switch verification fails, rollback restores source/database and recreates the previous controller from that pinned image with `--no-build`, avoiding a second build/disk spike during recovery.
-- Keeps the pinned rollback image while a Developer Update remains `recovery_required` so manual/startup recovery still has a known-good controller image.
-- Preserves active/recovery-required Developer Update artifacts during cleanup.
+- Fixed the legacy restore ancestry regression fixture used by `TestDeterministicSourceDefaultsRecoversExpiredLegacyRestoreByUniqueLayerAncestry`.
+- The fake Docker shell fixture now matches the multi-image `docker image inspect` request before the shorter single-image request. Shell `case` arms are first-match-wins; the previous ordering caused the batch request to return only the restore image and made the production code correctly fail closed with `no unique local image ancestor`.
+- Added an explanatory fixture comment to prevent reintroducing the overlapping-pattern ordering bug.
+
+## Runtime impact
+
+None. Production deterministic restore ancestry logic is unchanged from v1.0.17.
 
 ## Validation
 
+- Targeted legacy restore ancestry regression test.
 - Full Go test suite.
-- Race-detector coverage for the Developer Update, app and Docker helper paths.
 - `go vet`.
-- Server and Developer Updater builds.
-- Version consistency check across release/runtime/install files.
-- Developer Update ZIP staging validation with the integrated `StageArchive()` implementation.
+- Version consistency check.

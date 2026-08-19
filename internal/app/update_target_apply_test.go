@@ -224,12 +224,15 @@ func TestDeterministicSourceDefaultsRecoversExpiredLegacyRestoreByUniqueLayerAnc
 	script := filepath.Join(dir, "docker")
 	body := `#!/bin/sh
 case "$*" in
+  # Match the batch inspect before the single-image inspect. Shell case arms
+  # are first-match-wins, and the batch command also contains the shorter
+  # "image inspect sha256:restore" substring.
+  *"image inspect sha256:restore sha256:base sha256:unrelated"*)
+    printf '%s\n' '[{"Id":"sha256:restore","RootFS":{"Layers":["sha256:l1","sha256:l2","sha256:commit"]},"Config":{"Labels":{"io.vibewatch.restore-point":"expired-snapshot"}}},{"Id":"sha256:base","RootFS":{"Layers":["sha256:l1","sha256:l2"]},"Config":{"Env":["PATH=/old"],"Cmd":["/old/init"],"Labels":{}}},{"Id":"sha256:unrelated","RootFS":{"Layers":["sha256:x"]},"Config":{"Labels":{}}}]'; exit 0 ;;
   *"image inspect sha256:restore"*)
     printf '%s\n' '[{"Id":"sha256:restore","Parent":"","RootFS":{"Layers":["sha256:l1","sha256:l2","sha256:commit"]},"Config":{"Env":["PATH=/old","VPN_ENABLED=yes"],"Cmd":["/old/init"],"Labels":{"io.vibewatch.restore-point":"expired-snapshot"}}}]'; exit 0 ;;
   *"image ls -aq --no-trunc"*)
     printf '%s\n' 'sha256:restore' 'sha256:base' 'sha256:unrelated'; exit 0 ;;
-  *"image inspect sha256:restore sha256:base sha256:unrelated"*)
-    printf '%s\n' '[{"Id":"sha256:restore","RootFS":{"Layers":["sha256:l1","sha256:l2","sha256:commit"]},"Config":{"Labels":{"io.vibewatch.restore-point":"expired-snapshot"}}},{"Id":"sha256:base","RootFS":{"Layers":["sha256:l1","sha256:l2"]},"Config":{"Env":["PATH=/old"],"Cmd":["/old/init"],"Labels":{}}},{"Id":"sha256:unrelated","RootFS":{"Layers":["sha256:x"]},"Config":{"Labels":{}}}]'; exit 0 ;;
   *"image inspect sha256:base"*)
     printf '%s\n' '[{"Id":"sha256:base","RootFS":{"Layers":["sha256:l1","sha256:l2"]},"Config":{"Env":["PATH=/old"],"Cmd":["/old/init"],"Labels":{}}}]'; exit 0 ;;
 esac

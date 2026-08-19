@@ -2,6 +2,11 @@
 
 All notable public changes to Vibewatch are documented here.
 
+## 1.0.18
+
+- Fixed an overlapping shell-pattern ordering bug in the fake Docker fixture for legacy restore layer-ancestry recovery. The production lineage code was unchanged; CI previously fed the batch image-inspect path an incomplete single-image response and therefore triggered the intended fail-closed result.
+- Added regression-fixture documentation and kept all v1.0.17 Developer Update hardening behavior unchanged.
+
 ## 1.0.17
 
 - Hardened the built-in Developer Update path against disk exhaustion and interrupted rollback.
