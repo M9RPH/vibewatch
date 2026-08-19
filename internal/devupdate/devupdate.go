@@ -37,6 +37,31 @@ var RequiredSourceFiles = []string{
 	"web/package.json", "cmd/devupdater/main.go", "web/public/developer-update.html", "VERSION",
 }
 
+// RequiredPackageFiles are repository/release-skeleton files that are not
+// necessary to execute the controller, but must be present in every Developer
+// Update package so applying an update cannot silently degrade the mounted Git
+// source tree. data/**/.gitkeep entries are safe markers only; runtime data is
+// still preserved and never copied from the archive.
+var RequiredPackageFiles = []string{
+	".dockerignore", ".gitignore", ".env.example",
+	".github/workflows/ci.yml", ".github/workflows/container.yml",
+	"data/.gitkeep",
+	"data/backups/.gitkeep",
+	"data/backups/bundles/.gitkeep",
+	"data/backups/containers/.gitkeep",
+	"data/logs/.gitkeep",
+	"data/host-tls/.gitkeep",
+}
+
+var releaseDataSkeleton = []string{
+	"data/.gitkeep",
+	"data/backups/.gitkeep",
+	"data/backups/bundles/.gitkeep",
+	"data/backups/containers/.gitkeep",
+	"data/logs/.gitkeep",
+	"data/host-tls/.gitkeep",
+}
+
 type DiskSpace struct {
 	Path       string `json:"path"`
 	TotalBytes int64  `json:"total_bytes"`
@@ -334,7 +359,7 @@ func extractProjectZIP(zipPath, dst string) (string, error) {
 		return "", fmt.Errorf("open ZIP: %w", err)
 	}
 	defer zr.Close()
-	required := RequiredSourceFiles
+	required := append(append([]string{}, RequiredSourceFiles...), RequiredPackageFiles...)
 	roots := map[string]bool{}
 	total := int64(0)
 	for _, f := range zr.File {
@@ -596,10 +621,30 @@ func ApplySource(source, workspace string) error {
 			}
 		}
 	}
+	if err := ensureReleaseDataSkeleton(workspace); err != nil {
+		return fmt.Errorf("restore release data skeleton: %w", err)
+	}
 	if err := ValidateSourceTree(workspace); err != nil {
 		return fmt.Errorf("source tree invalid after apply: %w", err)
 	}
 	return verifySourceFiles(source, workspace)
+}
+
+func ensureReleaseDataSkeleton(workspace string) error {
+	for _, rel := range releaseDataSkeleton {
+		path := filepath.Join(workspace, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func copyFileAtomic(src, dst string, mode os.FileMode) error {

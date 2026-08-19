@@ -1,6 +1,6 @@
 # Official Vibewatch release Compose file. Keep compose.yml and docker-compose.yml identical.
 x-vibewatch-image: &vibewatch-image
-  image: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:1.0.18}}"
+  image: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:1.0.19}}"
 
 services:
   # Compatibility bridge for upgrades from the pre-Vibewatch Docker runtime
@@ -43,7 +43,7 @@ services:
       VIBEWATCH_LOG_LEVEL: "${VIBEWATCH_LOG_LEVEL:-${WTUI_LOG_LEVEL:-INFO}}"
       VIBEWATCH_WATCHTOWER_IMAGE: "${VIBEWATCH_WATCHTOWER_IMAGE:-${WTUI_WATCHTOWER_IMAGE:-nickfedor/watchtower:latest}}"
       VIBEWATCH_WORKER_NETWORK: "vibewatch-internal"
-      VIBEWATCH_APP_IMAGE: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:1.0.18}}"
+      VIBEWATCH_APP_IMAGE: "${VIBEWATCH_APP_IMAGE:-${WTUI_APP_IMAGE:-ghcr.io/m9rph/vibewatch:1.0.19}}"
       VIBEWATCH_CONTAINER_NAME: "vibewatch"
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       # Legacy migration only; V0.4.8+ sends with each account's own App Token + User Key.

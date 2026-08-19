@@ -24,6 +24,11 @@ func addRequiredSourceFiles(dst map[string]string, version string) {
 		"web/public/developer-update.html": "<!doctype html>\n",
 		"VERSION":                          version + "\n",
 	}
+	for _, rel := range RequiredPackageFiles {
+		if _, ok := defaults[rel]; !ok {
+			defaults[rel] = "release skeleton\n"
+		}
+	}
 	for k, v := range defaults {
 		if _, ok := dst[k]; !ok {
 			dst[k] = v
@@ -33,16 +38,8 @@ func addRequiredSourceFiles(dst map[string]string, version string) {
 
 func makeFixtureZIP(t *testing.T, root string, extra map[string]string) []byte {
 	t.Helper()
-	files := map[string]string{
-		"go.mod":                           "module github.com/m9rph/vibewatch\n",
-		"Dockerfile":                       "FROM scratch\n",
-		"docker-compose.yml":               "services: {}\n",
-		"docker-compose.build.yml":         "services: {}\n",
-		"web/package.json":                 "{}\n",
-		"cmd/devupdater/main.go":           "package main\nfunc main(){}\n",
-		"web/public/developer-update.html": "<!doctype html>\n",
-		"VERSION":                          "1.0.0\n",
-	}
+	files := map[string]string{}
+	addRequiredSourceFiles(files, "1.0.0")
 	for k, v := range extra {
 		files[k] = v
 	}
@@ -76,6 +73,30 @@ func TestStageArchiveAcceptsNestedProjectRoot(t *testing.T) {
 	p := PathsFor(dataDir)
 	if _, err := os.Stat(filepath.Join(p.Staged, st.ID, "source", "internal", "example.go")); err != nil {
 		t.Fatalf("expected extracted project file: %v", err)
+	}
+}
+
+func TestStageArchiveRejectsMissingRepositorySkeleton(t *testing.T) {
+	files := map[string]string{}
+	addRequiredSourceFiles(files, "1.0.0")
+	delete(files, "data/backups/bundles/.gitkeep")
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, body := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := StageArchive(t.TempDir(), "missing-skeleton.zip", bytes.NewReader(buf.Bytes()))
+	if err == nil || !strings.Contains(err.Error(), "data/backups/bundles/.gitkeep") {
+		t.Fatalf("expected release-skeleton validation error, got %v", err)
 	}
 }
 
@@ -149,6 +170,11 @@ func TestApplySourcePreservesEnvironmentDataAndGit(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "data", "evil")); !os.IsNotExist(err) {
 		t.Fatalf("staged runtime data must not be copied into persistent data: %v", err)
+	}
+	for _, rel := range releaseDataSkeleton {
+		if _, err := os.Stat(filepath.Join(workspace, filepath.FromSlash(rel))); err != nil {
+			t.Fatalf("release skeleton marker %s missing after apply: %v", rel, err)
+		}
 	}
 }
 

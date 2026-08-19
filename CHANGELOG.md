@@ -2,10 +2,13 @@
 
 All notable public changes to Vibewatch are documented here.
 
-## 1.0.18
+## 1.0.19
 
-- Fixed an overlapping shell-pattern ordering bug in the fake Docker fixture for legacy restore layer-ancestry recovery. The production lineage code was unchanged; CI previously fed the batch image-inspect path an incomplete single-image response and therefore triggered the intended fail-closed result.
-- Added regression-fixture documentation and kept all v1.0.17 Developer Update hardening behavior unchanged.
+- Restored repository dotfiles and the complete `data/**/.gitkeep` release skeleton to Developer Update packages after CI exposed an incomplete source artifact.
+- Developer Update staging now rejects packages missing `.gitignore`, workflow files or required release-skeleton markers.
+- Source apply continues to preserve all runtime data under `data/` while recreating only missing empty `.gitkeep` markers needed for a clean Git checkout/release tree.
+- Added regression tests for package-skeleton validation and safe marker restoration.
+- Carries forward the v1.0.18 test-fixture-only legacy restore ancestry correction; production update semantics remain unchanged.
 
 ## 1.0.17
 

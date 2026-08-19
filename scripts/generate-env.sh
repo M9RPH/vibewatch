@@ -8,7 +8,7 @@ if [ -z "$password" ]; then
   stty echo
   printf "\n" >&2
 fi
-version="$(cat VERSION 2>/dev/null || printf '1.0.18')"
+version="$(cat VERSION 2>/dev/null || printf '1.0.19')"
 secret=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 cat > .env <<EOT
 VIBEWATCH_PORT=8085

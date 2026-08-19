@@ -1,20 +1,19 @@
-# Vibewatch v1.0.18
+# Vibewatch v1.0.19
 
-v1.0.18 is a CI/regression-fixture correction release. It does not change the production update, chain, rollback, recovery, or Developer Update runtime logic introduced through v1.0.17.
+v1.0.19 fixes Developer Update/repository packaging integrity after GitHub CI exposed that release-skeleton dotfiles were missing from the generated source package. Runtime update, chain, rollback and recovery semantics are unchanged from v1.0.18.
 
-## Fixed
+## Repository and Developer Update integrity
 
-- Fixed the legacy restore ancestry regression fixture used by `TestDeterministicSourceDefaultsRecoversExpiredLegacyRestoreByUniqueLayerAncestry`.
-- The fake Docker shell fixture now matches the multi-image `docker image inspect` request before the shorter single-image request. Shell `case` arms are first-match-wins; the previous ordering caused the batch request to return only the restore image and made the production code correctly fail closed with `no unique local image ancestor`.
-- Added an explanatory fixture comment to prevent reintroducing the overlapping-pattern ordering bug.
-
-## Runtime impact
-
-None. Production deterministic restore ancestry logic is unchanged from v1.0.17.
+- Restores the complete repository skeleton to Developer Update packages, including `.gitignore`, `.github/workflows/*` and the six `data/**/.gitkeep` markers required by CI.
+- Developer Update staging now rejects an archive that is missing those repository/release-skeleton files instead of accepting an incomplete project tree.
+- Keeps `data/` runtime contents protected during source apply, but safely recreates missing empty `.gitkeep` markers after the source overlay so a mounted development workspace remains GitHub-release compatible.
+- Adds regression tests proving a package missing a release-skeleton marker is rejected and that source apply restores all six markers without copying staged runtime data.
+- Includes the v1.0.18 legacy-restore ancestry fixture correction; production container-update behavior is otherwise unchanged.
 
 ## Validation
 
-- Targeted legacy restore ancestry regression test.
-- Full Go test suite.
-- `go vet`.
-- Version consistency check.
+- `go test -count=1 ./...`
+- `go vet ./...`
+- version consistency check
+- GitHub CI release-data-skeleton checks
+- Developer Update ZIP staging through the integrated `StageArchive()` implementation
