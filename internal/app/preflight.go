@@ -49,11 +49,14 @@ type PreflightResult struct {
 }
 
 type preflightPrepared struct {
-	Snapshot            ContainerBackupSnapshot
-	RestorePoint        db.RestorePoint
-	Dependencies        []networkNamespaceDependencyRuntime
-	TargetInspect       inspectContainer
-	DeferredDataWriters []string
+	Snapshot             ContainerBackupSnapshot
+	RestorePoint         db.RestorePoint
+	Dependencies         []networkNamespaceDependencyRuntime
+	TargetInspect        inspectContainer
+	RestartedDataWriters []string
+	ContinuityHeld       bool
+	ContinuityExclusive  bool
+	ReleaseContinuity    func()
 }
 
 func preflightCheckSource(key string) string {
@@ -289,7 +292,9 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 		// HTTP 429. Leave enough room for those retries instead of turning a short
 		// provider rate limit into an immediate failed preflight.
 		regCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 45*time.Second, 60*time.Second))
+		releaseContinuityRead := a.acquireContinuityRead(regCtx)
 		digest, regErr := a.Registry.RemoteDigest(regCtx, imageRef)
+		releaseContinuityRead()
 		cancel()
 		if regErr != nil {
 			result.add("registry", preflightRed, "Registry / manifest unavailable", "The target manifest could not be resolved before changing the running container.", regErr.Error())
@@ -299,7 +304,9 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 		result.add("architecture", preflightRed, "Host architecture not verified", "Vibewatch could not determine the target Docker host architecture, so image compatibility cannot be proven safely.", "")
 	} else {
 		regCtx, cancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 45*time.Second, 60*time.Second))
+		releaseContinuityRead := a.acquireContinuityRead(regCtx)
 		remote, regErr := a.Registry.RemoteStateForPlatform(regCtx, imageRef, platform)
+		releaseContinuityRead()
 		cancel()
 		if regErr != nil {
 			if strings.Contains(strings.ToLower(regErr.Error()), "no image for platform") {
@@ -420,15 +427,14 @@ func (a *App) runUpdatePreflight(ctx context.Context, req updateRequest, prepare
 				if result.Blocked == 0 {
 					a.preflightProgress(ctx, req, 39, "Creating full restore point")
 					restoreCtx, restoreCancel := context.WithTimeout(ctx, 10*time.Minute)
-					deferRestart := map[string]bool{}
-					if req.DeferTargetRestart {
-						deferRestart[req.Container] = true
-					}
-					capture, re := a.createRestorePointForSnapshotWithOptions(restoreCtx, req.HostID, req.Container, snap, snapshotReason, req.Trigger, prepared.Dependencies, restorePointCaptureOptions{CaptureData: !req.SkipDataProtectionCapture, DeferWriterRestart: deferRestart})
+					capture, re := a.createRestorePointForSnapshotWithOptions(restoreCtx, req.HostID, req.Container, snap, snapshotReason, req.Trigger, prepared.Dependencies, restorePointCaptureOptions{CaptureData: !req.SkipDataProtectionCapture, HoldContinuityAfterCapture: true})
 					restoreCancel()
 					rp := capture.RestorePoint
 					prepared.RestorePoint = rp
-					prepared.DeferredDataWriters = capture.DeferredWriters
+					prepared.RestartedDataWriters = append([]string(nil), capture.RestartedWriters...)
+					prepared.ContinuityHeld = capture.ContinuityHeld
+					prepared.ContinuityExclusive = capture.ContinuityExclusive
+					prepared.ReleaseContinuity = capture.ReleaseContinuity
 					result.RestoreID = rp.ID
 					if re != nil {
 						result.add("restore_point", preflightRed, "Restore point failed", "The writable-layer restore point could not be prepared; the running container is left unchanged.", re.Error())

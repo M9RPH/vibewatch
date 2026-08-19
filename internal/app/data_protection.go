@@ -1317,6 +1317,14 @@ func decodeDataManifest(raw string) (dataArchiveManifest, error) {
 	return m, nil
 }
 
+func retainedManifestInventoryFallbackAllowed(scopeType string, err error) bool {
+	if err == nil || !strings.EqualFold(strings.TrimSpace(scopeType), "stack") {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not part of a Compose stack") || strings.Contains(msg, "not found")
+}
+
 func (a *App) restoreDataArchivesWithSafety(ctx context.Context, rp db.RestorePoint) ([]string, dataArchiveManifest, error) {
 	oldManifest, err := decodeDataManifest(rp.DataManifestJSON)
 	if err != nil || len(oldManifest.Entries) == 0 {
@@ -1324,7 +1332,15 @@ func (a *App) restoreDataArchivesWithSafety(ctx context.Context, rp db.RestorePo
 	}
 	_, currentMounts, err := a.dataProtectionInventory(ctx, rp.HostID, rp.ContainerName, oldManifest.ScopeType)
 	if err != nil {
-		return nil, dataArchiveManifest{}, err
+		// A failed forward recreate can lose Compose labels even though the
+		// pre-update restore manifest still contains the exact protected mount
+		// sources and owners. Do not let that broken *current* metadata prevent
+		// rollback of the already-captured data. The helper mounts retained
+		// sources directly and fails safely if a source disappeared.
+		if !retainedManifestInventoryFallbackAllowed(oldManifest.ScopeType, err) {
+			return nil, dataArchiveManifest{}, err
+		}
+		currentMounts = nil
 	}
 	currentByKey := map[string]DataProtectionMount{}
 	for _, m := range currentMounts {

@@ -29,13 +29,13 @@
   <div class="connection" id="connection">The Vibewatch controller is restarting. This is expected. This page is still running in your browser and will reconnect automatically.</div>
   <div class="meta"><div><span>Package</span><b id="package">—</b></div><div><span>Version</span><b id="version">—</b></div><div><span>Progress</span><b id="percent">0%</b></div></div>
   <div class="log-head"><b>Update log</b><span>Latest output</span></div><pre class="logs" id="logs">Waiting for log output…</pre>
-  <div class="actions"><a class="btn hidden" id="return" href="/">Return to Vibewatch</a><button class="btn secondary hidden" id="retry" type="button">Retry status</button></div>
+  <div class="actions"><a class="btn hidden" id="return" href="/">Return to Vibewatch</a><button class="btn secondary hidden" id="cancel" type="button">Safe cancel</button><button class="btn secondary hidden" id="recover" type="button">Retry recovery</button><button class="btn secondary hidden" id="retry" type="button">Retry status</button></div>
 </main></div>
 <script>
 (() => {
   const id = new URLSearchParams(location.search).get('update') || '';
   const el = name => document.getElementById(name);
-  const terminal = new Set(['completed','failed','rolled_back']);
+  const terminal = new Set(['completed','failed','rolled_back','cancelled','recovery_required']);
   let failures = 0, timer = 0, lastState = '';
   const render = s => {
     failures = 0; el('connection').classList.remove('show'); el('retry').classList.add('hidden');
@@ -46,9 +46,14 @@
     if(s.state==='completed'){status.classList.add('success');el('orb').textContent='✓';el('title').textContent='Development update complete';el('lead').textContent='The recreated Vibewatch controller is healthy and ready.'}
     else if(s.state==='rolled_back'){status.classList.add('rollback');el('orb').textContent='↶';el('title').textContent='Previous version restored';el('lead').textContent='The development update failed, but Vibewatch automatically restored the previous source and healthy controller.'}
     else if(s.state==='failed'){status.classList.add('failure');el('orb').textContent='!';el('title').textContent='Development update stopped';el('lead').textContent=s.error||'The controller was left unchanged or automatic rollback information is shown below.'}
+    else if(s.state==='cancelled'){status.classList.add('rollback');el('orb').textContent='×';el('title').textContent='Development update cancelled';el('lead').textContent=s.message||'The safe cancel completed.'}
+    else if(s.state==='recovery_required'){status.classList.add('failure');el('orb').textContent='!';el('title').textContent='Recovery required';el('lead').textContent=s.message||'Vibewatch could not prove a safe terminal development-update state.'}
     else {el('orb').textContent=s.state==='building'?'◌':s.state==='switching'?'↻':'•••';el('title').textContent=s.state==='building'?'Building new Vibewatch image':s.state==='switching'?'Switching controller':s.state==='verifying'?'Verifying recreated controller':'Installing development update'}
     lastState=s.state||'';
-    if(terminal.has(lastState)){el('return').classList.remove('hidden');clearTimeout(timer)}
+    const active=!terminal.has(lastState)&&lastState!=='uploaded';
+    el('cancel').classList.toggle('hidden',!active);el('cancel').disabled=!!s.cancel_requested;el('cancel').textContent=s.cancel_requested?'Cancel requested':'Safe cancel';
+    el('recover').classList.toggle('hidden',lastState!=='recovery_required');
+    if(terminal.has(lastState)){el('return').classList.remove('hidden');el('cancel').classList.add('hidden');clearTimeout(timer)}
   };
   async function refresh(){
     if(!id){el('stage').textContent='Missing update id';el('message').textContent='Open this page from Settings → Developer.';el('retry').classList.remove('hidden');return}
@@ -61,7 +66,9 @@
     }
     if(!terminal.has(lastState))timer=setTimeout(refresh,1500);
   }
-  el('retry').addEventListener('click',()=>{failures=0;refresh()}); refresh();
+  el('retry').addEventListener('click',()=>{failures=0;refresh()});
+  el('cancel').addEventListener('click',async()=>{if(!id||!confirm('Request a safe cancel? Pre-switch build work will stop and restore the previous source. Controller switch/recovery is never interrupted mid-step.'))return;el('cancel').disabled=true;try{const r=await fetch('/api/system/developer-update/cancel',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});if(!r.ok){const b=await r.json().catch(()=>({}));throw new Error(b.error||('HTTP '+r.status))}await refresh()}catch(e){el('message').textContent=String(e);el('cancel').disabled=false}});
+  el('recover').addEventListener('click',async()=>{if(!id)return;el('recover').disabled=true;try{const r=await fetch('/api/system/developer-update/recover',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});const b=await r.json().catch(()=>({}));if(!r.ok&&b.state!=='recovery_required')throw new Error(b.error||('HTTP '+r.status));render(b)}catch(e){el('message').textContent=String(e)}finally{el('recover').disabled=false}}); refresh();
 })();
 </script>
 </body>

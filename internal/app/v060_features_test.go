@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -232,5 +233,176 @@ func TestNetworkNamespaceDependencyPersistenceRoundTrip(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].SourceContainer != "xteve" || rows[0].SnapshotID != "snapshot-1" || !rows[0].WasRunning {
 		t.Fatalf("unexpected persisted dependency payload: %s", text)
+	}
+}
+
+func TestDeterministicTargetRuntimeUsesNewImageDefaultsAndPreservesVPNOverrides(t *testing.T) {
+	var current inspectContainer
+	current.Name = "/sabnzbdvpn"
+	current.Image = "sha256:old"
+	current.Config.Image = "binhex/arch-sabnzbdvpn:latest"
+	current.Config.Env = []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/bin",
+		"HOME=/home/nobody",
+		"VPN_ENABLED=yes",
+		"VPN_CLIENT=wireguard",
+		"LAN_NETWORK=192.168.1.0/24",
+	}
+	current.Config.Cmd = []string{"/bin/bash", "old-init.sh"}
+	current.Config.Entrypoint = []string{"/usr/bin/dumb-init", "--"}
+	current.Config.Labels = map[string]string{
+		"org.opencontainers.image.version": "old-image-version",
+		"com.docker.compose.project":       "sabnzbd",
+		"com.docker.compose.service":       "sabnzbdvpn",
+	}
+	current.Config.WorkingDir = "/"
+	current.HostConfig.Privileged = true
+	current.HostConfig.CapAdd = []string{"NET_ADMIN"}
+	current.HostConfig.Sysctls = map[string]string{"net.ipv4.conf.all.src_valid_mark": "1"}
+	current.HostConfig.PortBindings = map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}{"8080/tcp": {{HostPort: "8080"}}}
+	current.NetworkSettings.Networks = map[string]json.RawMessage{"sabnzbd_default": nil}
+
+	var source imageRuntimeDefaults
+	source.Config.Env = []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/bin",
+		"HOME=/home/nobody",
+	}
+	source.Config.Cmd = []string{"/bin/bash", "old-init.sh"}
+	source.Config.Entrypoint = []string{"/usr/bin/dumb-init", "--"}
+	source.Config.Labels = map[string]string{"org.opencontainers.image.version": "old-image-version"}
+	source.Config.WorkingDir = "/"
+
+	prepared, summary := targetRuntimeOverrides(current, source)
+	if summary.Environment != 3 {
+		t.Fatalf("expected only three user env overrides, got %#v env=%v", summary, prepared.Config.Env)
+	}
+	for _, inherited := range []string{"PATH=", "HOME="} {
+		for _, got := range prepared.Config.Env {
+			if strings.HasPrefix(got, inherited) {
+				t.Fatalf("inherited image env %q must not be replayed onto the target: %v", inherited, prepared.Config.Env)
+			}
+		}
+	}
+	if prepared.Config.Cmd != nil || prepared.Config.Entrypoint != nil {
+		t.Fatalf("inherited command/entrypoint must be supplied by the target image, got cmd=%v entrypoint=%v", prepared.Config.Cmd, prepared.Config.Entrypoint)
+	}
+	if _, ok := prepared.Config.Labels["org.opencontainers.image.version"]; ok {
+		t.Fatalf("inherited OCI image label must not be pinned to the target: %v", prepared.Config.Labels)
+	}
+	if prepared.Config.Labels["com.docker.compose.project"] != "sabnzbd" || prepared.Config.Labels["com.docker.compose.service"] != "sabnzbdvpn" {
+		t.Fatalf("compose runtime labels were not preserved: %v", prepared.Config.Labels)
+	}
+	args, _, err := createArgsFromInspect(prepared, "sha256:new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--privileged", "--cap-add NET_ADMIN", "--sysctl net.ipv4.conf.all.src_valid_mark=1", "--publish 8080:8080/tcp", "--env VPN_ENABLED=yes", "--env VPN_CLIENT=wireguard", "--network sabnzbd_default", "sha256:new"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("VPN deterministic recreate args missing %q: %s", want, joined)
+		}
+	}
+	for _, forbidden := range []string{"old-init.sh", "--entrypoint /usr/bin/dumb-init", "PATH=/usr/local", "org.opencontainers.image.version=old-image-version"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("old image default leaked into deterministic recreate (%q): %s", forbidden, joined)
+		}
+	}
+}
+
+func TestDeterministicTargetRuntimeIgnoresVibewatchNormalizedImageEntrypoint(t *testing.T) {
+	var current inspectContainer
+	current.Name = "/sabnzbdvpn"
+	// Real SABnzbdVPN evidence from the support bundle:
+	// healthy peer/source shape: Entrypoint=/usr/bin/dumb-init (2 args), Cmd=/bin/bash (2 args)
+	// restored Host 5 shape: Entrypoint=/usr/bin/dumb-init (1 arg), Cmd=-- (3 args).
+	current.Config.Entrypoint = []string{"/usr/bin/dumb-init"}
+	current.Config.Cmd = []string{"--", "/bin/bash", "/usr/local/bin/init.sh"}
+
+	var source imageRuntimeDefaults
+	// This is the original image process pair before an older Vibewatch rollback
+	// round-tripped it through docker create --entrypoint.
+	source.Config.Entrypoint = []string{"/usr/bin/dumb-init", "--"}
+	source.Config.Cmd = []string{"/bin/bash", "/usr/local/bin/init.sh"}
+
+	prepared, summary := targetRuntimeOverrides(current, source)
+	if summary.Command || summary.Entrypoint {
+		t.Fatalf("Vibewatch-normalized inherited startup contract must not become user overrides: %#v", summary)
+	}
+	if prepared.Config.Cmd != nil || prepared.Config.Entrypoint != nil {
+		t.Fatalf("target image must own startup defaults, got cmd=%v entrypoint=%v", prepared.Config.Cmd, prepared.Config.Entrypoint)
+	}
+	args, _, err := createArgsFromInspect(prepared, "sha256:new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "/usr/local/bin/init.sh") || strings.Contains(joined, "--entrypoint /usr/bin/dumb-init") {
+		t.Fatalf("legacy source startup path leaked into target recreate: %s", joined)
+	}
+}
+
+func TestDeterministicTargetRuntimeRecoversCommandOnlyOverrideAfterEntrypointNormalization(t *testing.T) {
+	var current inspectContainer
+	current.Config.Entrypoint = []string{"/usr/bin/dumb-init"}
+	current.Config.Cmd = []string{"--", "/custom/server", "--serve"}
+
+	var source imageRuntimeDefaults
+	source.Config.Entrypoint = []string{"/usr/bin/dumb-init", "--"}
+	source.Config.Cmd = []string{"/bin/bash", "init.sh"}
+
+	prepared, summary := targetRuntimeOverrides(current, source)
+	if !summary.Command || summary.Entrypoint {
+		t.Fatalf("expected command-only override after normalization, got %#v", summary)
+	}
+	if !slices.Equal(prepared.Config.Cmd, []string{"/custom/server", "--serve"}) {
+		t.Fatalf("expected normalized entrypoint tail to be removed from command override, got %v", prepared.Config.Cmd)
+	}
+	if prepared.Config.Entrypoint != nil {
+		t.Fatalf("target image entrypoint should remain authoritative, got %v", prepared.Config.Entrypoint)
+	}
+}
+
+func TestDeterministicTargetRuntimePreservesExplicitCommandAndEntrypointOverrides(t *testing.T) {
+	var current inspectContainer
+	current.Config.Cmd = []string{"/custom/server", "--serve"}
+	current.Config.Entrypoint = []string{"/custom/entrypoint"}
+	current.Config.User = "1000:1000"
+	var source imageRuntimeDefaults
+	source.Config.Cmd = []string{"/bin/bash", "init.sh"}
+	source.Config.Entrypoint = []string{"/usr/bin/dumb-init", "--"}
+
+	prepared, summary := targetRuntimeOverrides(current, source)
+	if !summary.Command || !summary.Entrypoint || !summary.User {
+		t.Fatalf("explicit runtime overrides were not retained: %#v", summary)
+	}
+	if !strings.EqualFold(prepared.Config.Cmd[0], "/custom/server") || prepared.Config.Entrypoint[0] != "/custom/entrypoint" || prepared.Config.User != "1000:1000" {
+		t.Fatalf("unexpected prepared overrides: cmd=%v entrypoint=%v user=%q", prepared.Config.Cmd, prepared.Config.Entrypoint, prepared.Config.User)
+	}
+}
+
+func TestDeterministicRuntimeFidelityCoversVPNCriticalSettings(t *testing.T) {
+	var before, after inspectContainer
+	before.HostConfig.Privileged = true
+	before.HostConfig.CapAdd = []string{"NET_ADMIN"}
+	before.HostConfig.Sysctls = map[string]string{"net.ipv4.conf.all.src_valid_mark": "1"}
+	before.HostConfig.RestartPolicy.Name = "unless-stopped"
+	before.HostConfig.NetworkMode = "sabnzbd_default"
+	before.NetworkSettings.Networks = map[string]json.RawMessage{"sabnzbd_default": nil}
+	before.HostConfig.PortBindings = map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}{"8080/tcp": {{HostPort: "8080"}}}
+	after = before
+	after.HostConfig.CapAdd = []string{"CAP_NET_ADMIN"} // Docker may normalize CAP_ prefix.
+	if got := criticalRuntimeMismatches(before, after); len(got) != 0 {
+		t.Fatalf("equivalent VPN runtime should pass fidelity check: %v", got)
+	}
+	after.HostConfig.Sysctls = map[string]string{}
+	got := criticalRuntimeMismatches(before, after)
+	if len(got) != 1 || got[0] != "sysctls" {
+		t.Fatalf("expected missing WireGuard sysctl to be detected precisely, got %v", got)
 	}
 }

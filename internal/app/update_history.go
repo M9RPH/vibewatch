@@ -66,7 +66,7 @@ func (a *App) handleUpdateHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-func (a *App) recordUpdateHistory(req updateRequest, before dockercli.Container, beforeVersion db.VersionInfo, snapshotID string, restorePointID int64, attemptedDigest string, started time.Time, dependencyCount int, dependencyStatus, dependencyDetails, preflightStatus, preflightDetails, verificationStatus, verificationDetails string) {
+func (a *App) recordUpdateHistory(req updateRequest, before dockercli.Container, beforeVersion db.VersionInfo, snapshotID string, restorePointID int64, attemptedDigest, expectedTargetImageID string, started time.Time, dependencyCount int, dependencyStatus, dependencyDetails, preflightStatus, preflightDetails, verificationStatus, verificationDetails string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	job, err := a.Store.Job(ctx, req.JobID)
@@ -78,6 +78,17 @@ func (a *App) recordUpdateHistory(req updateRequest, before dockercli.Container,
 	if toDigest == "" {
 		toDigest = before.ImageID
 	}
+	// Preserve the immutable image Vibewatch ACTUALLY attempted even when the
+	// pipeline fails before recreation completes or an automatic rollback leaves
+	// a restore image running. The post-operation container image is not the
+	// update target in either case.
+	if strings.TrimSpace(expectedTargetImageID) != "" && job.Status != "success" {
+		toDigest = strings.TrimSpace(expectedTargetImageID)
+	} else if strings.TrimSpace(attemptedDigest) != "" && job.Status != "success" {
+		toDigest = strings.TrimSpace(attemptedDigest)
+	} else if tx, txErr := a.Store.UpdateTransactionByJob(ctx, req.JobID); txErr == nil && tx.State == txRolledBack && strings.TrimSpace(expectedTargetImageID) != "" {
+		toDigest = strings.TrimSpace(expectedTargetImageID)
+	}
 	toRef := after.Image
 	if toRef == "" {
 		toRef = before.Image
@@ -85,12 +96,6 @@ func (a *App) recordUpdateHistory(req updateRequest, before dockercli.Container,
 	toVersion := afterVersion.Installed
 	if toVersion == "" {
 		toVersion = beforeVersion.Installed
-	}
-	if job.Status == "failed" && strings.TrimSpace(attemptedDigest) != "" && strings.EqualFold(strings.TrimSpace(toDigest), strings.TrimSpace(before.ImageID)) {
-		toDigest = strings.TrimSpace(attemptedDigest)
-		if strings.TrimSpace(beforeVersion.Latest) != "" {
-			toVersion = beforeVersion.Latest
-		}
 	}
 	actor := strings.TrimSpace(req.Actor)
 	if actor == "" {

@@ -51,3 +51,45 @@ func TestRollbackSnoozedFromHistory(t *testing.T) {
 		t.Fatal("successful rollback adjacent to snooze timestamp should be identified as rollback snooze")
 	}
 }
+
+func TestClearUpdateSnoozeRestoresKnownTargetAfterRollbackCacheCollapse(t *testing.T) {
+	c := db.Cache{
+		HostID:          1,
+		ContainerName:   "adguardhome",
+		CurrentDigest:   "sha256:old",
+		LatestDigest:    "sha256:old",
+		SnoozedDigest:   "sha256:new",
+		SnoozedAt:       "2026-08-19T04:05:00Z",
+		UpdateAvailable: false,
+	}
+	got := clearUpdateSnooze(c, "2026-08-19T06:45:00Z")
+	if got.SnoozedDigest != "" || got.SnoozedAt != "" {
+		t.Fatalf("snooze was not cleared: %+v", got)
+	}
+	if got.LatestDigest != "sha256:new" || !bool(got.UpdateAvailable) {
+		t.Fatalf("known snoozed target should become actionable again: %+v", got)
+	}
+}
+
+func TestClearUpdateSnoozeKeepsCurrentRemoteIdentityWhenUseful(t *testing.T) {
+	c := db.Cache{
+		HostID:          1,
+		ContainerName:   "demo",
+		CurrentDigest:   "sha256:old",
+		LatestDigest:    "sha256:newer",
+		SnoozedDigest:   "sha256:new",
+		SnoozedAt:       "2026-08-19T04:05:00Z",
+		UpdateAvailable: false,
+	}
+	got := clearUpdateSnooze(c, "2026-08-19T06:45:00Z")
+	if got.LatestDigest != "sha256:newer" || !bool(got.UpdateAvailable) {
+		t.Fatalf("newer known registry identity must win over stale snooze: %+v", got)
+	}
+}
+
+func TestCacheHasSnoozedUpdateSurvivesPostRollbackLatestCollapse(t *testing.T) {
+	c := db.Cache{CurrentDigest: "sha256:old", LatestDigest: "sha256:old", SnoozedDigest: "sha256:new", SnoozedAt: "2026-08-19T04:05:00Z"}
+	if !cacheHasSnoozedUpdate(c) {
+		t.Fatal("rollback snooze must remain authoritative when latest temporarily collapses to the running image")
+	}
+}

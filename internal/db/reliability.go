@@ -19,6 +19,7 @@ type UpdateTransaction struct {
 	SnapshotID     string `json:"snapshot_id"`
 	RestorePointID int64  `json:"restore_point_id"`
 	TargetDigest   string `json:"target_digest"`
+	TargetImageID  string `json:"target_image_id"`
 	StartedAt      string `json:"started_at"`
 	UpdatedAt      string `json:"updated_at"`
 	FinishedAt     string `json:"finished_at"`
@@ -89,12 +90,12 @@ func (s *Store) CreateUpdateTransaction(ctx context.Context, x UpdateTransaction
 	if strings.TrimSpace(x.Status) == "" {
 		x.Status = "running"
 	}
-	return s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_transactions(job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,started_at,updated_at,error,recovery_action) VALUES(%d,%d,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%s,%s); SELECT last_insert_rowid();`, x.JobID, x.HostID, q(x.ContainerName), q(x.Trigger), q(x.Actor), q(x.State), q(x.Status), q(x.SnapshotID), x.RestorePointID, q(x.TargetDigest), q(ts), q(ts), q(x.Error), q(x.RecoveryAction)))
+	return s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO update_transactions(job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,target_image_id,started_at,updated_at,error,recovery_action) VALUES(%d,%d,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%s,%s,%s); SELECT last_insert_rowid();`, x.JobID, x.HostID, q(x.ContainerName), q(x.Trigger), q(x.Actor), q(x.State), q(x.Status), q(x.SnapshotID), x.RestorePointID, q(x.TargetDigest), q(x.TargetImageID), q(ts), q(ts), q(x.Error), q(x.RecoveryAction)))
 }
 
 func (s *Store) UpdateTransaction(ctx context.Context, id int64) (UpdateTransaction, error) {
 	var xs []UpdateTransaction
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions WHERE id=%d LIMIT 1`, id), &xs)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,target_image_id,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions WHERE id=%d LIMIT 1`, id), &xs)
 	if err != nil {
 		return UpdateTransaction{}, err
 	}
@@ -106,7 +107,7 @@ func (s *Store) UpdateTransaction(ctx context.Context, id int64) (UpdateTransact
 
 func (s *Store) UpdateTransactionByJob(ctx context.Context, jobID int64) (UpdateTransaction, error) {
 	var xs []UpdateTransaction
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions WHERE job_id=%d ORDER BY id DESC LIMIT 1`, jobID), &xs)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,target_image_id,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions WHERE job_id=%d ORDER BY id DESC LIMIT 1`, jobID), &xs)
 	if err != nil {
 		return UpdateTransaction{}, err
 	}
@@ -118,7 +119,7 @@ func (s *Store) UpdateTransactionByJob(ctx context.Context, jobID int64) (Update
 
 func (s *Store) ActiveUpdateTransactions(ctx context.Context) ([]UpdateTransaction, error) {
 	var xs []UpdateTransaction
-	err := s.query(ctx, `SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions WHERE status IN ('running','recovering','recovery_required') ORDER BY id`, &xs)
+	err := s.query(ctx, `SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,target_image_id,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions WHERE status IN ('running','recovering','recovery_required') ORDER BY id`, &xs)
 	return xs, err
 }
 
@@ -127,14 +128,14 @@ func (s *Store) UpdateTransactions(ctx context.Context, limit int) ([]UpdateTran
 		limit = 200
 	}
 	var xs []UpdateTransaction
-	err := s.query(ctx, fmt.Sprintf(`SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions ORDER BY id DESC LIMIT %d`, limit), &xs)
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,job_id,host_id,container_name,trigger,actor,state,status,snapshot_id,restore_point_id,target_digest,target_image_id,started_at,updated_at,finished_at,error,recovery_action FROM update_transactions ORDER BY id DESC LIMIT %d`, limit), &xs)
 	return xs, err
 }
 
 func (s *Store) TransitionUpdateTransaction(ctx context.Context, id int64, fromState, toState, status, message string, durationMS int64) error {
 	ts := now()
 	finished := ""
-	if status == "success" || status == "failed" || status == "rolled_back" || status == "interrupted" {
+	if status == "success" || status == "failed" || status == "rolled_back" || status == "interrupted" || status == "cancelled" {
 		finished = ts
 	}
 	if strings.TrimSpace(status) == "" {
@@ -148,14 +149,14 @@ func (s *Store) TransitionUpdateTransaction(ctx context.Context, id int64, fromS
 
 func (s *Store) SetUpdateTransactionRecovery(ctx context.Context, id int64, status, action, errText string) error {
 	fin := ""
-	if status == "failed" || status == "success" || status == "rolled_back" || status == "interrupted" {
+	if status == "failed" || status == "success" || status == "rolled_back" || status == "interrupted" || status == "cancelled" {
 		fin = now()
 	}
 	return s.exec(ctx, fmt.Sprintf(`UPDATE update_transactions SET status=%s,recovery_action=%s,error=%s,updated_at=%s,finished_at=CASE WHEN %s='' THEN finished_at ELSE %s END WHERE id=%d`, q(status), q(action), q(errText), q(now()), q(fin), q(fin), id))
 }
 
-func (s *Store) SetUpdateTransactionPrepared(ctx context.Context, id int64, snapshotID string, restorePointID int64, targetDigest string) error {
-	return s.exec(ctx, fmt.Sprintf(`UPDATE update_transactions SET snapshot_id=%s,restore_point_id=%d,target_digest=%s,updated_at=%s WHERE id=%d`, q(snapshotID), restorePointID, q(targetDigest), q(now()), id))
+func (s *Store) SetUpdateTransactionPrepared(ctx context.Context, id int64, snapshotID string, restorePointID int64, targetDigest, targetImageID string) error {
+	return s.exec(ctx, fmt.Sprintf(`UPDATE update_transactions SET snapshot_id=%s,restore_point_id=%d,target_digest=%s,target_image_id=%s,updated_at=%s WHERE id=%d`, q(snapshotID), restorePointID, q(targetDigest), q(targetImageID), q(now()), id))
 }
 
 func (s *Store) UpdateTransactionEvents(ctx context.Context, txID int64) ([]UpdateTransactionEvent, error) {
@@ -265,11 +266,11 @@ func (s *Store) FailActiveJobsWithoutTransaction(ctx context.Context, reason str
 	if strings.TrimSpace(reason) == "" {
 		reason = "operation interrupted"
 	}
-	n, err := s.scalarInt(ctx, `SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required')) AND id NOT IN (SELECT job_id FROM update_chain_runs WHERE status IN ('queued','running','recovering','recovery_required') AND job_id>0);`)
+	n, err := s.scalarInt(ctx, `SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running','cancel_requested') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required')) AND id NOT IN (SELECT job_id FROM update_chain_runs WHERE status IN ('queued','running','recovering','recovery_required') AND job_id>0);`)
 	if err != nil || n == 0 {
 		return int(n), err
 	}
-	err = s.exec(ctx, fmt.Sprintf(`UPDATE jobs SET status='failed',finished_at=%s,error=CASE WHEN error='' THEN %s ELSE error END WHERE status IN ('queued','running') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required')) AND id NOT IN (SELECT job_id FROM update_chain_runs WHERE status IN ('queued','running','recovering','recovery_required') AND job_id>0);`, q(now()), q(reason)))
+	err = s.exec(ctx, fmt.Sprintf(`UPDATE jobs SET status='failed',finished_at=%s,error=CASE WHEN error='' THEN %s ELSE error END WHERE status IN ('queued','running','cancel_requested') AND id NOT IN (SELECT job_id FROM update_transactions WHERE status IN ('running','recovering','recovery_required')) AND id NOT IN (SELECT job_id FROM update_chain_runs WHERE status IN ('queued','running','recovering','recovery_required') AND job_id>0);`, q(now()), q(reason)))
 	return int(n), err
 }
 
@@ -277,13 +278,19 @@ func (s *Store) PruneReliabilityHistory(ctx context.Context, keepTransactions in
 	if keepTransactions < 100 {
 		keepTransactions = 5000
 	}
-	// Never prune active transactions. Events are removed only for transactions
-	// that are themselves outside the retained terminal history window.
+	// Never prune unresolved recovery contracts. Older releases could incorrectly
+	// mark a failed rollback as terminal `failed`, so recovery_action/error are
+	// deliberately part of the protection predicate for backwards compatibility.
+	protected := `(status IN ('running','recovering','recovery_required')
+OR recovery_action IN ('rollback_failed','pipeline_exit','lease_conflict','manual_intervention','pipeline_gate')
+OR lower(error) LIKE '%automatic rollback failed%'
+OR lower(error) LIKE '%recovery is required%')`
+	terminal := `NOT ` + protected
 	return s.exec(ctx, fmt.Sprintf(`DELETE FROM update_transaction_events WHERE transaction_id IN (
-SELECT id FROM update_transactions WHERE status NOT IN ('running','recovering','recovery_required') AND id NOT IN (
-SELECT id FROM update_transactions WHERE status NOT IN ('running','recovering','recovery_required') ORDER BY id DESC LIMIT %d));
-DELETE FROM update_transactions WHERE status NOT IN ('running','recovering','recovery_required') AND id NOT IN (
-SELECT id FROM update_transactions WHERE status NOT IN ('running','recovering','recovery_required') ORDER BY id DESC LIMIT %d);`, keepTransactions, keepTransactions))
+SELECT id FROM update_transactions WHERE %s AND id NOT IN (
+SELECT id FROM update_transactions WHERE %s ORDER BY id DESC LIMIT %d));
+DELETE FROM update_transactions WHERE %s AND id NOT IN (
+SELECT id FROM update_transactions WHERE %s ORDER BY id DESC LIMIT %d);`, terminal, terminal, keepTransactions, terminal, terminal, keepTransactions))
 }
 
 func (s *Store) SetRestorePointIntegrity(ctx context.Context, id int64, status, details string) error {

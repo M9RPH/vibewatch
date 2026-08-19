@@ -111,3 +111,45 @@ func TestQueuedJobCancellationAndClaimAreAtomic(t *testing.T) {
 		t.Fatal("a running job must not be cancellable")
 	}
 }
+
+func TestRunningUpdateCanRequestCooperativeCancellation(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not available in test environment")
+	}
+	dir := t.TempDir()
+	s := New(filepath.Join(dir, "watchtower-ui.db"))
+	ctx := context.Background()
+	if err := s.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.CreateJob(ctx, "update", "manual", 7, "sabnzbdvpn", "queued")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimQueuedJob(ctx, id)
+	if err != nil || !claimed {
+		t.Fatalf("claim queued update: claimed=%v err=%v", claimed, err)
+	}
+	requested, err := s.RequestRunningJobCancel(ctx, id, "safe cancel test")
+	if err != nil || !requested {
+		t.Fatalf("request running cancellation: requested=%v err=%v", requested, err)
+	}
+	job, err := s.Job(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != "cancel_requested" {
+		t.Fatalf("status=%q, want cancel_requested", job.Status)
+	}
+	active, err := s.HasActiveJob(ctx, 7, "sabnzbdvpn")
+	if err != nil || !active {
+		t.Fatalf("cancel_requested job must continue reserving its target: active=%v err=%v", active, err)
+	}
+	requested, err = s.RequestRunningJobCancel(ctx, id, "duplicate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requested {
+		t.Fatal("duplicate request must not rewrite an already cancel_requested job")
+	}
+}

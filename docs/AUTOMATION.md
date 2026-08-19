@@ -28,3 +28,7 @@ Automations can target:
 - a host group.
 
 Update Chains may bind only to Policy automations, not Cleanup automations.
+
+## Multi-host concurrency
+
+Policy discovery is bounded-parallel across up to three target hosts. The update queue can also execute up to three pipelines concurrently when they belong to different hosts, while a single host never receives two active update pipelines at once. Ordinary checks, preflight/restore preparation and ordinary stop/recreate/verification windows use shared continuity access and may overlap across hosts. A DNS-capable target (runtime port 53) requests exclusive access; already-running shared work finishes, then no new registry/Watchtower check or ordinary mutation starts until DNS readiness is proven.

@@ -13,7 +13,7 @@ import (
 
 func chainRunStepTerminal(status string) bool {
 	switch strings.TrimSpace(status) {
-	case "success", "failed", "rolled_back", "restarted", "recreated", "skipped_current", "skipped_snoozed", "skipped_preflight", "blocked_preflight", "interrupted":
+	case "success", "failed", "rolled_back", "restarted", "recreated", "skipped_current", "skipped_snoozed", "skipped_preflight", "blocked_preflight", "interrupted", "cancelled":
 		return true
 	default:
 		return false
@@ -56,6 +56,12 @@ func (a *App) recoverInterruptedChainRuns() {
 func (a *App) recoverInterruptedChainRun(run db.UpdateChainRun) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Minute)
 	defer cancel()
+	// Direct chain restart/recreate actions use the chain job as lease owner. A
+	// controller crash cannot release that in-memory owner, so reclaim it before
+	// any recovery rollback/verification tries to acquire the same container.
+	if run.JobID > 0 {
+		_ = a.Store.ReleaseOperationLeaseByJob(ctx, run.JobID)
+	}
 	chain, err := a.Store.UpdateChain(ctx, run.ChainID)
 	if err != nil {
 		msg := "interrupted chain definition is unavailable: " + err.Error()
@@ -65,6 +71,12 @@ func (a *App) recoverInterruptedChainRun(run db.UpdateChainRun) {
 		}
 		return
 	}
+	// Refresh because an orphaned Safe Cancel can mark the run recovery-required
+	// immediately before invoking this recovery function.
+	if freshRun, freshErr := a.Store.UpdateChainRun(ctx, run.ID); freshErr == nil {
+		run = freshRun
+	}
+	cancelAfterRecovery := strings.TrimSpace(run.RecoveryAction) == "safe_cancel_orphaned"
 	steps, err := a.Store.UpdateChainRunSteps(ctx, run.ID)
 	if err != nil {
 		msg := "interrupted chain steps are unavailable: " + err.Error()
@@ -74,6 +86,18 @@ func (a *App) recoverInterruptedChainRun(run db.UpdateChainRun) {
 		}
 		return
 	}
+	var pipelineErr error
+	ctx, releasePipeline, pipelineErr := a.acquireMutationPipeline(ctx, run.HostID)
+	if pipelineErr != nil {
+		msg := "chain recovery could not acquire mutation pipeline: " + pipelineErr.Error()
+		_ = a.Store.SetUpdateChainRunRecovery(context.Background(), run.ID, "recovery_required", "pipeline_gate", msg, false)
+		_ = a.Store.TouchUpdateChain(context.Background(), chain.ID, "recovery_required")
+		if run.JobID > 0 {
+			_ = a.Store.FinishJob(context.Background(), run.JobID, "failed", `{"status":"recovery_required"}`, msg)
+		}
+		return
+	}
+	defer releasePipeline()
 	_ = a.Store.SetUpdateChainRunRecovery(ctx, run.ID, "recovering", "reconcile_started_steps", "", false)
 	if run.JobID > 0 {
 		_ = a.Store.AddJobLog(ctx, run.JobID, "WARN", "recovery", "Controller restart detected; reconciling the interrupted update chain. Remaining unstarted steps will not be resumed automatically.")
@@ -239,6 +263,11 @@ func (a *App) recoverInterruptedChainRun(run db.UpdateChainRun) {
 		recoveredMutation = true
 	}
 
+	if cancelAfterRecovery {
+		a.finishChainSafeCancel(chain, run.JobID, run.ID, "system", "safe cancellation reconciled the active atomic chain step after executor loss; no further chain step was started")
+		return
+	}
+
 	// Never resume the remaining chain automatically after a controller restart.
 	// The already-started work has been reconciled; untouched steps are marked so
 	// the operator can clearly see where execution stopped and can run the chain
@@ -285,34 +314,88 @@ func restorePointUsedByActiveRun(rp db.RestorePoint, activeRuns []db.UpdateChain
 	return false
 }
 
+func recoveryTransactionPinsRestorePoint(tx db.UpdateTransaction) bool {
+	status := strings.ToLower(strings.TrimSpace(tx.Status))
+	action := strings.ToLower(strings.TrimSpace(tx.RecoveryAction))
+	errText := strings.ToLower(strings.TrimSpace(tx.Error))
+	if status == "running" || status == "recovering" || status == "recovery_required" {
+		return true
+	}
+	switch action {
+	case "rollback_failed", "pipeline_exit", "lease_conflict", "manual_intervention", "pipeline_gate":
+		return true
+	}
+	return strings.Contains(errText, "automatic rollback failed") || strings.Contains(errText, "recovery is required")
+}
+
+func recoveryChainRunPinsRestorePoints(run db.UpdateChainRun) bool {
+	status := strings.ToLower(strings.TrimSpace(run.Status))
+	errText := strings.ToLower(strings.TrimSpace(run.Error))
+	if status == "queued" || status == "running" || status == "recovering" || status == "recovery_required" {
+		return true
+	}
+	return strings.Contains(errText, "rollback of completed members incomplete") || strings.Contains(errText, "rollback incomplete")
+}
+
+// activeRestorePointReferences returns restore points that are still part of an
+// unresolved mutation/recovery contract. The name is retained for callers, but
+// this deliberately includes legacy terminal rows that older releases marked
+// failed even though their rollback had failed. Retention/GC must fail safe for
+// those historical states as well.
 func (a *App) activeRestorePointReferences(ctx context.Context) map[int64]bool {
 	keep := map[int64]bool{}
-	if txs, err := a.Store.ActiveUpdateTransactions(ctx); err == nil {
+	if txs, err := a.Store.UpdateTransactions(ctx, 5000); err == nil {
 		for _, tx := range txs {
-			if tx.RestorePointID > 0 {
+			if tx.RestorePointID > 0 && recoveryTransactionPinsRestorePoint(tx) {
 				keep[tx.RestorePointID] = true
 			}
 		}
 	}
-	runs, _ := a.Store.ActiveUpdateChainRuns(ctx)
+	runs, _ := a.Store.UpdateChainRuns(ctx, 0, 500)
+	protectedRuns := make([]db.UpdateChainRun, 0, len(runs))
+	for _, run := range runs {
+		if recoveryChainRunPinsRestorePoints(run) {
+			protectedRuns = append(protectedRuns, run)
+		}
+	}
 	points, _ := a.Store.RestorePoints(ctx, 5000, 0, "")
 	for _, rp := range points {
-		if restorePointUsedByActiveRun(rp, runs) {
+		if restorePointUsedByActiveRun(rp, protectedRuns) {
 			keep[rp.ID] = true
 		}
 	}
-	for _, run := range runs {
+	for _, run := range protectedRuns {
 		steps, _ := a.Store.UpdateChainRunSteps(ctx, run.ID)
 		for _, st := range steps {
-			if st.JobID <= 0 {
-				continue
+			if st.JobID > 0 {
+				if tx, err := a.Store.UpdateTransactionByJob(ctx, st.JobID); err == nil && tx.RestorePointID > 0 {
+					keep[tx.RestorePointID] = true
+				}
 			}
-			if tx, err := a.Store.UpdateTransactionByJob(ctx, st.JobID); err == nil && tx.RestorePointID > 0 {
-				keep[tx.RestorePointID] = true
+			if rp := a.chainRunRestorePoint(ctx, run.ID, run.HostID, st.ContainerName, st.JobID); rp.ID > 0 {
+				keep[rp.ID] = true
 			}
 		}
 	}
 	return keep
+}
+
+func (a *App) restoreSnapshotPinned(ctx context.Context, hostID int64, snapshotID string) bool {
+	snapshotID = strings.TrimSpace(snapshotID)
+	if hostID <= 0 || snapshotID == "" {
+		return false
+	}
+	keep := a.activeRestorePointReferences(ctx)
+	points, err := a.Store.RestorePoints(ctx, 5000, hostID, "")
+	if err != nil {
+		return true
+	}
+	for _, rp := range points {
+		if strings.TrimSpace(rp.SnapshotID) == snapshotID && keep[rp.ID] {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) removeOrphanHelperContainers(ctx context.Context, points []db.RestorePoint) (int, []string) {

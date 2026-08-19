@@ -91,10 +91,10 @@ func (a *App) handleWhyUpdate(w http.ResponseWriter, r *http.Request, hostID int
 
 	jobs, _ := a.Store.Jobs(r.Context(), 5000)
 	for _, j := range jobs {
-		if j.HostID == hostID && j.ContainerName == container && (j.Status == "queued" || j.Status == "running") {
+		if j.HostID == hostID && j.ContainerName == container && (j.Status == "queued" || j.Status == "running" || j.Status == "cancel_requested") {
 			res.Status = "waiting"
 			res.Summary = "An operation for this container is already in progress."
-			res.NextAction = "Wait for the existing job to finish or cancel it while it is still queued."
+			res.NextAction = "Wait for the existing job to finish, or request safe cancellation for a running update from Jobs."
 			add("blue", fmt.Sprintf("Job #%d · %s", j.ID, j.Status), j.Type+" · "+j.Trigger)
 			break
 		}
@@ -201,17 +201,15 @@ func (a *App) handleWhyUpdate(w http.ResponseWriter, r *http.Request, hostID int
 			res.NextAction = "Run Check to populate the current image state."
 		}
 	}
-	if bool(cache.UpdateAvailable) {
-		if cache.SnoozedDigest != "" && cache.LatestDigest != "" && cache.SnoozedDigest == cache.LatestDigest {
-			res.Status = "snoozed"
-			res.Summary = "The currently available digest is snoozed."
-			res.NextAction = "Unsnooze it, or wait until a different digest is published."
-			add("yellow", "Current digest snoozed", whyShortDigest(cache.SnoozedDigest))
-		} else {
-			add("green", "New image digest available", whyShortDigest(cache.LatestDigest))
-			if res.Status == "current" {
-				res.Status = "ready"
-			}
+	if cacheHasSnoozedUpdate(cache) {
+		res.Status = "snoozed"
+		res.Summary = "The currently available digest is snoozed."
+		res.NextAction = "Unsnooze it, or wait until a different digest is published."
+		add("yellow", "Current digest snoozed", whyShortDigest(cache.SnoozedDigest))
+	} else if bool(cache.UpdateAvailable) {
+		add("green", "New image digest available", whyShortDigest(cache.LatestDigest))
+		if res.Status == "current" {
+			res.Status = "ready"
 		}
 	} else if cache.LastCheckedAt != "" && cache.LastError == "" {
 		if res.Status == "ready" || res.Status == "managed" {

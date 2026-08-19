@@ -89,6 +89,13 @@ type ImageSummary struct {
 	RollbackProtected bool     `json:"rollback_protected,omitempty"`
 }
 
+type FilesystemUsage struct {
+	Path       string `json:"path"`
+	TotalBytes int64  `json:"total_bytes"`
+	FreeBytes  int64  `json:"free_bytes"`
+	FreeInodes uint64 `json:"free_inodes"`
+}
+
 type NetworkSummary struct {
 	ID                string `json:"id"`
 	Name              string `json:"name"`
@@ -202,7 +209,7 @@ type EventWatcher struct {
 }
 
 func New(logger *slog.Logger) *Client {
-	return &Client{Binary: "docker", Logger: logger, HostTLSRoot: "/data/host-tls", ControllerName: "vibewatch", DataDir: "/data", WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.6", labelCache: map[string]cachedLabels{}, platformCache: map[string]cachedPlatform{}}
+	return &Client{Binary: "docker", Logger: logger, HostTLSRoot: "/data/host-tls", ControllerName: "vibewatch", DataDir: "/data", WorkerImage: "nickfedor/watchtower:latest", WorkerNetwork: "vibewatch-internal", WorkerPort: "8080", WorkerVersion: "0.4.7", labelCache: map[string]cachedLabels{}, platformCache: map[string]cachedPlatform{}}
 }
 
 func ConnectionType(endpoint string) string {
@@ -293,7 +300,30 @@ func (c *Client) ImageExists(ctx context.Context, endpoint, ref string) bool {
 
 func (c *Client) PullRemoteImage(ctx context.Context, endpoint, ref string) error {
 	_, err := c.run(ctx, endpoint, "pull", ref)
+	if err == nil {
+		// A pull may move mutable references such as :latest to a different image.
+		// Never let metadata cached before the pull survive that identity change.
+		c.invalidateMutableImageMetadata(endpoint, ref)
+	}
 	return err
+}
+
+func immutableImageID(ref string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ref)), "sha256:")
+}
+
+func (c *Client) invalidateMutableImageMetadata(endpoint, ref string) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || immutableImageID(ref) {
+		return
+	}
+	key := endpoint + "\x00" + ref
+	c.platformMu.Lock()
+	delete(c.platformCache, key)
+	c.platformMu.Unlock()
+	c.labelMu.Lock()
+	delete(c.labelCache, key)
+	c.labelMu.Unlock()
 }
 
 func safeArgs(args []string) []string {
@@ -1097,25 +1127,20 @@ func (c *Client) ImageMetadataBatch(ctx context.Context, endpoint string, refs .
 					result[tag] = m
 				}
 			}
+			// Persist metadata caches only under immutable image/config IDs. Repo tags
+			// are intentionally kept in the immediate batch result but never cached:
+			// a later pull or Watchtower update may move :latest (or any other tag)
+			// without going through this Client, so a tag-keyed cache cannot be made
+			// coherent reliably.
 			c.labelMu.Lock()
 			if m.ID != "" {
 				c.labelCache[endpoint+"\x00"+m.ID] = cachedLabels{Labels: m.Labels, At: time.Now()}
-			}
-			for _, tag := range row.RepoTags {
-				if tag = strings.TrimSpace(tag); tag != "" {
-					c.labelCache[endpoint+"\x00"+tag] = cachedLabels{Labels: m.Labels, At: time.Now()}
-				}
 			}
 			c.labelMu.Unlock()
 			platform := ImagePlatform{OS: m.OS, Architecture: m.Architecture, Variant: m.Variant, ImageID: m.ID}
 			c.platformMu.Lock()
 			if m.ID != "" {
 				c.platformCache[endpoint+"\x00"+m.ID] = cachedPlatform{Platform: platform, At: time.Now()}
-			}
-			for _, tag := range row.RepoTags {
-				if tag = strings.TrimSpace(tag); tag != "" {
-					c.platformCache[endpoint+"\x00"+tag] = cachedPlatform{Platform: platform, At: time.Now()}
-				}
 			}
 			c.platformMu.Unlock()
 		}
@@ -1513,13 +1538,20 @@ func (c *Client) ImagePlatform(ctx context.Context, endpoint, image string) (Ima
 		return ImagePlatform{}, fmt.Errorf("image reference is empty")
 	}
 	key := endpoint + "\x00" + image
-	c.platformMu.Lock()
-	if hit, ok := c.platformCache[key]; ok && time.Since(hit.At) < 5*time.Minute {
-		p := hit.Platform
+	// Only immutable Docker image/config IDs are safe cache keys for identity.
+	// Mutable refs such as :latest can move after Watchtower or a direct pull;
+	// serving their old ImageID for five minutes can make a successful pull look
+	// as if it never happened and can corrupt post-rollback update decisions.
+	cacheable := immutableImageID(image)
+	if cacheable {
+		c.platformMu.Lock()
+		if hit, ok := c.platformCache[key]; ok && time.Since(hit.At) < 5*time.Minute {
+			p := hit.Platform
+			c.platformMu.Unlock()
+			return p, nil
+		}
 		c.platformMu.Unlock()
-		return p, nil
 	}
-	c.platformMu.Unlock()
 	out, err := c.run(ctx, endpoint, "image", "inspect", image, "--format", "{{json .}}")
 	if err != nil {
 		return ImagePlatform{}, err
@@ -1541,7 +1573,11 @@ func (c *Client) ImagePlatform(ctx context.Context, endpoint, image string) (Ima
 	}
 	p := ImagePlatform{OS: strings.TrimSpace(raw.OS), Architecture: strings.TrimSpace(raw.Architecture), Variant: strings.TrimSpace(raw.Variant), ImageID: strings.TrimSpace(raw.ID)}
 	c.platformMu.Lock()
-	c.platformCache[key] = cachedPlatform{Platform: p, At: time.Now()}
+	if cacheable {
+		c.platformCache[key] = cachedPlatform{Platform: p, At: time.Now()}
+	}
+	// The resolved image ID itself is immutable and remains safe to cache even
+	// when the lookup was performed through a mutable tag.
 	if p.ImageID != "" {
 		c.platformCache[endpoint+"\x00"+p.ImageID] = cachedPlatform{Platform: p, At: time.Now()}
 	}
@@ -1550,17 +1586,24 @@ func (c *Client) ImagePlatform(ctx context.Context, endpoint, image string) (Ima
 }
 
 func (c *Client) ImageLabels(ctx context.Context, endpoint, image string) (map[string]string, error) {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return nil, fmt.Errorf("image reference is empty")
+	}
 	key := endpoint + "\x00" + image
-	c.labelMu.Lock()
-	if hit, ok := c.labelCache[key]; ok && time.Since(hit.At) < 5*time.Minute {
-		copy := make(map[string]string, len(hit.Labels))
-		for k, v := range hit.Labels {
-			copy[k] = v
+	cacheable := immutableImageID(image)
+	if cacheable {
+		c.labelMu.Lock()
+		if hit, ok := c.labelCache[key]; ok && time.Since(hit.At) < 5*time.Minute {
+			copy := make(map[string]string, len(hit.Labels))
+			for k, v := range hit.Labels {
+				copy[k] = v
+			}
+			c.labelMu.Unlock()
+			return copy, nil
 		}
 		c.labelMu.Unlock()
-		return copy, nil
 	}
-	c.labelMu.Unlock()
 	out, err := c.run(ctx, endpoint, "image", "inspect", image, "--format", "{{json .Config.Labels}}")
 	if err != nil {
 		return nil, err
@@ -1571,9 +1614,11 @@ func (c *Client) ImageLabels(ctx context.Context, endpoint, image string) (map[s
 			return nil, err
 		}
 	}
-	c.labelMu.Lock()
-	c.labelCache[key] = cachedLabels{Labels: labels, At: time.Now()}
-	c.labelMu.Unlock()
+	if cacheable {
+		c.labelMu.Lock()
+		c.labelCache[key] = cachedLabels{Labels: labels, At: time.Now()}
+		c.labelMu.Unlock()
+	}
 	copy := make(map[string]string, len(labels))
 	for k, v := range labels {
 		copy[k] = v
@@ -1653,6 +1698,7 @@ func (c *Client) EnsureWorker(ctx context.Context, host db.Host) (string, error)
 		"-e", "WATCHTOWER_HTTP_API_PERIODIC_POLLS=false",
 		"-e", "WATCHTOWER_UPDATE_ON_START=false",
 		"-e", "WATCHTOWER_INCLUDE_STOPPED=true",
+		"-e", "WATCHTOWER_REVIVE_STOPPED=false",
 		"-e", "WATCHTOWER_CLEANUP=false",
 	)
 	if ConnectionType(host.Endpoint) == "local" {
@@ -1932,6 +1978,133 @@ func (c *Client) ContainerMount(ctx context.Context, containerName, destination 
 	return MountInfo{}, false, nil
 }
 
+func developmentUpdaterName(updateID string) string {
+	updateID = strings.TrimSpace(updateID)
+	shortID := updateID
+	if len(shortID) > 24 {
+		shortID = shortID[len(shortID)-24:]
+	}
+	return "vibewatch-dev-updater-" + strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, shortID)
+}
+
+func (c *Client) DevelopmentUpdaterRunning(ctx context.Context, updateID string) (bool, error) {
+	if strings.TrimSpace(updateID) == "" {
+		return false, fmt.Errorf("development update id is empty")
+	}
+	out, err := c.run(ctx, "", "inspect", "-f", "{{.State.Running}}", developmentUpdaterName(updateID))
+	if err != nil {
+		low := strings.ToLower(err.Error())
+		if strings.Contains(low, "no such object") || strings.Contains(low, "no such container") {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(out), "true"), nil
+}
+
+func (c *Client) StopDevelopmentUpdater(ctx context.Context, updateID string) error {
+	if strings.TrimSpace(updateID) == "" {
+		return fmt.Errorf("development update id is empty")
+	}
+	_, err := c.run(ctx, "", "stop", "--time", "20", developmentUpdaterName(updateID))
+	if err != nil {
+		low := strings.ToLower(err.Error())
+		if strings.Contains(low, "no such object") || strings.Contains(low, "no such container") {
+			return nil
+		}
+	}
+	return err
+}
+
+// DockerRootFilesystemUsage probes the host filesystem backing Docker's root
+// directory without requiring host filesystem access inside the controller.
+// It starts the already-local controller image with the Docker root bind-mounted
+// read-only and runs df inside that short-lived probe container.
+func (c *Client) DockerRootFilesystemUsage(ctx context.Context, controllerName string) (FilesystemUsage, error) {
+	controllerName = strings.TrimSpace(controllerName)
+	if controllerName == "" {
+		return FilesystemUsage{}, fmt.Errorf("controller name is empty")
+	}
+	root, err := c.run(ctx, "", "info", "--format", "{{.DockerRootDir}}")
+	if err != nil {
+		return FilesystemUsage{}, fmt.Errorf("inspect Docker root: %w", err)
+	}
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return FilesystemUsage{}, fmt.Errorf("Docker root directory is empty")
+	}
+	image, err := c.run(ctx, "", "inspect", controllerName, "--format", "{{.Config.Image}}")
+	if err != nil {
+		return FilesystemUsage{}, fmt.Errorf("inspect controller image: %w", err)
+	}
+	image = strings.TrimSpace(image)
+	mount := "type=bind,src=" + root + ",dst=/vibewatch-docker-root,readonly"
+	blocks, err := c.run(ctx, "", "run", "--rm", "--pull=never", "--entrypoint", "/bin/df", "--mount", mount, image, "-Pk", "/vibewatch-docker-root")
+	if err != nil {
+		return FilesystemUsage{}, fmt.Errorf("probe Docker root capacity: %w", err)
+	}
+	inodes, err := c.run(ctx, "", "run", "--rm", "--pull=never", "--entrypoint", "/bin/df", "--mount", mount, image, "-Pi", "/vibewatch-docker-root")
+	if err != nil {
+		return FilesystemUsage{}, fmt.Errorf("probe Docker root inodes: %w", err)
+	}
+	parse := func(out string) ([]string, error) {
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if len(lines) < 2 {
+			return nil, fmt.Errorf("unexpected df output %q", out)
+		}
+		fields := strings.Fields(lines[len(lines)-1])
+		if len(fields) < 6 {
+			return nil, fmt.Errorf("unexpected df fields %q", lines[len(lines)-1])
+		}
+		return fields, nil
+	}
+	bf, err := parse(blocks)
+	if err != nil {
+		return FilesystemUsage{}, err
+	}
+	inf, err := parse(inodes)
+	if err != nil {
+		return FilesystemUsage{}, err
+	}
+	totalKB, err := strconv.ParseInt(bf[1], 10, 64)
+	if err != nil {
+		return FilesystemUsage{}, err
+	}
+	freeKB, err := strconv.ParseInt(bf[3], 10, 64)
+	if err != nil {
+		return FilesystemUsage{}, err
+	}
+	freeInodes, err := strconv.ParseUint(inf[3], 10, 64)
+	if err != nil {
+		return FilesystemUsage{}, err
+	}
+	return FilesystemUsage{Path: root, TotalBytes: totalKB * 1024, FreeBytes: freeKB * 1024, FreeInodes: freeInodes}, nil
+}
+
+func (c *Client) CleanupOrphanedDevelopmentUpdaters(ctx context.Context, keepUpdateID string) error {
+	keep := ""
+	if strings.TrimSpace(keepUpdateID) != "" {
+		keep = developmentUpdaterName(keepUpdateID)
+	}
+	out, err := c.run(ctx, "", "ps", "-a", "--filter", "name=^vibewatch-dev-updater-", "--format", "{{.Names}}")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" || name == keep {
+			continue
+		}
+		_, _ = c.run(ctx, "", "rm", "-f", name)
+	}
+	return nil
+}
+
 // LaunchDevelopmentUpdater starts the source-build updater in a helper container
 // that is independent from the controller it will eventually recreate. The
 // helper inherits the controller's /data and /workspace mounts and talks only to
@@ -1955,20 +2128,20 @@ func (c *Client) LaunchDevelopmentUpdater(ctx context.Context, controllerName, u
 	if image == "" {
 		return fmt.Errorf("controller image is empty")
 	}
-	shortID := updateID
-	if len(shortID) > 24 {
-		shortID = shortID[len(shortID)-24:]
+	dockerRoot, err := c.run(ctx, "", "info", "--format", "{{.DockerRootDir}}")
+	if err != nil {
+		return fmt.Errorf("inspect Docker root for development updater: %w", err)
 	}
-	name := "vibewatch-dev-updater-" + strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '-'
-	}, shortID)
+	dockerRoot = strings.TrimSpace(dockerRoot)
+	if dockerRoot == "" {
+		return fmt.Errorf("Docker root directory is empty")
+	}
+	name := developmentUpdaterName(updateID)
 	_, _ = c.run(ctx, "", "rm", "-f", name)
 	args := []string{
 		"run", "-d", "--rm", "--name", name,
 		"--volumes-from", controllerName,
+		"--mount", "type=bind,src=" + dockerRoot + ",dst=/vibewatch-docker-root,readonly",
 		"-e", "VIBEWATCH_DEV_UPDATE_ID=" + updateID,
 		"-e", "VIBEWATCH_DEV_UPDATE_PROJECT_DIR=" + projectDir,
 		"-e", "VIBEWATCH_DEV_UPDATE_DATA_DIR=" + dataDir,

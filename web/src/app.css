@@ -2786,3 +2786,7 @@ html,body,#root,.v2-app,.v2-login-shell,button,input,select,textarea{font-family
 .v2-chain-preflight-live .v2-quick-setup-stage.is-active,.v2-chain-execution-live .v2-quick-setup-stage.is-active{transform:translateY(-1px)!important}.v2-chain-preflight-live .v2-quick-setup-stage,.v2-chain-execution-live .v2-quick-setup-stage{animation:v2ChainStageIn .2s ease-out both!important}
 @keyframes v2ChainStageIn{from{opacity:.45;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}@keyframes v2ChainIssueIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:translateY(0)}}
 @media(max-width:640px){.v2-chain-live-runtime .v2-job-operation-runtime-meta{width:100%!important;margin-left:0!important}.v2-chain-member-stages{max-height:50vh!important}.v2-chain-member-issues{margin-left:20px!important}.v2-chain-member-issues>div{grid-template-columns:24px minmax(0,1fr)!important}.v2-chain-member-issues em{display:none!important}}
+
+/* v1.0.6 snooze recovery: keep chain-level release action aligned and readable. */
+.v2-chain-snooze-note > span:nth-child(2){min-width:0!important;flex:1 1 auto!important}
+.v2-chain-snooze-note > .wt-btn{margin-left:auto!important;flex:0 0 auto!important}

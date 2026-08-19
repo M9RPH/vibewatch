@@ -347,6 +347,18 @@ func (a *App) runCustomVerification(ctx context.Context, hostID int64, container
 	if result.Status == verificationStatusFailed {
 		if jobID > 0 {
 			_ = a.Store.AddJobLog(context.Background(), jobID, "ERROR", "verify", result.Error)
+			_ = a.Store.AddJobLog(context.Background(), jobID, "INFO", "verify", fmt.Sprintf("configured readiness window exhausted: start_delay=%ds retry_count=%d retry_interval=%ds elapsed=%dms", profile.StartDelaySeconds, profile.RetryCount, profile.RetryIntervalSeconds, result.DurationMS))
+			diagCtx, diagCancel := context.WithTimeout(context.Background(), 12*time.Second)
+			if runtime, inspectErr := a.inspectOne(diagCtx, hostID, container); inspectErr == nil {
+				health := "not_configured"
+				if runtime.State.Health != nil && strings.TrimSpace(runtime.State.Health.Status) != "" {
+					health = strings.TrimSpace(runtime.State.Health.Status)
+				}
+				_ = a.Store.AddJobLog(context.Background(), jobID, "INFO", "verify", fmt.Sprintf("failure runtime snapshot before rollback: image_id=%s state=%s running=%t restarting=%t exit_code=%d health=%s", runtime.Image, runtime.State.Status, runtime.State.Running, runtime.State.Restarting, runtime.State.ExitCode, health))
+			} else if inspectErr != nil {
+				_ = a.Store.AddJobLog(context.Background(), jobID, "WARN", "verify", "failure runtime snapshot unavailable before rollback: "+inspectErr.Error())
+			}
+			diagCancel()
 		}
 		_ = a.Store.Audit(context.Background(), actor, "verification.failed", hostID, container, result.Error)
 		a.Logger.Warn("custom verification failed", "host_id", hostID, "container", container, "trigger", trigger, "error", result.Error)

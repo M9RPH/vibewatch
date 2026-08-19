@@ -75,21 +75,22 @@ type inspectContainer struct {
 	ID     string `json:"Id"`
 	Name   string `json:"Name"`
 	Config struct {
-		Hostname    string              `json:"Hostname"`
-		Domainname  string              `json:"Domainname"`
-		User        string              `json:"User"`
-		Tty         bool                `json:"Tty"`
-		OpenStdin   bool                `json:"OpenStdin"`
-		StdinOnce   bool                `json:"StdinOnce"`
-		Env         []string            `json:"Env"`
-		Cmd         []string            `json:"Cmd"`
-		Entrypoint  []string            `json:"Entrypoint"`
-		Image       string              `json:"Image"`
-		Labels      map[string]string   `json:"Labels"`
-		WorkingDir  string              `json:"WorkingDir"`
-		StopSignal  string              `json:"StopSignal"`
-		StopTimeout *int                `json:"StopTimeout"`
-		Healthcheck *inspectHealthcheck `json:"Healthcheck"`
+		Hostname     string              `json:"Hostname"`
+		Domainname   string              `json:"Domainname"`
+		User         string              `json:"User"`
+		Tty          bool                `json:"Tty"`
+		OpenStdin    bool                `json:"OpenStdin"`
+		StdinOnce    bool                `json:"StdinOnce"`
+		Env          []string            `json:"Env"`
+		Cmd          []string            `json:"Cmd"`
+		Entrypoint   []string            `json:"Entrypoint"`
+		Image        string              `json:"Image"`
+		Labels       map[string]string   `json:"Labels"`
+		WorkingDir   string              `json:"WorkingDir"`
+		StopSignal   string              `json:"StopSignal"`
+		StopTimeout  *int                `json:"StopTimeout"`
+		Healthcheck  *inspectHealthcheck `json:"Healthcheck"`
+		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 	} `json:"Config"`
 	HostConfig struct {
 		RestartPolicy struct {
@@ -694,7 +695,7 @@ func (a *App) enforceSnapshotRetention(dir string) {
 		path := filepath.Join(dir, old)
 		info, _, infoErr := readSnapshotInfo(path)
 		snapshotID := strings.TrimSuffix(old, filepath.Ext(old))
-		if infoErr == nil && a.dependencySnapshotPinned(context.Background(), info.HostID, snapshotID) {
+		if infoErr == nil && (a.dependencySnapshotPinned(context.Background(), info.HostID, snapshotID) || a.restoreSnapshotPinned(context.Background(), info.HostID, snapshotID)) {
 			// Cross-stack dependency snapshots are transaction-owned by the parent
 			// restore point. They may temporarily push this unit above its nominal
 			// retention count, but removing them early would silently degrade an
@@ -1378,8 +1379,8 @@ func (a *App) handleContainerBackupArchivedDelete(w http.ResponseWriter, r *http
 			continue
 		}
 		snapshotID := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-		if a.dependencySnapshotPinned(r.Context(), hostID, snapshotID) {
-			writeErr(w, http.StatusConflict, fmt.Sprintf("snapshot %s is still pinned by a retained rollback transaction", snapshotID))
+		if a.dependencySnapshotPinned(r.Context(), hostID, snapshotID) || a.restoreSnapshotPinned(r.Context(), hostID, snapshotID) {
+			writeErr(w, http.StatusConflict, fmt.Sprintf("snapshot %s is still pinned by an unresolved rollback/recovery transaction", snapshotID))
 			return
 		}
 		candidates = append(candidates, candidate{path: path, snapshotID: snapshotID, info: info})

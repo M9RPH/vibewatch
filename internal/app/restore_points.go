@@ -105,13 +105,19 @@ func (a *App) findSnapshotByID(hostID int64, snapshotID, container string) (stri
 }
 
 type restorePointCaptureOptions struct {
-	CaptureData        bool
-	DeferWriterRestart map[string]bool
+	CaptureData                bool
+	DeferWriterRestart         map[string]bool
+	ContinuityGuardHeld        bool
+	HoldContinuityAfterCapture bool
 }
 
 type restorePointCaptureResult struct {
-	RestorePoint    db.RestorePoint
-	DeferredWriters []string
+	RestorePoint        db.RestorePoint
+	DeferredWriters     []string
+	RestartedWriters    []string
+	ContinuityHeld      bool
+	ContinuityExclusive bool
+	ReleaseContinuity   func()
 }
 
 func (a *App) createRestorePointForSnapshotWithOptions(ctx context.Context, hostID int64, container string, snap ContainerBackupSnapshot, reason, trigger string, deps []networkNamespaceDependencyRuntime, opts restorePointCaptureOptions) (restorePointCaptureResult, error) {
@@ -185,6 +191,30 @@ func (a *App) createRestorePointForSnapshotWithOptions(ctx context.Context, host
 		return restorePointCaptureResult{}, fmt.Errorf("load data protection profile: %w", dataErr)
 	}
 	dataConfigured = dataConfigured && opts.CaptureData
+	continuityHeldHere := false
+	continuityExclusive := false
+	releaseContinuity := func() {}
+	if dataConfigured && !opts.ContinuityGuardHeld {
+		for _, deferred := range opts.DeferWriterRestart {
+			if deferred {
+				return restorePointCaptureResult{}, fmt.Errorf("deferred data-writer restart requires an outer continuity guard")
+			}
+		}
+		// A cold snapshot only needs to stop the rest of the fleet when the
+		// protected target itself provides DNS. Ordinary data writers can be
+		// captured concurrently with work on other hosts.
+		lockedCtx, release, exclusive := a.acquireContinuityMutation(ctx, old)
+		ctx = lockedCtx
+		releaseContinuity = release
+		continuityHeldHere = true
+		continuityExclusive = exclusive
+	}
+	defer func() {
+		if continuityHeldHere {
+			releaseContinuity()
+		}
+	}()
+
 	var stoppedWriters []string
 	if dataConfigured {
 		stoppedWriters, err = a.stopDataWriters(ctx, hostID, protectedMounts)
@@ -208,19 +238,47 @@ func (a *App) createRestorePointForSnapshotWithOptions(ctx context.Context, host
 		}
 		restartCtx, cancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
 		defer cancel()
-		_ = a.ensureDataWritersRunning(restartCtx, hostID, stoppedWriters)
+		if restartErr := a.ensureDataWritersRunning(restartCtx, hostID, stoppedWriters); restartErr != nil {
+			if a.Logger != nil {
+				a.Logger.Error("data writers failed to recover after aborted restore-point capture", "host_id", hostID, "container", container, "error", restartErr)
+			}
+			return
+		}
+		if containsString(stoppedWriters, container) {
+			recoveryErr := a.verifyUpdatedContainer(restartCtx, hostID, container)
+			if recoveryErr == nil {
+				recoveryErr = a.probeRecoveredApplication(restartCtx, hostID, container)
+			}
+			if recoveryErr == nil && containerProvidesDNS(old) {
+				recoveryErr = a.verifyDNSControlPlaneRecovery(restartCtx, old)
+			}
+			if recoveryErr != nil && a.Logger != nil {
+				a.Logger.Error("protected service failed continuity recovery after aborted restore-point capture", "host_id", hostID, "container", container, "error", recoveryErr)
+			}
+		}
 	}()
 
 	ref := restoreImageRef(hostID, container, snap.ID)
 	base.ImageRef = ref
 	commitCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	imageID, commitErr := a.Docker.Run(commitCtx, h.Endpoint,
+	commitArgs := []string{
 		"commit", "--pause=true",
-		"--change", "LABEL io.vibewatch.restore-point="+snap.ID,
-		"--change", "LABEL io.vibewatch.container="+container,
-		container, ref,
-	)
+		"--change", "LABEL io.vibewatch.restore-point=" + snap.ID,
+		"--change", "LABEL io.vibewatch.container=" + container,
+	}
+	// Persist immutable restore provenance inside the commit image itself. The
+	// DB/config-snapshot retention policy may legitimately delete older metadata
+	// while a restored container keeps running for months; deterministic forward
+	// updates must therefore not depend on that external metadata surviving.
+	if originalID := strings.TrimSpace(old.Image); originalID != "" {
+		commitArgs = append(commitArgs, "--change", "LABEL io.vibewatch.restore-original-image-id="+originalID)
+	}
+	if originalRef := strings.TrimSpace(old.Config.Image); originalRef != "" {
+		commitArgs = append(commitArgs, "--change", "LABEL io.vibewatch.restore-original-image-ref="+originalRef)
+	}
+	commitArgs = append(commitArgs, container, ref)
+	imageID, commitErr := a.Docker.Run(commitCtx, h.Endpoint, commitArgs...)
 	imageID = strings.TrimSpace(imageID)
 	if commitErr != nil || imageID == "" {
 		base.Status = "degraded"
@@ -269,6 +327,10 @@ func (a *App) createRestorePointForSnapshotWithOptions(ctx context.Context, host
 			return restorePointCaptureResult{}, fmt.Errorf("data writers did not recover after restore-point capture: %w", restartErr)
 		}
 	}
+	if continuityHeldHere && !opts.HoldContinuityAfterCapture {
+		releaseContinuity()
+		continuityHeldHere = false
+	}
 	if dataConfigured {
 		_ = a.Store.InvalidateHostStorageCache(context.Background(), hostID)
 	}
@@ -284,11 +346,30 @@ func (a *App) createRestorePointForSnapshotWithOptions(ctx context.Context, host
 	}
 	base.ID = id
 	completed = true
+	result := restorePointCaptureResult{RestorePoint: base, DeferredWriters: deferred, RestartedWriters: immediate}
+	if continuityHeldHere && opts.HoldContinuityAfterCapture {
+		// Transfer only lock ownership metadata, never the context used while the
+		// restore point was captured. Callers intentionally wrap capture in a
+		// bounded timeout; exporting that child context would make the subsequent
+		// update pipeline inherit a context that is cancelled as soon as capture
+		// returns. The caller re-attaches the continuity marker to its own durable
+		// job context while this release function keeps the actual RWMutex held.
+		result.ContinuityHeld = true
+		result.ContinuityExclusive = continuityExclusive
+		result.ReleaseContinuity = releaseContinuity
+		continuityHeldHere = false // ownership transferred to the update pipeline
+	}
 	_ = a.Store.Audit(context.Background(), "system", "restore-point.create", hostID, container, fmt.Sprintf("restore_point=%d snapshot=%s image=%s deferred_writers=%s", id, snap.ID, ref, strings.Join(deferred, ",")))
-	return restorePointCaptureResult{RestorePoint: base, DeferredWriters: deferred}, nil
+	return result, nil
 }
 
 func (a *App) expireRestorePointsForSnapshot(ctx context.Context, hostID int64, snapshotID string) {
+	if a.restoreSnapshotPinned(ctx, hostID, snapshotID) {
+		if a.Logger != nil {
+			a.Logger.Warn("restore point retention skipped pinned unresolved recovery snapshot", "host_id", hostID, "snapshot", snapshotID)
+		}
+		return
+	}
 	points, err := a.Store.ExpireRestorePointsBySnapshot(ctx, hostID, snapshotID)
 	if err != nil || len(points) == 0 {
 		return
@@ -580,76 +661,101 @@ func dockerHealthVerificationWindow(hc *inspectHealthcheck) time.Duration {
 	return window
 }
 
+const containerStartupVerificationWindow = 45 * time.Second
+
 func (a *App) verifyUpdatedContainer(ctx context.Context, hostID int64, container string) error {
+	return verifyContainerRuntimeWithInspector(ctx, func(inspectCtx context.Context) (inspectContainer, error) {
+		return a.inspectOne(inspectCtx, hostID, container)
+	}, containerStartupVerificationWindow, 4*time.Second, 2*time.Second)
+}
+
+// verifyContainerRuntimeWithInspector is split from Docker I/O so startup-race
+// behavior can be regression-tested deterministically. Restarting/not-running
+// observations are retryable until startupWindow expires; only a stable running
+// runtime (or a healthy Docker healthcheck) lets the pipeline advance.
+func verifyContainerRuntimeWithInspector(ctx context.Context, inspect func(context.Context) (inspectContainer, error), startupWindow, noHealthStableWindow, pollInterval time.Duration) error {
 	started := time.Now()
-	deadline := started.Add(12 * time.Second)
-	// Containers without a Docker healthcheck still get a short stability
-	// window. We intentionally do not guess application health, but this catches
-	// the common case where a new image starts and immediately crash-loops.
+	if startupWindow <= 0 {
+		startupWindow = containerStartupVerificationWindow
+	}
+	if noHealthStableWindow <= 0 {
+		noHealthStableWindow = 4 * time.Second
+	}
+	if pollInterval <= 0 {
+		pollInterval = 2 * time.Second
+	}
+	deadline := started.Add(startupWindow)
 	noHealthStableSince := time.Time{}
 	var lastErr error
 	lastHealth := ""
 	healthWindowSet := false
 	for {
-		cur, err := a.inspectOne(ctx, hostID, container)
+		cur, err := inspect(ctx)
 		if err != nil {
 			lastErr = err
+			noHealthStableSince = time.Time{}
+		} else if cur.State.Restarting {
+			// Restarting immediately after docker start/recreate is a retryable
+			// startup observation, not proof that recovery failed.
+			lastErr = fmt.Errorf("container is still restarting after update")
+			noHealthStableSince = time.Time{}
+		} else if !cur.State.Running || (cur.State.Status != "" && cur.State.Status != "running") {
+			lastErr = fmt.Errorf("container is not yet running after update (state=%s exit=%d)", cur.State.Status, cur.State.ExitCode)
+			noHealthStableSince = time.Time{}
 		} else {
-			// A later successful inspect supersedes a transient remote/API read
-			// error; do not let a stale inspect error trigger rollback after the
-			// container has resumed reporting valid health state.
+			// A later healthy runtime observation supersedes any transient inspect,
+			// restarting or not-running observation seen during startup.
 			lastErr = nil
-			if cur.State.Restarting {
-				return fmt.Errorf("container is restarting after update")
-			}
-			if !cur.State.Running || (cur.State.Status != "" && cur.State.Status != "running") {
-				return fmt.Errorf("container is not running after update (state=%s exit=%d)", cur.State.Status, cur.State.ExitCode)
-			}
 			if cur.State.Health != nil {
 				noHealthStableSince = time.Time{}
 				if !healthWindowSet {
-					deadline = started.Add(dockerHealthVerificationWindow(cur.Config.Healthcheck))
+					healthDeadline := started.Add(dockerHealthVerificationWindow(cur.Config.Healthcheck))
+					if healthDeadline.After(deadline) {
+						deadline = healthDeadline
+					}
 					healthWindowSet = true
 				}
 				lastHealth = strings.ToLower(strings.TrimSpace(cur.State.Health.Status))
 				switch lastHealth {
 				case "healthy":
 					return nil
-				case "unhealthy", "starting", "":
-					// Keep polling. A just-recreated service can report unhealthy before
-					// its application is actually ready, even though it recovers shortly
-					// afterwards. Only a persistent unhealthy state at the deadline is
-					// considered rollback-worthy.
+				case "unhealthy":
+					lastErr = fmt.Errorf("container healthcheck is still unhealthy")
+				case "starting", "":
+					// Keep polling until the bounded deadline. Custom Verification remains
+					// the stronger application-level gate after Docker lifecycle recovery.
 				}
 			} else {
-				// No Docker healthcheck exists. Running state is the strongest safe
-				// signal Vibewatch can use without application-specific knowledge,
-				// so require it to remain stable briefly instead of returning on the
-				// first successful inspect.
 				if noHealthStableSince.IsZero() {
 					noHealthStableSince = time.Now()
 				}
-				if time.Since(noHealthStableSince) >= 4*time.Second {
+				if time.Since(noHealthStableSince) >= noHealthStableWindow {
 					return nil
 				}
 			}
 		}
 		if time.Now().After(deadline) {
 			if lastErr != nil {
-				return lastErr
+				return fmt.Errorf("container did not reach a stable running state within %s: %w", time.Since(started).Round(time.Millisecond), lastErr)
 			}
 			if lastHealth == "unhealthy" {
-				return fmt.Errorf("container healthcheck remained unhealthy for %s after update", time.Since(started).Round(time.Second))
+				return fmt.Errorf("container healthcheck remained unhealthy for %s after update", time.Since(started).Round(time.Millisecond))
 			}
-			// A healthcheck that is still starting is not proof of application
-			// failure. Custom Verification, when configured, remains the stronger
-			// application-level gate after this Docker lifecycle check.
+			if !healthWindowSet {
+				stableFor := time.Duration(0)
+				if !noHealthStableSince.IsZero() {
+					stableFor = time.Since(noHealthStableSince)
+				}
+				return fmt.Errorf("container did not remain continuously running for the required %s stability window (stable for %s)", noHealthStableWindow, stableFor.Round(time.Millisecond))
+			}
+			// A Docker healthcheck that is still starting is not proof of application
+			// failure. Custom Verification, when configured, remains authoritative.
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -673,11 +779,14 @@ func (a *App) shouldAutoRollback(ctx context.Context, rp db.RestorePoint) bool {
 	return !strings.EqualFold(strings.TrimSpace(cur.Image), strings.TrimSpace(rp.OriginalImageID))
 }
 
-func (a *App) runAutomaticRollback(req updateRequest, rp db.RestorePoint, cause error) (bool, error) {
-	if !a.shouldAutoRollback(a.ctx, rp) {
+func (a *App) runAutomaticRollback(ctx context.Context, req updateRequest, rp db.RestorePoint, cause error) (bool, error) {
+	if ctx == nil {
+		ctx = a.ctx
+	}
+	if !a.shouldAutoRollback(ctx, rp) {
 		return false, nil
 	}
-	id, err := a.Store.CreateJob(a.ctx, "rollback", "automatic", rp.HostID, rp.ContainerName, "queued")
+	id, err := a.Store.CreateJob(ctx, "rollback", "automatic", rp.HostID, rp.ContainerName, "queued")
 	if err != nil {
 		return true, err
 	}
@@ -685,8 +794,8 @@ func (a *App) runAutomaticRollback(req updateRequest, rp db.RestorePoint, cause 
 	if cause != nil {
 		message += ": " + cause.Error()
 	}
-	_ = a.Store.AddJobLog(a.ctx, id, "WARN", "rollback", message)
-	a.jobProgress(a.ctx, id, 5, "Automatic rollback queued")
-	_ = a.Store.Audit(a.ctx, "system", "rollback.auto.queue", rp.HostID, rp.ContainerName, fmt.Sprintf("restore_point=%d update_job=%d", rp.ID, req.JobID))
-	return true, a.executeRestorePointRollback(id, rp, "system", "automatic")
+	_ = a.Store.AddJobLog(ctx, id, "WARN", "rollback", message)
+	a.jobProgress(ctx, id, 5, "Automatic rollback queued")
+	_ = a.Store.Audit(ctx, "system", "rollback.auto.queue", rp.HostID, rp.ContainerName, fmt.Sprintf("restore_point=%d update_job=%d", rp.ID, req.JobID))
+	return true, a.executeRestorePointRollback(ctx, id, rp, "system", "automatic")
 }

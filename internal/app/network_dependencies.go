@@ -286,9 +286,16 @@ func (a *App) recreateOneNetworkNamespaceDependent(ctx context.Context, hostID i
 	if sourceImage == "" {
 		return fmt.Errorf("dependent container %s image reference is unavailable", dep.SourceContainer)
 	}
-	imageRef := a.prepareRuntimeRestoreRef(ctx, h.Endpoint, sourceImage, dep.Inspect.Config.Image)
-	if err := a.recreateContainerRuntime(ctx, h.Endpoint, dep.Inspect, imageRef, dep.WasRunning, "container:"+parentID); err != nil {
-		return err
+	imageRef, restoreTag := a.prepareRuntimeRestoreRefPreservingTag(ctx, h.Endpoint, sourceImage, dep.Inspect.Config.Image)
+	recreateErr := a.recreateContainerRuntime(ctx, h.Endpoint, dep.Inspect, imageRef, dep.WasRunning, "container:"+parentID)
+	if tagErr := runRuntimeRefCleanup(ctx, restoreTag); tagErr != nil {
+		if recreateErr != nil {
+			return fmt.Errorf("recreate dependent failed: %v; mutable image-tag cleanup also failed: %v", recreateErr, tagErr)
+		}
+		return fmt.Errorf("dependent recreated, but mutable image-tag cleanup failed: %w", tagErr)
+	}
+	if recreateErr != nil {
+		return recreateErr
 	}
 	return a.verifyDependentState(ctx, hostID, dep.SourceContainer, dep.WasRunning)
 }
@@ -372,8 +379,9 @@ func (a *App) dependencySnapshotPinned(ctx context.Context, hostID int64, snapsh
 		// prune a snapshot that might be part of an active rollback transaction.
 		return true
 	}
+	keep := a.activeRestorePointReferences(ctx)
 	for _, rp := range points {
-		if rp.Status == "expired" || rp.Status == "failed" {
+		if rp.Status == "expired" || (rp.Status == "failed" && !keep[rp.ID]) {
 			continue
 		}
 		for _, dep := range restorePointDependencies(rp) {

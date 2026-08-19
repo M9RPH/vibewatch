@@ -552,7 +552,7 @@ CREATE TABLE IF NOT EXISTS update_chains (id INTEGER PRIMARY KEY AUTOINCREMENT, 
 CREATE TABLE IF NOT EXISTS update_chain_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, chain_id INTEGER NOT NULL, position INTEGER NOT NULL, container_name TEXT NOT NULL, current_action TEXT NOT NULL DEFAULT 'skip', wait_seconds INTEGER NOT NULL DEFAULT 0, UNIQUE(chain_id,position));
 CREATE TABLE IF NOT EXISTS update_chain_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, chain_id INTEGER NOT NULL, chain_name TEXT NOT NULL, host_id INTEGER NOT NULL, job_id INTEGER NOT NULL DEFAULT 0, trigger TEXT NOT NULL, actor TEXT NOT NULL, status TEXT NOT NULL, recovery_action TEXT NOT NULL DEFAULT '', recovered_at TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS update_chain_run_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, position INTEGER NOT NULL, container_name TEXT NOT NULL, status TEXT NOT NULL, job_id INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS update_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL UNIQUE, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', status TEXT NOT NULL DEFAULT 'running', snapshot_id TEXT NOT NULL DEFAULT '', restore_point_id INTEGER NOT NULL DEFAULT 0, target_digest TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', recovery_action TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS update_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL UNIQUE, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', status TEXT NOT NULL DEFAULT 'running', snapshot_id TEXT NOT NULL DEFAULT '', restore_point_id INTEGER NOT NULL DEFAULT 0, target_digest TEXT NOT NULL DEFAULT '', target_image_id TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', recovery_action TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS update_transaction_events (id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_id INTEGER NOT NULL, ts TEXT NOT NULL, from_state TEXT NOT NULL DEFAULT '', to_state TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running', message TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS operation_leases (resource_key TEXT PRIMARY KEY, host_id INTEGER NOT NULL, container_name TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL, operation_type TEXT NOT NULL, transaction_id INTEGER NOT NULL DEFAULT 0, job_id INTEGER NOT NULL DEFAULT 0, acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS verification_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, host_id INTEGER NOT NULL, container_name TEXT NOT NULL, trigger TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', job_id INTEGER NOT NULL DEFAULT 0, transaction_id INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, scope_type TEXT NOT NULL DEFAULT '', scope_key TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0, details_json TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '');
@@ -620,6 +620,7 @@ JOIN (SELECT host_id,scope_type,scope_key,MAX(id) AS id FROM verification_histor
 		{"update_chain_runs", "recovered_at", "TEXT NOT NULL DEFAULT ''"},
 		{"recovery_gc_runs", "helpers_removed", "INTEGER NOT NULL DEFAULT 0"},
 		{"recovery_gc_runs", "unusable_removed", "INTEGER NOT NULL DEFAULT 0"},
+		{"update_transactions", "target_image_id", "TEXT NOT NULL DEFAULT ''"},
 	}
 	if err := s.ensureColumns(ctx, migrations); err != nil {
 		return err
@@ -1073,9 +1074,8 @@ func (s *Store) ClaimQueuedJob(ctx context.Context, id int64) (bool, error) {
 }
 
 // CancelQueuedJob only succeeds while the operation has not started. Running
-// jobs are deliberately not interrupted because Docker update/rollback work is
-// transactional and killing it mid-flight could leave the service in an
-// ambiguous state.
+// container updates use RequestRunningJobCancel instead, which is cooperative
+// and never force-kills an atomic Docker mutation.
 func (s *Store) CancelQueuedJob(ctx context.Context, id int64, reason string) (bool, error) {
 	if strings.TrimSpace(reason) == "" {
 		reason = "cancelled before execution"
@@ -1083,6 +1083,18 @@ func (s *Store) CancelQueuedJob(ctx context.Context, id int64, reason string) (b
 	n, err := s.scalarInt(ctx, fmt.Sprintf(`UPDATE jobs SET status='cancelled',finished_at=%s,summary_json=%s,error='' WHERE id=%d AND status='queued'; SELECT changes();`, q(now()), q(reason), id))
 	return n > 0, err
 }
+
+// RequestRunningJobCancel records a cooperative safe-cancel request. The
+// update pipeline decides the next safe point; Docker mutations are never
+// force-killed mid-flight.
+func (s *Store) RequestRunningJobCancel(ctx context.Context, id int64, reason string) (bool, error) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "safe cancellation requested"
+	}
+	n, err := s.scalarInt(ctx, fmt.Sprintf(`UPDATE jobs SET status='cancel_requested',summary_json=%s WHERE id=%d AND status='running'; SELECT changes();`, q(reason), id))
+	return n > 0, err
+}
+
 func (s *Store) FinishJob(ctx context.Context, id int64, status, summary, errMsg string) error {
 	return s.exec(ctx, fmt.Sprintf(`UPDATE jobs SET status=%s,finished_at=%s,summary_json=%s,error=%s WHERE id=%d;`, q(status), q(now()), q(summary), q(errMsg), id))
 }
@@ -1106,7 +1118,7 @@ func (s *Store) Job(ctx context.Context, id int64) (Job, error) {
 	return x[0], nil
 }
 func (s *Store) HasActiveJob(ctx context.Context, hostID int64, name string) (bool, error) {
-	n, err := s.scalarInt(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE host_id=%d AND container_name=%s AND status IN ('queued','running');`, hostID, q(name)))
+	n, err := s.scalarInt(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE host_id=%d AND container_name=%s AND status IN ('queued','running','cancel_requested');`, hostID, q(name)))
 	return n > 0, err
 }
 
@@ -1167,12 +1179,11 @@ func (s *Store) AddRestorePoint(ctx context.Context, x RestorePoint) (int64, err
 	ts := now()
 	id, err := s.scalarInt(ctx, fmt.Sprintf(`INSERT INTO restore_points(created_at,updated_at,host_id,container_name,snapshot_id,reason,trigger,status,image_ref,image_id,original_image_ref,original_image_id,target_digest,from_version,unit_kind,unit_key,stack_type,writable_layer,config_protected,volume_data_protected,volume_count,bind_count,restore_count,last_restored_at,last_error,dependency_count,dependencies_json,data_manifest_json,data_bytes) VALUES(%s,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%s,%d,%s,%s,%d); SELECT last_insert_rowid();`,
 		q(ts), q(ts), x.HostID, q(x.ContainerName), q(x.SnapshotID), q(x.Reason), q(x.Trigger), q(x.Status), q(x.ImageRef), q(x.ImageID), q(x.OriginalImageRef), q(x.OriginalImageID), q(x.TargetDigest), q(x.FromVersion), q(x.UnitKind), q(x.UnitKey), q(x.StackType), b(x.WritableLayer), b(x.ConfigProtected), b(x.VolumeDataProtected), x.VolumeCount, x.BindCount, x.RestoreCount, q(x.LastRestoredAt), q(x.LastError), x.DependencyCount, q(x.DependenciesJSON), q(x.DataManifestJSON), x.DataBytes))
-	if err == nil {
-		// Only prune already-expired metadata here. Ready/degraded Restore Points may
-		// own host-local images and data archives that must be expired through the
-		// recovery retention pipeline before their database row disappears.
-		_ = s.exec(ctx, `DELETE FROM restore_points WHERE status='expired' AND id NOT IN (SELECT id FROM restore_points ORDER BY id DESC LIMIT 5000);`)
-	}
+	// Restore-point metadata is intentionally not pruned opportunistically here.
+	// Retention/Recovery GC owns deletion because only the application layer can
+	// evaluate unresolved transaction/chain references and pinned recovery
+	// baselines. Metadata is cheap; losing the last proof of a recoverable
+	// baseline is not.
 	return id, err
 }
 
@@ -1557,6 +1568,18 @@ func (s *Store) SetUpdateChainRunRecovery(ctx context.Context, id int64, status,
 	}
 	return s.exec(ctx, fmt.Sprintf(`UPDATE update_chain_runs SET status=%s,recovery_action=%s,recovered_at=CASE WHEN %s='' THEN recovered_at ELSE %s END,finished_at=CASE WHEN %s='' THEN finished_at ELSE %s END,error=%s WHERE id=%d`, q(status), q(action), q(recovered), q(recovered), q(fin), q(fin), q(errText), id))
 }
+func (s *Store) UpdateChainRunByJob(ctx context.Context, jobID int64) (UpdateChainRun, error) {
+	var x []UpdateChainRun
+	err := s.query(ctx, fmt.Sprintf(`SELECT id,chain_id,chain_name,host_id,job_id,trigger,actor,status,recovery_action,recovered_at,started_at,finished_at,error FROM update_chain_runs WHERE job_id=%d ORDER BY id DESC LIMIT 1`, jobID), &x)
+	if err != nil {
+		return UpdateChainRun{}, err
+	}
+	if len(x) == 0 {
+		return UpdateChainRun{}, fmt.Errorf("update chain run for job %d not found", jobID)
+	}
+	return x[0], nil
+}
+
 func (s *Store) UpdateChainRun(ctx context.Context, id int64) (UpdateChainRun, error) {
 	var x []UpdateChainRun
 	err := s.query(ctx, fmt.Sprintf(`SELECT id,chain_id,chain_name,host_id,job_id,trigger,actor,status,recovery_action,recovered_at,started_at,finished_at,error FROM update_chain_runs WHERE id=%d LIMIT 1`, id), &x)

@@ -21,13 +21,13 @@ func TestV090TransactionLeaseAndVerificationHistoryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	txID, err := s.CreateUpdateTransaction(ctx, UpdateTransaction{JobID: jobID, HostID: 4, ContainerName: "app", Trigger: "manual", Actor: "owner", State: "queued", Status: "running", TargetDigest: "sha256:new"})
+	txID, err := s.CreateUpdateTransaction(ctx, UpdateTransaction{JobID: jobID, HostID: 4, ContainerName: "app", Trigger: "manual", Actor: "owner", State: "queued", Status: "running", TargetDigest: "sha256:manifest", TargetImageID: "sha256:config"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	tx, err := s.UpdateTransaction(ctx, txID)
-	if err != nil || tx.TargetDigest != "sha256:new" {
-		t.Fatalf("transaction lost: %#v err=%v", tx, err)
+	if err != nil || tx.TargetDigest != "sha256:manifest" || tx.TargetImageID != "sha256:config" {
+		t.Fatalf("transaction target identities lost: %#v err=%v", tx, err)
 	}
 	if err := s.TransitionUpdateTransaction(ctx, txID, "queued", "preflight", "running", "start", 12); err != nil {
 		t.Fatal(err)

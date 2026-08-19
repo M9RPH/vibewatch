@@ -7,7 +7,29 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func addRequiredSourceFiles(dst map[string]string, version string) {
+	if version == "" {
+		version = "1.0.0"
+	}
+	defaults := map[string]string{
+		"go.mod":                           "module github.com/m9rph/vibewatch\n",
+		"Dockerfile":                       "FROM scratch\n",
+		"docker-compose.yml":               "services: {}\n",
+		"docker-compose.build.yml":         "services: {}\n",
+		"web/package.json":                 "{}\n",
+		"cmd/devupdater/main.go":           "package main\nfunc main(){}\n",
+		"web/public/developer-update.html": "<!doctype html>\n",
+		"VERSION":                          version + "\n",
+	}
+	for k, v := range defaults {
+		if _, ok := dst[k]; !ok {
+			dst[k] = v
+		}
+	}
+}
 
 func makeFixtureZIP(t *testing.T, root string, extra map[string]string) []byte {
 	t.Helper()
@@ -92,11 +114,16 @@ func TestApplySourcePreservesEnvironmentDataAndGit(t *testing.T) {
 	mustWrite("scripts/.env", "SCRIPT_SECRET=keep")
 	mustWrite("data/vibewatch.db", "database")
 	mustWrite(".git/config", "git")
+	requiredOld := map[string]string{}
+	addRequiredSourceFiles(requiredOld, "1.0.0")
+	for path, body := range requiredOld {
+		mustWrite(path, body)
+	}
 
 	source := t.TempDir()
-	for path, body := range map[string]string{
-		"docker-compose.yml": "new compose", "docker-compose.build.yml": "build", "fresh.go": "fresh", "scripts/tool.sh": "new tool", ".env": "SECRET=replace", "data/evil": "nope",
-	} {
+	newFiles := map[string]string{"docker-compose.yml": "new compose", "docker-compose.build.yml": "build", "fresh.go": "fresh", "scripts/tool.sh": "new tool", ".env": "SECRET=replace", "data/evil": "nope"}
+	addRequiredSourceFiles(newFiles, "1.0.1")
+	for path, body := range newFiles {
 		full := filepath.Join(source, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatal(err)
@@ -127,11 +154,9 @@ func TestApplySourcePreservesEnvironmentDataAndGit(t *testing.T) {
 
 func TestApplySourceNeverCopiesStagedScriptEnvironment(t *testing.T) {
 	workspace := t.TempDir()
-	for path, body := range map[string]string{
-		"docker-compose.yml": "old compose",
-		"scripts/.env":       "OWNER_SECRET=keep",
-		"scripts/old.sh":     "old",
-	} {
+	oldFiles := map[string]string{"docker-compose.yml": "old compose", "scripts/.env": "OWNER_SECRET=keep", "scripts/old.sh": "old"}
+	addRequiredSourceFiles(oldFiles, "1.0.0")
+	for path, body := range oldFiles {
 		full := filepath.Join(workspace, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatal(err)
@@ -141,11 +166,9 @@ func TestApplySourceNeverCopiesStagedScriptEnvironment(t *testing.T) {
 		}
 	}
 	source := t.TempDir()
-	for path, body := range map[string]string{
-		"docker-compose.yml": "new compose",
-		"scripts/.env":       "OWNER_SECRET=replace-me",
-		"scripts/new.sh":     "new",
-	} {
+	newFiles := map[string]string{"docker-compose.yml": "new compose", "scripts/.env": "OWNER_SECRET=replace-me", "scripts/new.sh": "new"}
+	addRequiredSourceFiles(newFiles, "1.0.1")
+	for path, body := range newFiles {
 		full := filepath.Join(source, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatal(err)
@@ -171,12 +194,9 @@ func TestApplySourceNeverCopiesStagedScriptEnvironment(t *testing.T) {
 
 func TestSnapshotSourceDoesNotCopyEnvironmentSecrets(t *testing.T) {
 	workspace := t.TempDir()
-	for path, body := range map[string]string{
-		"docker-compose.yml": "services: {}",
-		".env":               "ROOT_SECRET=yes",
-		"scripts/.env":       "SCRIPT_SECRET=yes",
-		"scripts/tool.sh":    "#!/bin/sh\n",
-	} {
+	files := map[string]string{"docker-compose.yml": "services: {}", ".env": "ROOT_SECRET=yes", "scripts/.env": "SCRIPT_SECRET=yes", "scripts/tool.sh": "#!/bin/sh\n"}
+	addRequiredSourceFiles(files, "1.0.0")
+	for path, body := range files {
 		full := filepath.Join(workspace, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatal(err)
@@ -229,5 +249,83 @@ func TestRestoreDatabaseBackupReplacesDatabaseAndClearsSidecars(t *testing.T) {
 	gotKey, err := os.ReadFile(filepath.Join(dataDir, "registry-credentials.key"))
 	if err != nil || !bytes.Equal(gotKey, key) {
 		t.Fatalf("registry key restore failed: %v", err)
+	}
+}
+
+func TestApplySourceFailureDoesNotDeleteExistingSource(t *testing.T) {
+	workspace := t.TempDir()
+	old := map[string]string{"keep-stale.txt": "must survive failed apply", "block": "existing file"}
+	addRequiredSourceFiles(old, "1.0.0")
+	for path, body := range old {
+		full := filepath.Join(workspace, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := t.TempDir()
+	newFiles := map[string]string{"block/child.txt": "forces mkdir over file"}
+	addRequiredSourceFiles(newFiles, "1.0.1")
+	for path, body := range newFiles {
+		full := filepath.Join(source, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ApplySource(source, workspace); err == nil {
+		t.Fatal("expected apply failure")
+	}
+	if b, err := os.ReadFile(filepath.Join(workspace, "keep-stale.txt")); err != nil || string(b) != "must survive failed apply" {
+		t.Fatalf("failed apply deleted preexisting source: %q err=%v", string(b), err)
+	}
+	if err := ValidateSourceTree(workspace); err != nil {
+		t.Fatalf("failed apply must leave a structurally complete source tree: %v", err)
+	}
+}
+
+func TestWriteStatusCreatesEmergencyReserveAndCancelMarker(t *testing.T) {
+	dataDir := t.TempDir()
+	st := Status{ID: "20260819-test123", State: "building", Stage: "Building", Percent: 38}
+	if err := WriteStatus(dataDir, st); err != nil {
+		t.Fatal(err)
+	}
+	reserve := filepath.Join(PathsFor(dataDir).Root, ".status-reserve")
+	if info, err := os.Stat(reserve); err != nil || info.Size() < statusReserveBytes {
+		t.Fatalf("status emergency reserve missing: info=%v err=%v", info, err)
+	}
+	if err := RequestCancel(dataDir, st.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !CancelRequested(dataDir, st.ID) {
+		t.Fatal("cancel marker not visible")
+	}
+	ClearCancel(dataDir, st.ID)
+	if CancelRequested(dataDir, st.ID) {
+		t.Fatal("cancel marker not cleared")
+	}
+}
+
+func TestActiveStatusDoesNotExpireByAge(t *testing.T) {
+	dataDir := t.TempDir()
+	st := Status{ID: "20260819-oldactive", State: "rolling_back", Stage: "Restoring previous source", Percent: 70}
+	if err := WriteStatus(dataDir, st); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(PathsFor(dataDir).States, st.ID+".json")
+	old := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ActiveStatus(dataDir)
+	if !ok {
+		t.Fatal("aged active development update must remain active until reconciled")
+	}
+	if got.ID != st.ID || got.State != "rolling_back" {
+		t.Fatalf("active status = %#v", got)
 	}
 }

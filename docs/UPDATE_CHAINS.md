@@ -46,3 +46,7 @@ v1.0.0 treats a controller restart as a recovery event, not a reason to blindly 
 - Remaining unstarted steps are marked **Interrupted** and are not automatically resumed.
 - A successfully reconciled interrupted Chain is shown as **Recovered**.
 - An unresolved state is shown as **Recovery required** and blocks another run until recovery is resolved.
+
+## Target-image verification
+
+Every actual image update inside a Chain uses the same container update transaction as a standalone update. Since v1.0.4 a Chain member is only successful after the live container image matches the target image detected by Preflight. `updated=0 / skipped=1` with the old image still active therefore fails at that member and cannot be reported as a successful Chain step.

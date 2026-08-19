@@ -441,16 +441,91 @@ func createArgsFromInspect(c inspectContainer, targetImage string) ([]string, []
 	return args, extras, nil
 }
 
-func (a *App) prepareRuntimeRestoreRef(ctx context.Context, endpoint, sourceImage, originalRef string) string {
+type mutableRuntimeRefState struct {
+	Ref          string
+	ImageID      string
+	RestoreImage bool
+	Captured     bool
+}
+
+// captureMutableRuntimeRefState snapshots the host's mutable application tag
+// before a rollback temporarily reuses that tag to preserve Config.Image on the
+// recreated container. A Vibewatch restore commit is considered contamination:
+// it must never be restored into the application tag namespace afterwards.
+func (a *App) captureMutableRuntimeRefState(ctx context.Context, endpoint, ref string) (mutableRuntimeRefState, error) {
+	ref = strings.TrimSpace(ref)
+	state := mutableRuntimeRefState{Ref: ref}
+	if !mutableApplicationImageRef(ref) {
+		return state, nil
+	}
+	platform, err := a.Docker.ImagePlatform(ctx, endpoint, ref)
+	if err != nil {
+		// Do not mutate a tag whose current state cannot be proven. The caller can
+		// still recreate from the immutable source image and accept Config.Image
+		// being an immutable ID for this recovery operation.
+		return state, fmt.Errorf("capture mutable image ref %s before restore: %w", ref, err)
+	}
+	state.Captured = true
+	state.ImageID = strings.TrimSpace(platform.ImageID)
+	labels, err := a.Docker.ImageLabels(ctx, endpoint, state.ImageID)
+	if err != nil {
+		return mutableRuntimeRefState{Ref: ref}, fmt.Errorf("inspect mutable image ref %s provenance before restore: %w", ref, err)
+	}
+	state.RestoreImage = strings.TrimSpace(labels["io.vibewatch.restore-point"]) != "" ||
+		strings.TrimSpace(labels["io.vibewatch.restore-original-image-id"]) != ""
+	return state, nil
+}
+
+// prepareRuntimeRestoreRefPreservingTag temporarily points a readable mutable
+// image ref at an immutable restore image, but returns a cleanup function that
+// restores the *pre-restore tag state*. This keeps the running rollback runtime
+// independent from repo:latest: the container can run a restore image while the
+// mutable tag continues to point at the real registry target. Legacy polluted
+// tags that already point at a Vibewatch restore commit are removed instead of
+// being perpetuated.
+func (a *App) prepareRuntimeRestoreRefPreservingTag(ctx context.Context, endpoint, sourceImage, originalRef string) (string, func(context.Context) error) {
 	sourceImage = strings.TrimSpace(sourceImage)
 	originalRef = strings.TrimSpace(originalRef)
-	if sourceImage == "" || originalRef == "" || strings.HasPrefix(originalRef, "sha256:") || strings.Contains(originalRef, "@sha256:") {
-		return sourceImage
+	noop := func(context.Context) error { return nil }
+	if sourceImage == "" || !mutableApplicationImageRef(originalRef) {
+		return sourceImage, noop
 	}
-	if _, err := a.Docker.Run(ctx, endpoint, "image", "tag", sourceImage, originalRef); err == nil {
-		return originalRef
+	state, err := a.captureMutableRuntimeRefState(ctx, endpoint, originalRef)
+	if err != nil || !state.Captured || state.ImageID == "" {
+		// Fail safe without touching the mutable tag. The restore image itself is
+		// immutable and remains sufficient to recreate the runtime.
+		return sourceImage, noop
 	}
-	return sourceImage
+	if _, err := a.Docker.Run(ctx, endpoint, "image", "tag", sourceImage, originalRef); err != nil {
+		return sourceImage, noop
+	}
+	cleanup := func(cleanupCtx context.Context) error {
+		if state.RestoreImage {
+			// Remove only the mutable alias. Docker keeps the underlying restore image
+			// because the recreated container references its immutable image ID.
+			if _, err := a.Docker.Run(cleanupCtx, endpoint, "image", "rm", originalRef); err != nil {
+				return fmt.Errorf("remove restore-contaminated mutable image ref %s: %w", originalRef, err)
+			}
+			return nil
+		}
+		if !a.Docker.ImageExists(cleanupCtx, endpoint, state.ImageID) {
+			return fmt.Errorf("previous mutable image ref target %s is no longer local", state.ImageID)
+		}
+		if _, err := a.Docker.Run(cleanupCtx, endpoint, "image", "tag", state.ImageID, originalRef); err != nil {
+			return fmt.Errorf("restore mutable image ref %s to pre-restore target %s: %w", originalRef, state.ImageID, err)
+		}
+		return nil
+	}
+	return originalRef, cleanup
+}
+
+func runRuntimeRefCleanup(ctx context.Context, cleanup func(context.Context) error) error {
+	if cleanup == nil {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+	defer cancel()
+	return cleanup(cleanupCtx)
 }
 
 func (a *App) recreateContainerRuntime(ctx context.Context, endpoint string, c inspectContainer, targetImage string, start bool, networkModeOverride string) error {
@@ -513,6 +588,13 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 	if !a.beginAsyncJob(ctx, jobID) {
 		return
 	}
+	var pipelineErr error
+	ctx, releasePipeline, pipelineErr := a.acquireMutationPipeline(ctx, hist.HostID)
+	if pipelineErr != nil {
+		a.failJob(jobID, fmt.Errorf("rollback host mutation scheduler: %w", pipelineErr))
+		return
+	}
+	defer releasePipeline()
 	leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, jobID, hist.HostID, hist.ContainerName, "rollback-legacy")
 	if leaseErr != nil {
 		a.failJob(jobID, leaseErr)
@@ -527,7 +609,7 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 		a.failJob(jobID, err)
 		return
 	}
-	opCtx, opCancel := context.WithTimeout(a.ctx, dockerOperationTimeout(h.Endpoint, 20*time.Minute, 35*time.Minute))
+	opCtx, opCancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 20*time.Minute, 35*time.Minute))
 	defer opCancel()
 	ctx = opCtx
 	path, _, err := a.findSnapshotForHistory(hist)
@@ -592,8 +674,12 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 	if swarmService != "" {
 		_, err = a.Docker.Run(ctx, h.Endpoint, "service", "update", "--image", target, "--detach=true", swarmService)
 	} else {
-		target = a.prepareRuntimeRestoreRef(ctx, h.Endpoint, target, old.Config.Image)
+		var restoreTag func(context.Context) error
+		target, restoreTag = a.prepareRuntimeRestoreRefPreservingTag(ctx, h.Endpoint, target, old.Config.Image)
 		err = a.restoreContainerRuntime(ctx, h.Endpoint, old, target)
+		if tagErr := runRuntimeRefCleanup(ctx, restoreTag); tagErr != nil {
+			_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Could not restore mutable image-tag state after runtime rollback: "+tagErr.Error())
+		}
 		if err != nil {
 			// Best-effort recovery to the state that existed immediately before
 			// the rollback attempt. This makes rollback failure far less likely
@@ -632,12 +718,22 @@ func (a *App) executeRollback(jobID int64, hist db.UpdateHistory, actor string) 
 	_, _ = a.Store.AddUpdateHistory(ctx, db.UpdateHistory{HostID: hist.HostID, ContainerName: hist.ContainerName, Action: "rollback", Trigger: "manual", Actor: actor, Status: "success", FromVersion: currentVersion.Installed, ToVersion: afterVersion.Installed, FromImageRef: currentContainer.Image, ToImageRef: after.Image, FromDigest: currentContainer.ImageID, ToDigest: after.ImageID, SnapshotID: hist.SnapshotID, DurationMS: time.Since(started).Milliseconds()})
 }
 
-func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor, trigger string) error {
-	ctx := a.ctx
+func (a *App) executeRestorePointRollback(parentCtx context.Context, jobID int64, rp db.RestorePoint, actor, trigger string) error {
+	ctx := parentCtx
+	if ctx == nil {
+		ctx = a.ctx
+	}
 	started := time.Now()
 	if !a.beginAsyncJob(ctx, jobID) {
 		return fmt.Errorf("rollback job was cancelled before execution")
 	}
+	var pipelineErr error
+	ctx, releasePipeline, pipelineErr := a.acquireMutationPipeline(ctx, rp.HostID)
+	if pipelineErr != nil {
+		a.failJob(jobID, fmt.Errorf("acquire host mutation scheduler for rollback: %w", pipelineErr))
+		return pipelineErr
+	}
+	defer releasePipeline()
 	if trigger != "automatic" {
 		leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, jobID, rp.HostID, rp.ContainerName, "rollback")
 		if leaseErr != nil {
@@ -663,7 +759,7 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 		a.failJob(jobID, err)
 		return err
 	}
-	opCtx, opCancel := context.WithTimeout(a.ctx, dockerOperationTimeout(h.Endpoint, 20*time.Minute, 35*time.Minute))
+	opCtx, opCancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 20*time.Minute, 35*time.Minute))
 	defer opCancel()
 	ctx = opCtx
 	path, _, err := a.findSnapshotByID(rp.HostID, rp.SnapshotID, rp.ContainerName)
@@ -756,6 +852,25 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 			_, _ = a.Docker.Run(cleanupCtx, h.Endpoint, "image", "rm", safetyRef)
 		}()
 	}
+	// Protect the destructive rollback window with the same continuity policy as
+	// forward updates. Ordinary rollbacks can run alongside work on other hosts;
+	// restoring a DNS-capable service becomes globally exclusive until runtime,
+	// application and uncached DNS readiness have all recovered. If the caller
+	// already owns the appropriate update guard, the context marker makes this a
+	// no-op rather than a recursive lock.
+	continuityBaseCtx := ctx
+	mutationCtx, releaseContinuity, continuityExclusive := a.acquireContinuityMutation(ctx, old)
+	ctx = mutationCtx
+	continuityHeld := true
+	defer func() {
+		if continuityHeld {
+			releaseContinuity()
+		}
+	}()
+	if continuityExclusive {
+		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "continuity", "DNS-capable rollback entered exclusive control-plane continuity window")
+	}
+
 	var dataStopped []string
 	var safetyData dataArchiveManifest
 	dataRestored := false
@@ -781,8 +896,12 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 			}
 		}
 		stopDependentsBestEffort(recoveryCtx, a, h.Endpoint, rollbackExecutionDeps)
-		fallback := a.prepareRuntimeRestoreRef(recoveryCtx, h.Endpoint, safetyRef, current.Config.Image)
-		if fallbackErr := a.restoreContainerRuntime(recoveryCtx, h.Endpoint, current, fallback); fallbackErr != nil {
+		fallback, restoreTag := a.prepareRuntimeRestoreRefPreservingTag(recoveryCtx, h.Endpoint, safetyRef, current.Config.Image)
+		fallbackErr := a.restoreContainerRuntime(recoveryCtx, h.Endpoint, current, fallback)
+		if tagErr := runRuntimeRefCleanup(recoveryCtx, restoreTag); tagErr != nil {
+			_ = a.Store.AddJobLog(recoveryCtx, jobID, "WARN", "rollback", "Could not restore mutable image-tag state after safety recovery: "+tagErr.Error())
+		}
+		if fallbackErr != nil {
 			return fallbackErr
 		}
 		if len(currentDependencyCtx) > 0 {
@@ -826,8 +945,13 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 	}
 
 	a.jobProgress(ctx, jobID, 48, "Restoring container filesystem and configuration")
-	target := a.prepareRuntimeRestoreRef(ctx, h.Endpoint, rp.ImageRef, old.Config.Image)
+	target, restoreTag := a.prepareRuntimeRestoreRefPreservingTag(ctx, h.Endpoint, rp.ImageRef, old.Config.Image)
 	err = a.restoreContainerRuntime(ctx, h.Endpoint, old, target)
+	if tagErr := runRuntimeRefCleanup(ctx, restoreTag); tagErr != nil {
+		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Restored runtime, but could not restore the pre-rollback mutable image-tag state: "+tagErr.Error())
+	} else if mutableApplicationImageRef(old.Config.Image) {
+		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "rollback", "Restored runtime without leaving the mutable application image tag on a Vibewatch restore image")
+	}
 	if err != nil && safetyRef != "" && strings.TrimSpace(current.Name) != "" {
 		_ = a.Store.AddJobLog(ctx, jobID, "WARN", "rollback", "Restore failed; attempting safety recovery of the pre-rollback container and its namespace dependents")
 		originalErr := err
@@ -945,6 +1069,26 @@ func (a *App) executeRestorePointRollback(jobID int64, rp db.RestorePoint, actor
 		}(), DependencyDetails: dependencyNames(rollbackExecutionDeps), VerificationStatus: rollbackVerification.Status, VerificationDetails: rollbackVerificationJSON})
 		return err
 	}
+	if continuityExclusive {
+		restored, inspectErr := a.inspectOne(ctx, rp.HostID, rp.ContainerName)
+		if inspectErr != nil {
+			err = fmt.Errorf("DNS rollback completed but restored target could not be inspected: %w", inspectErr)
+			a.jobProgress(ctx, jobID, 100, "Rollback continuity verification failed")
+			_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+			return err
+		}
+		if dnsErr := a.verifyDNSControlPlaneRecovery(ctx, restored); dnsErr != nil {
+			err = fmt.Errorf("DNS rollback completed but control-plane continuity did not recover: %w", dnsErr)
+			a.jobProgress(ctx, jobID, 100, "Rollback continuity verification failed")
+			_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
+			_ = a.Store.AddJobLog(ctx, jobID, "ERROR", "continuity", err.Error())
+			return err
+		}
+		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "continuity", "DNS-capable rollback restored uncached controller name resolution")
+	}
+	releaseContinuity()
+	continuityHeld = false
+	ctx = continuityBaseCtx
 	_, _, _ = a.check(ctx, rp.HostID, rp.ContainerName, "post-rollback")
 	if snoozed := a.snoozeLatestAfterRollback(ctx, rp.HostID, rp.ContainerName, rp.TargetDigest); snoozed != "" {
 		_ = a.Store.AddJobLog(ctx, jobID, "INFO", "rollback", "Update digest snoozed after rollback: "+snoozed)
@@ -1044,7 +1188,7 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 		a.jobProgress(r.Context(), id, 5, "Queued")
 		actor := a.actor(r)
 		_ = a.Store.Audit(r.Context(), actor, "rollback.queue", rp.HostID, rp.ContainerName, fmt.Sprintf("restore_point=%d snapshot=%s", rp.ID, rp.SnapshotID))
-		go a.executeRestorePointRollback(id, rp, actor, "manual")
+		go a.executeRestorePointRollback(a.ctx, id, rp, actor, "manual")
 		writeJSON(w, 202, map[string]any{"job_id": id, "restore_point_id": rp.ID})
 		return
 	}

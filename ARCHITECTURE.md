@@ -73,9 +73,9 @@ queued
  -> success
 ```
 
-Failure after mutation can enter rollback. v1.0.0 persists transaction state so a controller restart can reconcile the real Docker runtime instead of blindly declaring the update failed.
+Failure after mutation can enter rollback. Transaction state is persisted so a controller restart can reconcile the real Docker runtime instead of blindly declaring the update failed.
 
-Before mutation, an interrupted transaction can be safely aborted. After mutation, Vibewatch first checks the current runtime and verification state. If the updated service is healthy, it can keep the successfully updated runtime. If it is not healthy and a valid restore point exists, Vibewatch can restore the pre-update state. An unresolved case is marked `recovery_required` and blocks another update of the same target until recovery is resolved.
+Before mutation, an interrupted transaction can be safely aborted. After mutation, Vibewatch first checks the current runtime and verification state. If the updated service is healthy, it can keep the successfully updated runtime. If it is not healthy and a valid restore point exists, Vibewatch can restore the pre-update state. An unresolved case — including a failed automatic rollback — is marked `recovery_required`, blocks another update of the same target and pins its recovery baseline until reconciliation succeeds.
 
 ## Preflight
 
@@ -101,6 +101,8 @@ A non-Swarm full restore point can contain:
 - dependency metadata for containers using another container's network namespace.
 
 Restore points are retention-managed as one recovery unit. Config, writable-layer image and protected data are not treated as unrelated backup products.
+
+Writable-layer restore images embed their immediate immutable source-image provenance. Forward deterministic updates resolve source defaults from embedded provenance first, retained restore metadata second, and only for legacy commits from validated local Docker image ancestry. Ambiguous ancestry fails closed.
 
 ### Data Protection helper
 
@@ -140,7 +142,7 @@ A Chain run stores its controller job ID and recovery context. After a controlle
 4. shared protected-data baselines remain consistent with software rollback decisions;
 5. remaining unstarted steps are marked interrupted and are not resumed automatically.
 
-Chain history exposes `Recovered`, `Interrupted` and `Recovery required` states. A new Chain run is blocked while a previous run still requires recovery.
+Chain history exposes `Recovered`, `Interrupted` and `Recovery required` states. A new Chain run is blocked while a previous run still requires recovery. Running Chains support cooperative Safe Cancel: the active atomic step is settled/recovered, and no subsequent step is started. Incomplete rollback of already-completed members remains `recovery_required` rather than being finalized as an ordinary failed run.
 
 ## Network namespace dependencies
 
@@ -156,9 +158,11 @@ Stack Verification has a shared stack state: a successful application-level chec
 
 Verification is authoritative for application success where configured. A container can be Docker-running while the application endpoint still fails; that condition can trigger rollback.
 
-## Operation leases
+## Mutation scheduler and operation leases
 
-Destructive operations use persisted leases. Container-scoped update/rollback operations can run independently on unrelated containers, while host-scoped cleanup/recovery work conflicts with mutations on that host. Leases have heartbeats and expiry to avoid permanent locks after crashes.
+All lifecycle mutation paths share one bounded, context-reentrant scheduler: standalone updates, Restore Point rollback, legacy history rollback, Chain `restart/recreate if current`, update crash recovery and Chain crash recovery. Up to three different Docker hosts can progress concurrently, but a single host has at most one lifecycle mutation pipeline at a time. Nested recovery on the same host reuses the already-held scheduler slot, preventing self-deadlock during automatic rollback.
+
+Destructive operations additionally use persisted leases for target/resource ownership. Leases have heartbeats and expiry, and crash recovery explicitly reclaims stale job-owned leases before reconciliation. Host-scoped cleanup/recovery conflicts with container mutation on that host.
 
 ## Recovery GC and cleanup
 
@@ -170,7 +174,7 @@ Recovery GC periodically:
 - removes Vibewatch-owned orphan restore images;
 - removes orphaned short-lived helper containers when the host is idle.
 
-`Cleanup unusable` is separate from normal retention. It may permanently remove expired/degraded recovery artifacts, but never Ready restore points and never a restore point referenced by an active/recovery-required transaction or Chain run.
+`Cleanup unusable` is separate from normal retention. It may permanently remove expired/degraded recovery artifacts, but never Ready restore points and never a restore point referenced by an unresolved transaction or Chain recovery contract. Legacy failed-rollback records from older releases are treated conservatively as pinned recovery references. Restore-point metadata is not opportunistically pruned outside this graph-aware recovery/retention path.
 
 ## Automation
 

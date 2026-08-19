@@ -59,7 +59,10 @@ exit 0
 		t.Fatalf("worker autonomous polling/start update safety flags missing:\n%s", got)
 	}
 	if !strings.Contains(got, "WATCHTOWER_INCLUDE_STOPPED=true") {
-		t.Fatalf("worker must include explicitly targeted stopped containers for data-protection handoff:\n%s", got)
+		t.Fatalf("worker must include intentionally stopped targets without reviving them:\n%s", got)
+	}
+	if !strings.Contains(got, "WATCHTOWER_REVIVE_STOPPED=false") {
+		t.Fatalf("worker must preserve intentionally stopped target state:\n%s", got)
 	}
 	if !strings.Contains(got, "com.centurylinklabs.watchtower.scope=vibewatch-worker-7") {
 		t.Fatalf("remote worker isolation scope label missing:\n%s", got)
@@ -937,6 +940,7 @@ func TestLaunchDevelopmentUpdaterUsesControllerImageAndInheritedMounts(t *testin
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
   "inspect vibewatch --format {{.Config.Image}}") echo vibewatch:1.0.0; exit 0 ;;
+  "info --format {{.DockerRootDir}}") echo /var/lib/docker; exit 0 ;;
   "rm -f "*) exit 0 ;;
   "run "*) echo helper-id; exit 0 ;;
 esac
@@ -955,7 +959,7 @@ exit 0
 		t.Fatal(err)
 	}
 	got := string(b)
-	if !strings.Contains(got, "--volumes-from vibewatch") || !strings.Contains(got, "--entrypoint /usr/local/bin/vibewatch-dev-updater vibewatch:1.0.0") {
+	if !strings.Contains(got, "--volumes-from vibewatch") || !strings.Contains(got, "--mount type=bind,src=/var/lib/docker,dst=/vibewatch-docker-root,readonly") || !strings.Contains(got, "--entrypoint /usr/local/bin/vibewatch-dev-updater vibewatch:1.0.0") {
 		t.Fatalf("development updater helper launch is incomplete:\n%s", got)
 	}
 	if strings.Contains(got, "-v /var/run/docker.sock:/var/run/docker.sock") {
@@ -1012,5 +1016,219 @@ exit 0
 		if strings.Contains(args, secret) {
 			t.Fatalf("TLS secret leaked into process arguments: %q", secret)
 		}
+	}
+}
+
+func TestImagePlatformDoesNotCacheMutableTagIdentity(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state")
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  *"image inspect example/app:latest --format {{json .}}"*)
+    if [ -f "` + statePath + `" ]; then
+      printf '%s\n' '{"Id":"sha256:new","Os":"linux","Architecture":"arm64","Variant":"v8"}'
+    else
+      : > "` + statePath + `"
+      printf '%s\n' '{"Id":"sha256:old","Os":"linux","Architecture":"arm64","Variant":"v8"}'
+    fi
+    exit 0 ;;
+esac
+printf 'unexpected: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	first, err := c.ImagePlatform(context.Background(), "tcp://docker:2375", "example/app:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.ImagePlatform(context.Background(), "tcp://docker:2375", "example/app:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ImageID != "sha256:old" || second.ImageID != "sha256:new" {
+		t.Fatalf("mutable tag identity was cached across changes: first=%#v second=%#v", first, second)
+	}
+	b, _ := os.ReadFile(logPath)
+	if got := strings.Count(string(b), "image inspect example/app:latest"); got != 2 {
+		t.Fatalf("mutable tag must be inspected fresh; got %d calls:\n%s", got, string(b))
+	}
+}
+
+func TestImagePlatformStillCachesImmutableImageID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  *"image inspect sha256:fixed --format {{json .}}"*)
+    printf '%s\n' '{"Id":"sha256:fixed","Os":"linux","Architecture":"amd64","Variant":""}'
+    exit 0 ;;
+esac
+printf 'unexpected: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	for i := 0; i < 2; i++ {
+		if _, err := c.ImagePlatform(context.Background(), "tcp://docker:2375", "sha256:fixed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, _ := os.ReadFile(logPath)
+	if got := strings.Count(string(b), "image inspect sha256:fixed"); got != 1 {
+		t.Fatalf("immutable image ID should remain cached; got %d calls:\n%s", got, string(b))
+	}
+}
+
+func TestImageLabelsDoesNotCacheMutableTag(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state")
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  *"image inspect example/app:latest --format {{json .Config.Labels}}"*)
+    if [ -f "` + statePath + `" ]; then
+      printf '%s\n' '{"org.opencontainers.image.version":"2.0.0"}'
+    else
+      : > "` + statePath + `"
+      printf '%s\n' '{"org.opencontainers.image.version":"1.0.0"}'
+    fi
+    exit 0 ;;
+esac
+printf 'unexpected: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	first, err := c.ImageLabels(context.Background(), "tcp://docker:2375", "example/app:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.ImageLabels(context.Background(), "tcp://docker:2375", "example/app:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first["org.opencontainers.image.version"] != "1.0.0" || second["org.opencontainers.image.version"] != "2.0.0" {
+		t.Fatalf("mutable tag labels were cached across changes: first=%#v second=%#v", first, second)
+	}
+	b, _ := os.ReadFile(logPath)
+	if got := strings.Count(string(b), "image inspect example/app:latest"); got != 2 {
+		t.Fatalf("mutable tag labels must be inspected fresh; got %d calls:\n%s", got, string(b))
+	}
+}
+
+func TestImageLabelsStillCachesImmutableImageID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  *"image inspect sha256:fixed --format {{json .Config.Labels}}"*)
+    printf '%s\n' '{"org.opencontainers.image.version":"1.2.3"}'
+    exit 0 ;;
+esac
+printf 'unexpected: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	for i := 0; i < 2; i++ {
+		labels, err := c.ImageLabels(context.Background(), "tcp://docker:2375", "sha256:fixed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if labels["org.opencontainers.image.version"] != "1.2.3" {
+			t.Fatalf("unexpected labels: %#v", labels)
+		}
+	}
+	b, _ := os.ReadFile(logPath)
+	if got := strings.Count(string(b), "image inspect sha256:fixed"); got != 1 {
+		t.Fatalf("immutable image labels should remain cached; got %d calls:\n%s", got, string(b))
+	}
+}
+
+func TestDockerRootFilesystemUsageUsesLocalControllerImage(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  "info --format {{.DockerRootDir}}") echo /var/lib/docker; exit 0 ;;
+  "inspect vibewatch --format {{.Config.Image}}") echo vibewatch:1.0.16; exit 0 ;;
+  "run --rm --pull=never --entrypoint /bin/df --mount type=bind,src=/var/lib/docker,dst=/vibewatch-docker-root,readonly vibewatch:1.0.16 -Pk /vibewatch-docker-root") printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda 10485760 6291456 4194304 60%% /vibewatch-docker-root\n'; exit 0 ;;
+  "run --rm --pull=never --entrypoint /bin/df --mount type=bind,src=/var/lib/docker,dst=/vibewatch-docker-root,readonly vibewatch:1.0.16 -Pi /vibewatch-docker-root") printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/sda 1000000 1000 999000 1%% /vibewatch-docker-root\n'; exit 0 ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	got, err := c.DockerRootFilesystemUsage(context.Background(), "vibewatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != "/var/lib/docker" || got.FreeBytes != 4194304*1024 || got.FreeInodes != 999000 {
+		t.Fatalf("unexpected filesystem usage: %+v", got)
+	}
+	b, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(b), "--pull=never") {
+		t.Fatalf("probe must never pull an image:\n%s", string(b))
+	}
+}
+
+func TestDevelopmentUpdaterRunningAndCleanup(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "docker-args.log")
+	script := filepath.Join(dir, "docker")
+	body := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+case "$*" in
+  "inspect -f {{.State.Running}} vibewatch-dev-updater-20260819-abc123") echo true; exit 0 ;;
+  "ps -a --filter name=^vibewatch-dev-updater- --format {{.Names}}") printf 'vibewatch-dev-updater-20260819-abc123\nvibewatch-dev-updater-old\n'; exit 0 ;;
+  "rm -f vibewatch-dev-updater-old") exit 0 ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(slog.Default())
+	c.Binary = script
+	running, err := c.DevelopmentUpdaterRunning(context.Background(), "20260819-abc123")
+	if err != nil || !running {
+		t.Fatalf("running=%v err=%v", running, err)
+	}
+	if err := c.CleanupOrphanedDevelopmentUpdaters(context.Background(), "20260819-abc123"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(logPath)
+	if strings.Contains(string(b), "rm -f vibewatch-dev-updater-20260819-abc123") {
+		t.Fatal("active helper was removed")
+	}
+	if !strings.Contains(string(b), "rm -f vibewatch-dev-updater-old") {
+		t.Fatal("orphan helper was not removed")
 	}
 }

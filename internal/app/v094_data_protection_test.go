@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/m9rph/vibewatch/internal/db"
@@ -85,5 +86,20 @@ func TestV094LocalDriverBindVolumeIsNotBlindlyMarkedLocal(t *testing.T) {
 	}
 	if got := volumeBindSource(options); got != "/mnt/nas/app" {
 		t.Fatalf("unexpected bind source %q", got)
+	}
+}
+
+func TestRetainedManifestInventoryFallbackAllowsLostComposeIdentity(t *testing.T) {
+	if !retainedManifestInventoryFallbackAllowed("stack", fmt.Errorf("container is not part of a Compose stack")) {
+		t.Fatal("expected retained restore manifest to remain usable after broken target loses Compose labels")
+	}
+	if !retainedManifestInventoryFallbackAllowed("stack", fmt.Errorf("container sabnzbdvpn not found")) {
+		t.Fatal("expected retained restore manifest to remain usable when failed recreate temporarily removes target")
+	}
+	if retainedManifestInventoryFallbackAllowed("service", fmt.Errorf("container is not part of a Compose stack")) {
+		t.Fatal("service scope should not use stack-identity fallback")
+	}
+	if retainedManifestInventoryFallbackAllowed("stack", fmt.Errorf("docker daemon unavailable")) {
+		t.Fatal("unrelated Docker errors must still fail closed")
 	}
 }

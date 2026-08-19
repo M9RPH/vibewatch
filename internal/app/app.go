@@ -21,6 +21,7 @@ import (
 
 	"github.com/m9rph/vibewatch/internal/auth"
 	"github.com/m9rph/vibewatch/internal/db"
+	"github.com/m9rph/vibewatch/internal/devupdate"
 	"github.com/m9rph/vibewatch/internal/dockercli"
 	"github.com/m9rph/vibewatch/internal/notify"
 	"github.com/m9rph/vibewatch/internal/registry"
@@ -72,6 +73,11 @@ type App struct {
 	chainPreflightOps map[string]ChainPreflightProgress
 	chainMu           sync.Mutex
 	chainReserved     map[string]int64
+	continuityMu      sync.RWMutex
+	jobCancelMu       sync.Mutex
+	jobCancels        map[int64]context.CancelFunc
+	devUpdateMu       sync.Mutex
+	mutationGate      *mutationPipelineGate
 }
 type updateRequest struct {
 	JobID                     int64
@@ -82,7 +88,6 @@ type updateRequest struct {
 	Actor                     string
 	AllowPreflightWarnings    bool
 	SkipDataProtectionCapture bool
-	DeferTargetRestart        bool
 	PreviewProgress           func(percent int, stage string)
 	PreviewCheck              func(check PreflightCheck)
 }
@@ -261,7 +266,7 @@ type quickSetupProgress struct {
 
 func New(cfg Config, store *db.Store, docker *dockercli.Client, wt *watchtower.Client, gh *releases.GitHubClient, reg *registry.Client, po *notify.Pushover, ssh *sshsetup.Client, logger *slog.Logger, authm *auth.Manager) *App {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}, ensureLocks: map[int64]*sync.Mutex{}, hostHealth: map[int64]hostHealthState{}, hostHealthRun: map[int64]bool{}, quickSetupOps: map[string]quickSetupProgress{}, chainPreflightOps: map[string]ChainPreflightProgress{}, chainReserved: map[string]int64{}}
+	return &App{Cfg: cfg, Store: store, Docker: docker, WT: wt, Releases: gh, Registry: reg, Pushover: po, SSH: ssh, Logger: logger, Auth: authm, Events: dockercli.NewEventWatcher(), Queue: make(chan updateRequest, 200), ctx: ctx, cancel: cancel, infoRefresh: map[string]bool{}, ensureLocks: map[int64]*sync.Mutex{}, hostHealth: map[int64]hostHealthState{}, hostHealthRun: map[int64]bool{}, quickSetupOps: map[string]quickSetupProgress{}, chainPreflightOps: map[string]ChainPreflightProgress{}, chainReserved: map[string]int64{}, jobCancels: map[int64]context.CancelFunc{}, mutationGate: newMutationPipelineGate(maxConcurrentUpdatePipelines)}
 }
 func remoteDockerEndpoint(endpoint string) bool {
 	v := strings.ToLower(strings.TrimSpace(endpoint))
@@ -362,6 +367,24 @@ func (a *App) scheduleHostProbe(h db.Host, force bool) {
 }
 
 func (a *App) recoverInterruptedJobs() {
+	// First settle the narrow failure mode where an update transaction reached a
+	// terminal state but the final jobs UPDATE failed. This is exactly the class
+	// of stale "running" row that made a completed failure look hung in v1.0.8.
+	if jobs, listErr := a.Store.Jobs(a.ctx, 5000); listErr == nil {
+		for _, job := range jobs {
+			if job.Status != "running" && job.Status != "cancel_requested" {
+				continue
+			}
+			tx, txErr := a.Store.UpdateTransactionByJob(a.ctx, job.ID)
+			if txErr != nil || !transactionTerminalState(tx.State) {
+				continue
+			}
+			status, summary, errMsg := terminalJobStateForTransaction(tx)
+			if finishErr := a.finishJobDurable(job.ID, status, summary, errMsg); finishErr == nil && a.Logger != nil {
+				a.Logger.Warn("reconciled stale active job from terminal update transaction", "job_id", job.ID, "transaction_id", tx.ID, "status", status)
+			}
+		}
+	}
 	reason := "controller restarted or previous operation was interrupted"
 	count, err := a.Store.FailActiveJobsWithoutTransaction(a.ctx, reason)
 	if err != nil {
@@ -375,6 +398,16 @@ func (a *App) recoverInterruptedJobs() {
 }
 
 func (a *App) Start() {
+	a.reconcileDeveloperUpdates(context.Background())
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	keepDevID := ""
+	if active, ok := devupdate.ActiveStatus(a.Cfg.DataDir); ok {
+		keepDevID = active.ID
+	}
+	if err := a.Docker.CleanupOrphanedDevelopmentUpdaters(cleanupCtx, keepDevID); err != nil && a.Logger != nil {
+		a.Logger.Warn("could not clean orphaned development updater helpers", "error", err)
+	}
+	cleanupCancel()
 	a.recoverInterruptedJobs()
 	if err := a.reloadRegistryCredentials(a.ctx); err != nil && a.Logger != nil {
 		a.Logger.Warn("registry credentials could not be loaded", "error", err)
@@ -523,6 +556,8 @@ func (a *App) Handler() http.Handler {
 	protected.HandleFunc("GET /api/system/developer-update", a.handleDeveloperUpdateInfo)
 	protected.HandleFunc("POST /api/system/developer-update/upload", a.handleDeveloperUpdateUpload)
 	protected.HandleFunc("POST /api/system/developer-update/install", a.handleDeveloperUpdateInstall)
+	protected.HandleFunc("POST /api/system/developer-update/cancel", a.handleDeveloperUpdateCancel)
+	protected.HandleFunc("POST /api/system/developer-update/recover", a.handleDeveloperUpdateRecover)
 	protected.HandleFunc("GET /api/system/developer-update/status", a.handleDeveloperUpdateStatus)
 	protected.HandleFunc("GET /api/audit", a.handleAudit)
 	protected.HandleFunc("GET /api/docker-events", a.handleDockerEvents)
@@ -1392,12 +1427,7 @@ func (a *App) handleHostSubroutes(w http.ResponseWriter, r *http.Request) {
 				cache.FirstDetectedAt = cache.SnoozedAt
 			}
 		} else {
-			cache.SnoozedDigest = ""
-			cache.SnoozedAt = ""
-			cache.UpdateAvailable = db.Bool(!digestEqual(cache.CurrentDigest, cache.LatestDigest) && strings.TrimSpace(cache.LatestDigest) != "")
-			if bool(cache.UpdateAvailable) && strings.TrimSpace(cache.FirstDetectedAt) == "" {
-				cache.FirstDetectedAt = time.Now().UTC().Format(time.RFC3339)
-			}
+			cache = clearUpdateSnooze(cache, time.Now().UTC().Format(time.RFC3339))
 		}
 		if err := a.Store.SaveCache(r.Context(), cache); err != nil {
 			writeErr(w, 500, err.Error())
@@ -1831,7 +1861,9 @@ func (a *App) readOnlyRegistryCheck(ctx context.Context, hostID int64, c dockerc
 	if a.Registry == nil {
 		errs = append(errs, "registry client unavailable")
 	} else if strings.TrimSpace(platform.Architecture) != "" {
+		releaseContinuityRead := a.acquireContinuityRead(ctx)
 		remote, remoteErr := a.Registry.RemoteStateForPlatform(ctx, c.Image, platform)
+		releaseContinuityRead()
 		if remoteErr != nil {
 			errs = append(errs, "registry image state: "+remoteErr.Error())
 		} else {
@@ -2169,11 +2201,13 @@ func (a *App) refreshVersion(ctx context.Context, hostID int64, container, image
 	if a.Registry != nil && strings.TrimSpace(image) != "" {
 		var rv registry.Version
 		var err error
+		releaseContinuityRead := a.acquireContinuityRead(ctx)
 		if len(platforms) > 0 && strings.TrimSpace(platforms[0].Architecture) != "" {
 			rv, err = a.Registry.RemoteVersionForPlatform(ctx, image, platforms[0])
 		} else {
 			rv, err = a.Registry.RemoteVersion(ctx, image)
 		}
+		releaseContinuityRead()
 		if err == nil && rv.Version != "" {
 			v.Latest = strings.TrimPrefix(strings.TrimSpace(rv.Version), "v")
 			v.LatestSource = rv.Source
@@ -2324,17 +2358,62 @@ func (a *App) markCheckUnavailable(ctx context.Context, hostID int64, container 
 }
 
 func (a *App) runCheck(ctx context.Context, jobID, hostID int64, container, trigger string) (watchtower.CheckResponse, error) {
-	a.workerOpMu.RLock()
-	defer a.workerOpMu.RUnlock()
+	// Treat the complete check as shared control-plane work, not just the manifest
+	// request. This also protects Docker/Watchtower endpoint access if a remote
+	// host is addressed by DNS. Multiple checks remain fully parallel, while a
+	// pending DNS-service mutation prevents new checks from starting.
+	checkCtx, releaseContinuity := a.acquireContinuityShared(ctx)
+	defer releaseContinuity()
+	ctx = checkCtx
 	started := time.Now()
 	_ = a.Store.AddJobLog(ctx, jobID, "INFO", "app", "update check started")
-	a.jobProgress(ctx, jobID, 20, "Preparing update worker")
+	a.jobProgress(ctx, jobID, 20, "Resolving running image")
 	h, err := a.Store.Host(ctx, hostID)
 	if err != nil {
 		a.jobProgress(ctx, jobID, 100, "Check failed")
 		_ = a.Store.FinishJob(ctx, jobID, "failed", "", err.Error())
 		return watchtower.CheckResponse{}, err
 	}
+
+	// For a concrete container, Vibewatch owns update detection. Compare the
+	// running immutable Docker image/config ID with the config digest of the
+	// matching remote platform manifest. Watchtower remains the mutation worker,
+	// but its check endpoint is not authoritative after a rollback because a
+	// newer image can remain locally tagged while the container runs the old ID.
+	if strings.TrimSpace(container) != "" && a.Registry != nil {
+		cur, inspectErr := a.inspectOne(ctx, hostID, container)
+		if inspectErr == nil {
+			name := strings.TrimPrefix(strings.TrimSpace(cur.Name), "/")
+			if name == "" {
+				name = container
+			}
+			ref := strings.TrimSpace(cur.Config.Image)
+			if ref == "" {
+				ref = strings.TrimSpace(cur.Image)
+			}
+			state := strings.TrimSpace(cur.State.Status)
+			c := dockercli.Container{Name: name, Image: ref, ImageID: strings.TrimSpace(cur.Image), State: state}
+			a.jobProgress(ctx, jobID, 45, "Checking registry target identity")
+			res, registryErr := a.readOnlyRegistryCheck(ctx, hostID, c, trigger+":registry-authoritative")
+			payload, _ := json.Marshal(map[string]any{"api_version": "v1", "containers": res.Containers, "count": res.Count, "timestamp": time.Now().UTC().Format(time.RFC3339)})
+			if registryErr == nil {
+				a.jobProgress(ctx, jobID, 92, "Saving update state")
+				_ = a.Store.AddJobLog(ctx, jobID, "INFO", "registry", "authoritative platform image check completed")
+				a.jobProgress(ctx, jobID, 100, "Check completed")
+				_ = a.Store.FinishJob(ctx, jobID, "success", string(payload), "")
+				return res, nil
+			}
+			_ = a.Store.AddJobLog(ctx, jobID, "WARN", "registry", "authoritative registry check unavailable; falling back to update worker: "+registryErr.Error())
+		} else {
+			_ = a.Store.AddJobLog(ctx, jobID, "WARN", "docker", "container inspect for authoritative registry check failed; falling back to update worker: "+inspectErr.Error())
+		}
+	}
+
+	// Compatibility fallback for bulk checks or registries that Vibewatch cannot
+	// resolve directly. This path retains the legacy Watchtower check behavior.
+	a.workerOpMu.RLock()
+	defer a.workerOpMu.RUnlock()
+	a.jobProgress(ctx, jobID, 20, "Preparing update worker")
 	base, err := a.ensureWorker(ctx, h)
 	if err != nil {
 		a.markCheckUnavailable(ctx, hostID, container, err)
@@ -2344,7 +2423,9 @@ func (a *App) runCheck(ctx context.Context, jobID, hostID int64, container, trig
 		return watchtower.CheckResponse{}, err
 	}
 	a.jobProgress(ctx, jobID, 45, "Checking registry and image digest")
+	releaseContinuityRead := a.acquireContinuityRead(ctx)
 	res, raw, err := a.WT.Check(ctx, base, h.WorkerToken, container)
+	releaseContinuityRead()
 	if logs, e := a.Docker.WorkerLogs(ctx, hostID, started); e == nil && logs != "" {
 		_ = a.Store.AddJobLog(ctx, jobID, "DEBUG", "watchtower", logs)
 	}
@@ -2489,23 +2570,89 @@ func (a *App) enqueueUpdate(ctx context.Context, hostID int64, container, trigge
 	}
 }
 
+const maxConcurrentUpdatePipelines = 3
+
+func nextDispatchableUpdate(pending []updateRequest, busyHosts map[int64]bool) int {
+	for i, req := range pending {
+		if !busyHosts[req.HostID] {
+			return i
+		}
+	}
+	return -1
+}
+
+// updateWorker is a bounded multi-host dispatcher. Preflight, restore-point
+// preparation and local Docker inspection can overlap on different hosts, but
+// only one pipeline is allowed per host. The global continuity barrier then
+// serializes only the destructive stop/recreate/readiness windows. This keeps
+// large homelab runs moving without allowing simultaneous service outages.
 func (a *App) updateWorker() {
+	pending := make([]updateRequest, 0, maxConcurrentUpdatePipelines*2)
+	busyHosts := map[int64]bool{}
+	done := make(chan int64, maxConcurrentUpdatePipelines)
+	running := 0
+
 	for {
+		for running < maxConcurrentUpdatePipelines {
+			i := nextDispatchableUpdate(pending, busyHosts)
+			if i < 0 {
+				break
+			}
+			req := pending[i]
+			pending = append(pending[:i], pending[i+1:]...)
+			busyHosts[req.HostID] = true
+			running++
+			go func(r updateRequest) {
+				a.executeUpdate(r)
+				done <- r.HostID
+			}(req)
+		}
+
 		select {
 		case <-a.ctx.Done():
 			return
 		case req := <-a.Queue:
-			a.executeUpdate(req)
+			pending = append(pending, req)
+		case hostID := <-done:
+			delete(busyHosts, hostID)
+			if running > 0 {
+				running--
+			}
 		}
 	}
 }
 func (a *App) executeUpdate(req updateRequest) {
-	ctx := a.ctx
+	// Register the in-memory owner before claiming the queued DB row. This closes
+	// the claim/register race: a cancel arriving immediately after the claim sees
+	// an active cooperative owner and can never misclassify the just-started job
+	// as an orphan. If the queued job was cancelled first, ClaimQueuedJob simply
+	// fails and this owner is removed without touching Docker.
+	jobCtx, unregisterCancel := a.registerJobCancellation(req.JobID)
+	defer unregisterCancel()
+	ctx := jobCtx
 	if !a.beginAsyncJob(ctx, req.JobID) {
 		return
 	}
+	if a.jobCancelRequested(ctx, req.JobID) {
+		a.cancelUpdateBeforeMutation(req, nil, "safe cancellation requested before update preparation started")
+		return
+	}
+	ctx, releasePipeline, pipelineErr := a.acquireMutationPipeline(ctx, req.HostID)
+	if pipelineErr != nil {
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, nil, "safe cancellation requested while waiting for the host mutation scheduler")
+			return
+		}
+		a.failJob(req.JobID, fmt.Errorf("acquire host mutation scheduler: %w", pipelineErr))
+		return
+	}
+	defer releasePipeline()
 	leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, req.JobID, req.HostID, req.Container, "update")
 	if leaseErr != nil {
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, nil, "safe cancellation requested while waiting for the update lease")
+			return
+		}
 		a.failJob(req.JobID, leaseErr)
 		return
 	}
@@ -2525,6 +2672,7 @@ func (a *App) executeUpdate(req updateRequest) {
 	historySnapshotID := ""
 	restorePointID := int64(0)
 	attemptedDigest := strings.TrimSpace(beforeCache.LatestDigest)
+	expectedTargetImageID := ""
 	dependencyCount := 0
 	dependencyStatus := "none"
 	dependencyDetails := ""
@@ -2535,26 +2683,43 @@ func (a *App) executeUpdate(req updateRequest) {
 
 	txID, txErr := a.Store.CreateUpdateTransaction(ctx, db.UpdateTransaction{JobID: req.JobID, HostID: req.HostID, ContainerName: req.Container, Trigger: req.Trigger, Actor: req.Actor, State: txQueued, Status: "running", TargetDigest: attemptedDigest})
 	if txErr != nil {
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, nil, "safe cancellation requested before the update transaction was created")
+			return
+		}
 		a.failJob(req.JobID, fmt.Errorf("create persistent update transaction: %w", txErr))
 		return
 	}
 	tx, _ := a.Store.UpdateTransaction(ctx, txID)
 	req.TransactionID = txID
-	_ = a.Store.RenewOperationLease(ctx, leaseKey, leaseOwner, txID, operationLeaseTTL)
-	stopHeartbeat := a.startLeaseHeartbeat(ctx, leaseKey, leaseOwner, txID)
+	_ = a.Store.RenewOperationLease(context.Background(), leaseKey, leaseOwner, txID, operationLeaseTTL)
+	stopHeartbeat := a.startLeaseHeartbeat(a.ctx, leaseKey, leaseOwner, txID)
 	defer stopHeartbeat()
+	if a.jobCancelRequested(ctx, req.JobID) {
+		a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested before preflight started")
+		return
+	}
 	if err := a.txTransition(ctx, &tx, txPreflight, "running", "update preflight started"); err != nil {
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while persisting preflight state")
+			return
+		}
 		a.failJob(req.JobID, fmt.Errorf("persist update transaction preflight state: %w", err))
 		return
 	}
 
 	defer func() {
-		a.recordUpdateHistory(req, beforeContainer, beforeVersion, historySnapshotID, restorePointID, attemptedDigest, started, dependencyCount, dependencyStatus, dependencyDetails, preflightStatus, preflightDetails, verificationStatus, verificationDetails)
+		a.recordUpdateHistory(req, beforeContainer, beforeVersion, historySnapshotID, restorePointID, attemptedDigest, expectedTargetImageID, started, dependencyCount, dependencyStatus, dependencyDetails, preflightStatus, preflightDetails, verificationStatus, verificationDetails)
 	}()
+	defer a.ensureUpdateJobTerminal(req, txID)
 	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "app", fmt.Sprintf("update pipeline started · transaction #%d", txID))
 
 	h, err := a.Store.Host(ctx, req.HostID)
 	if err != nil {
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while loading the Docker host")
+			return
+		}
 		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
 		a.failJob(req.JobID, err)
 		a.notifyManualUpdateResult(req, "failed", err)
@@ -2580,26 +2745,26 @@ func (a *App) executeUpdate(req updateRequest) {
 	// recovery preparation path. The transaction id is passed into preflight so
 	// snapshot and restore-point stages are durable state-machine transitions.
 	a.jobProgress(ctx, req.JobID, 12, "Running update preflight")
-	// Data-protected update targets are allowed to remain stopped after their
-	// cold snapshot. The Watchtower worker includes explicitly targeted stopped
-	// containers, so we avoid an otherwise redundant stop -> start -> stop cycle.
-	req.DeferTargetRestart = true
+	// A protected data capture may stop the target briefly to obtain a cold
+	// snapshot. Always restore the target to its original running/stopped state
+	// before invoking the update worker. Earlier builds deferred the restart of a
+	// running target as an optimization; that made a worker-side skip look like a
+	// successful update when the target remained on the old image.
+	pipelineBaseCtx := ctx
 	preflight, prepared := a.runUpdatePreflight(ctx, req, true)
-	deferredWritersReleased := false
-	releaseDeferredWriters := func() error {
-		if deferredWritersReleased || len(prepared.DeferredDataWriters) == 0 {
-			deferredWritersReleased = true
-			return nil
-		}
-		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), dockerOperationTimeout(h.Endpoint, 2*time.Minute, 5*time.Minute))
-		defer releaseCancel()
-		err := a.ensureDataWritersRunning(releaseCtx, req.HostID, prepared.DeferredDataWriters)
-		if err == nil {
-			deferredWritersReleased = true
-		}
-		return err
+	preflightContinuityHeld := prepared.ContinuityHeld && prepared.ReleaseContinuity != nil
+	if preflightContinuityHeld {
+		// The restore-point capture deliberately runs under its own timeout. Only
+		// the lock itself crosses that boundary; bind the continuity marker to the
+		// durable per-job context so restoreCancel() cannot poison the remainder of
+		// the update pipeline with context.Canceled.
+		ctx = withHeldContinuityMarker(pipelineBaseCtx, prepared.ContinuityExclusive)
+		defer func() {
+			if preflightContinuityHeld {
+				prepared.ReleaseContinuity()
+			}
+		}()
 	}
-	defer func() { _ = releaseDeferredWriters() }()
 	if fresh, e := a.Store.UpdateTransaction(ctx, txID); e == nil {
 		tx = fresh
 	}
@@ -2616,18 +2781,14 @@ func (a *App) executeUpdate(req updateRequest) {
 	}
 	historySnapshotID = prepared.Snapshot.ID
 	restorePointID = prepared.RestorePoint.ID
-	if err := a.Store.SetUpdateTransactionPrepared(ctx, txID, historySnapshotID, restorePointID, attemptedDigest); err != nil {
-		err = fmt.Errorf("persist prepared recovery context: %w", err)
-		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
-		a.failJob(req.JobID, err)
-		a.notifyManualUpdateResult(req, "failed", err)
-		return
-	}
-	tx.SnapshotID, tx.RestorePointID, tx.TargetDigest = historySnapshotID, restorePointID, attemptedDigest
 	dependencyCount = len(prepared.Dependencies)
 	if dependencyCount > 0 {
 		dependencyStatus = "prepared"
 		dependencyDetails = dependencyNames(prepared.Dependencies)
+	}
+	if a.jobCancelRequested(ctx, req.JobID) {
+		a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested during update preflight; protected writers were restored before cancellation")
+		return
 	}
 	if preflight.Status == "blocked" {
 		err := fmt.Errorf("update preflight blocked the update")
@@ -2646,13 +2807,13 @@ func (a *App) executeUpdate(req updateRequest) {
 			verificationDetails = `[{"type":"custom_verification","status":"not_run","detail":"automatic update held by Preflight"}]`
 			_ = a.txTransition(ctx, &tx, txSkipped, "skipped", err.Error())
 			a.jobProgress(ctx, req.JobID, 100, "Automatic update held by Preflight")
-			_ = a.Store.FinishJob(ctx, req.JobID, "skipped", `{"reason":"preflight_warning"}`, err.Error())
+			_ = a.finishJobDurable(req.JobID, "skipped", `{"reason":"preflight_warning"}`, err.Error())
 			_ = a.Store.Audit(ctx, req.Actor, "update.skipped-preflight", req.HostID, req.Container, err.Error())
 			return
 		}
 		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
 		a.jobProgress(ctx, req.JobID, 100, "Update blocked by preflight")
-		_ = a.Store.FinishJob(ctx, req.JobID, "failed", "", err.Error())
+		_ = a.finishJobDurable(req.JobID, "failed", "", err.Error())
 		_ = a.Store.Audit(ctx, req.Actor, "update.blocked-preflight", req.HostID, req.Container, err.Error())
 		notifyAutomatic("failed", err)
 		a.notifyManualUpdateResult(req, "failed", err)
@@ -2661,13 +2822,114 @@ func (a *App) executeUpdate(req updateRequest) {
 	if preflight.Status == "ready_with_warnings" {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "preflight", fmt.Sprintf("preflight ready with %d warning(s)", preflight.Warnings))
 	}
+
+	// A cold Data Protection capture can temporarily stop the very service that
+	// provides DNS/proxy connectivity for the controller. Prove recovery before
+	// any post-capture registry lookup. The continuity guard transferred
+	// from restore-point capture keeps DNS mutations from racing this recovery; for
+	// DNS targets it is exclusive and also keeps other hosts' registry checks out until this
+	// sequence succeeds.
+	recoveredTargetID := ""
+	if containsString(prepared.RestartedDataWriters, req.Container) {
+		a.jobProgress(ctx, req.JobID, 43, "Waiting for protected service recovery")
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "data-protection", "cold snapshot complete; waiting for the previously running target to become stable before registry/update activity")
+		stableCtx, stableCancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 90*time.Second, 3*time.Minute))
+		stableErr := a.verifyUpdatedContainer(stableCtx, req.HostID, req.Container)
+		if stableErr == nil {
+			stableErr = a.probeRecoveredApplication(stableCtx, req.HostID, req.Container)
+		}
+		if stableErr == nil {
+			for attempt, delay := range []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * time.Second} {
+				if delay > 0 {
+					select {
+					case <-stableCtx.Done():
+						stableErr = stableCtx.Err()
+					case <-time.After(delay):
+					}
+				}
+				if stableErr != nil {
+					break
+				}
+				recoveredTargetID, stableErr = a.resolveExpectedTargetImageIDFresh(stableCtx, req.HostID, req.Container)
+				if stableErr == nil {
+					break
+				}
+				_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "data-protection", fmt.Sprintf("fresh registry probe after protected service restart failed (attempt %d/4): %v", attempt+1, stableErr))
+			}
+		}
+		stableCancel()
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while waiting for protected service recovery")
+			return
+		}
+		if stableErr != nil {
+			failure := fmt.Errorf("protected service did not recover after cold snapshot: %w", stableErr)
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "data-protection", failure.Error())
+			_ = a.txTransition(ctx, &tx, txFailed, "failed", failure.Error())
+			a.jobProgress(ctx, req.JobID, 100, "Protected service recovery failed")
+			_ = a.finishJobDurable(req.JobID, "failed", "", failure.Error())
+			_ = a.Store.Audit(ctx, req.Actor, "update.protected-service-recovery-failed", req.HostID, req.Container, failure.Error())
+			notifyAutomatic("failed", failure)
+			a.notifyManualUpdateResult(req, "failed", failure)
+			return
+		}
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "data-protection", "previously running target recovered after cold snapshot and passed runtime/application plus fresh registry continuity checks")
+	}
+
+	// The worker's latest_digest can be a registry MANIFEST digest, while
+	// Docker container inspect .Image is the platform image CONFIG digest.
+	// Resolve and persist the config digest explicitly. v1.0.3 accidentally
+	// compared these different OCI identities and rolled back correctly updated
+	// multi-arch images such as AdGuard Home on arm64.
+	targetID := strings.TrimSpace(recoveredTargetID)
+	var targetErr error
+	if targetID == "" {
+		targetID, targetErr = a.resolveExpectedTargetImageID(ctx, req.HostID, req.Container)
+	}
+	if targetErr != nil {
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while resolving the target image")
+			return
+		}
+		err := fmt.Errorf("pre-update target image identity could not be resolved: %w", targetErr)
+		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
+		a.jobProgress(ctx, req.JobID, 100, "Update blocked before image mutation")
+		_ = a.finishJobDurable(req.JobID, "failed", "", err.Error())
+		_ = a.Store.Audit(ctx, req.Actor, "update.target-identity-failed", req.HostID, req.Container, err.Error())
+		notifyAutomatic("failed", err)
+		a.notifyManualUpdateResult(req, "failed", err)
+		return
+	}
+	expectedTargetImageID = strings.TrimSpace(targetID)
+	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "image-verify", fmt.Sprintf("target identities resolved: detected_digest=%s expected_image_id=%s", attemptedDigest, expectedTargetImageID))
+	if err := a.Store.SetUpdateTransactionPrepared(ctx, txID, historySnapshotID, restorePointID, attemptedDigest, expectedTargetImageID); err != nil {
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while persisting prepared recovery context")
+			return
+		}
+		err = fmt.Errorf("persist prepared recovery context: %w", err)
+		_ = a.txTransition(ctx, &tx, txFailed, "failed", err.Error())
+		a.failJob(req.JobID, err)
+		a.notifyManualUpdateResult(req, "failed", err)
+		return
+	}
+	tx.SnapshotID, tx.RestorePointID, tx.TargetDigest, tx.TargetImageID = historySnapshotID, restorePointID, attemptedDigest, expectedTargetImageID
+
 	if tx.State != txPrepared {
 		if err := a.txTransition(ctx, &tx, txPrepared, "running", "snapshot and restore point prepared"); err != nil {
+			if a.jobCancelRequested(ctx, req.JobID) {
+				a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while persisting the prepared transaction state")
+				return
+			}
 			err = fmt.Errorf("persist prepared transaction state: %w", err)
 			a.failJob(req.JobID, err)
 			a.notifyManualUpdateResult(req, "failed", err)
 			return
 		}
+	}
+	if a.jobCancelRequested(ctx, req.JobID) {
+		a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested after recovery preparation and before image mutation")
+		return
 	}
 	rp := prepared.RestorePoint
 
@@ -2679,9 +2941,16 @@ func (a *App) executeUpdate(req updateRequest) {
 		rollbackAttempted := false
 		if allowAutoRollback && rp.ID > 0 {
 			_ = a.txTransition(ctx, &tx, txRollback, "running", "failure detected; evaluating automatic rollback")
-			attempted, rollbackErr := a.runAutomaticRollback(req, rp, failure)
+			attempted, rollbackErr := a.runAutomaticRollback(ctx, req, rp, failure)
 			rollbackAttempted = attempted
 			if attempted {
+				if rollbackErr == nil && containerProvidesDNS(prepared.TargetInspect) {
+					if restored, inspectErr := a.inspectOne(ctx, req.HostID, req.Container); inspectErr != nil {
+						rollbackErr = fmt.Errorf("rollback completed but DNS target could not be inspected for continuity recovery: %w", inspectErr)
+					} else if dnsErr := a.verifyDNSControlPlaneRecovery(ctx, restored); dnsErr != nil {
+						rollbackErr = fmt.Errorf("rollback completed but DNS control-plane continuity did not recover: %w", dnsErr)
+					}
+				}
 				if rollbackErr == nil {
 					finalErr = fmt.Errorf("%v; automatic rollback completed from restore point #%d", failure, rp.ID)
 					_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "rollback", fmt.Sprintf("Automatic rollback completed from restore point #%d", rp.ID))
@@ -2690,7 +2959,10 @@ func (a *App) executeUpdate(req updateRequest) {
 				} else {
 					finalErr = fmt.Errorf("%v; automatic rollback failed: %v", failure, rollbackErr)
 					_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "rollback", "Automatic rollback failed: "+rollbackErr.Error())
-					_ = a.txTransition(ctx, &tx, txFailed, "failed", finalErr.Error())
+					// A failed rollback is not a terminal failed update: the live runtime is
+					// unresolved and must block further mutation until recovery reconciles it.
+					_ = a.txTransition(ctx, &tx, txRecoveryRequired, "recovery_required", finalErr.Error())
+					_ = a.Store.SetUpdateTransactionRecovery(context.Background(), tx.ID, "recovery_required", "rollback_failed", rollbackErr.Error())
 				}
 			}
 		}
@@ -2698,36 +2970,178 @@ func (a *App) executeUpdate(req updateRequest) {
 			_ = a.txTransition(ctx, &tx, txFailed, "failed", finalErr.Error())
 		}
 		a.jobProgress(ctx, req.JobID, 100, "Update failed")
-		_ = a.Store.FinishJob(ctx, req.JobID, "failed", string(raw), finalErr.Error())
+		_ = a.finishJobDurable(req.JobID, "failed", string(raw), finalErr.Error())
 		_ = a.Store.Audit(ctx, "system", "update.failed", req.HostID, req.Container, finalErr.Error())
 		notifyAutomatic("failed", finalErr)
 		a.notifyManualUpdateResult(req, "failed", finalErr)
 	}
 
-	if err := a.txTransition(ctx, &tx, txUpdating, "running", "Watchtower update execution started"); err != nil {
+	if preflightContinuityHeld {
+		prepared.ReleaseContinuity()
+		preflightContinuityHeld = false
+		ctx = pipelineBaseCtx
+	}
+
+	// Materialize and pin the transaction's already-resolved immutable target
+	// before Watchtower is allowed to mutate the runtime. Rollbacks intentionally
+	// leave the running container on an older/restore image, but the mutable app
+	// tag must never point at a Vibewatch restore commit: Watchtower would treat
+	// that local tag as the update and recreate the wrong image. Keeping this
+	// preparation before txUpdating also makes failures safe and cancellable.
+	if strings.TrimSpace(expectedTargetImageID) != "" {
+		ref := strings.TrimSpace(prepared.TargetInspect.Config.Image)
+		previousRefID := ""
+		if mutableApplicationImageRef(ref) {
+			if currentRef, refErr := a.Docker.ImagePlatform(ctx, h.Endpoint, ref); refErr == nil {
+				previousRefID = strings.TrimSpace(currentRef.ImageID)
+			}
+		}
+		releaseRead := a.acquireContinuityRead(ctx)
+		a.jobProgress(ctx, req.JobID, 43, "Preparing exact target image")
+		targetPrepErr := a.ensureExpectedTargetImageLocal(ctx, h, prepared, expectedTargetImageID)
+		if targetPrepErr == nil {
+			_, _, targetPrepErr = a.alignMutableImageRefToTarget(ctx, h, prepared, expectedTargetImageID)
+		}
+		releaseRead()
+		if targetPrepErr != nil {
+			if a.jobCancelRequested(ctx, req.JobID) {
+				a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while preparing the exact target image")
+				return
+			}
+			failure := fmt.Errorf("prepare authoritative transaction target before worker mutation: %w", targetPrepErr)
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "image-verify", failure.Error())
+			finishFailed(nil, failure, false)
+			return
+		}
+		if mutableApplicationImageRef(ref) && previousRefID != "" && !digestEqual(previousRefID, expectedTargetImageID) {
+			_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "image-verify", fmt.Sprintf("normalized mutable image ref %s from %s to transaction target %s before invoking worker", ref, previousRefID, expectedTargetImageID))
+		} else {
+			_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "image-verify", fmt.Sprintf("authoritative transaction target is local before worker mutation: %s", expectedTargetImageID))
+		}
+	}
+
+	// Freeze the user/runtime contract before any destructive mutation. This is
+	// derived against the immutable source image, so image defaults may evolve
+	// while explicit environment/Compose/process overrides remain mandatory.
+	runtimeContract, runtimeContractSummary, runtimeContractSourceID, runtimeContractErr := a.preparedRuntimeOverrides(ctx, h, prepared.TargetInspect)
+	if runtimeContractErr != nil {
+		failure := fmt.Errorf("derive pre-update runtime fidelity contract: %w", runtimeContractErr)
+		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "runtime-fidelity", failure.Error())
+		finishFailed(nil, failure, false)
+		return
+	}
+	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "runtime-fidelity", fmt.Sprintf("pre-update runtime contract prepared from source_image=%s: env_overrides=%d label_overrides=%d command_override=%t entrypoint_override=%t", runtimeContractSourceID, runtimeContractSummary.Environment, runtimeContractSummary.Labels, runtimeContractSummary.Command, runtimeContractSummary.Entrypoint))
+
+	// Restore-derived runtimes are synthetic docker-commit containers. Asking
+	// Watchtower to reconstruct them has proven unsafe: the worker can preserve
+	// image defaults while dropping materialized user environment/Compose
+	// metadata. Vibewatch already has the pre-update inspect plus immutable source
+	// lineage, so use the deterministic delta recreator directly for this case.
+	directTargetApply := vibewatchRestoreRuntime(prepared.TargetInspect)
+	base := ""
+	workerLocked := false
+	if directTargetApply {
+		a.jobProgress(ctx, req.JobID, 45, "Preparing deterministic restore-runtime update")
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "image-verify", "restore-derived runtime detected; bypassing Watchtower recreate and applying the immutable transaction target with Vibewatch runtime-delta fidelity")
+	} else {
+		a.jobProgress(ctx, req.JobID, 45, "Preparing update worker")
+		a.workerOpMu.RLock()
+		workerLocked = true
+		var workerErr error
+		base, workerErr = a.ensureWorker(ctx, h)
+		if workerErr != nil {
+			a.workerOpMu.RUnlock()
+			workerLocked = false
+			if a.jobCancelRequested(ctx, req.JobID) {
+				a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while preparing the update worker")
+				return
+			}
+			finishFailed(nil, workerErr, false)
+			return
+		}
+	}
+	// Enter the continuity guard before image mutation. Waiting for this guard is
+	// still a safe cancellation point; only after the guard has been acquired and
+	// the transaction is persisted as updating do we switch to an atomic context.
+	continuityBaseCtx := ctx
+	mutationCtx, releaseContinuity, continuityExclusive := a.acquireContinuityMutation(ctx, prepared.TargetInspect)
+	ctx = mutationCtx
+	if continuityExclusive {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "continuity", "DNS-capable target entered exclusive control-plane continuity window")
+	}
+	continuityHeld := true
+	defer func() {
+		if continuityHeld {
+			releaseContinuity()
+		}
+	}()
+	if a.jobCancelRequested(continuityBaseCtx, req.JobID) {
+		releaseContinuity()
+		continuityHeld = false
+		if workerLocked {
+			a.workerOpMu.RUnlock()
+			workerLocked = false
+		}
+		ctx = continuityBaseCtx
+		a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested while waiting for the mutation window")
+		return
+	}
+	updateExecutionDetail := "Watchtower update execution started"
+	if directTargetApply {
+		updateExecutionDetail = "deterministic restore-runtime target execution started"
+	}
+	if err := a.txTransition(ctx, &tx, txUpdating, "running", updateExecutionDetail); err != nil {
+		releaseContinuity()
+		continuityHeld = false
+		if workerLocked {
+			a.workerOpMu.RUnlock()
+			workerLocked = false
+		}
+		ctx = continuityBaseCtx
+		if a.jobCancelRequested(ctx, req.JobID) {
+			a.cancelUpdateBeforeMutation(req, &tx, "safe cancellation requested at the final pre-mutation transaction boundary")
+			return
+		}
 		err = fmt.Errorf("persist destructive update stage: %w", err)
 		a.failJob(req.JobID, err)
 		a.notifyManualUpdateResult(req, "failed", err)
 		return
 	}
-	a.jobProgress(ctx, req.JobID, 45, "Preparing update worker")
-	a.workerOpMu.RLock()
-	base, err := a.ensureWorker(ctx, h)
-	if err != nil {
-		a.workerOpMu.RUnlock()
-		finishFailed(nil, err, false)
-		return
-	}
-	a.jobProgress(ctx, req.JobID, 55, "Update engine working")
-	res, raw, err := a.WT.Update(ctx, base, h.WorkerToken, req.Container)
-	if logs, e := a.Docker.WorkerLogs(ctx, req.HostID, started); e == nil && logs != "" {
-		_ = a.Store.AddJobLog(ctx, req.JobID, "DEBUG", "watchtower", logs)
-	}
-	a.workerOpMu.RUnlock()
-	if err != nil {
-		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "watchtower", err.Error())
-		finishFailed(raw, err, true)
-		return
+	// From this point onward user cancellation is cooperative: never terminate a
+	// Watchtower/recreate/verification/rollback operation halfway through. The
+	// cancellation request remains persisted and is observed at the next safe
+	// settlement point.
+	criticalCtx, criticalCancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Minute)
+	defer criticalCancel()
+	ctx = criticalCtx
+	var res watchtower.UpdateResponse
+	var raw []byte
+	if directTargetApply {
+		a.jobProgress(ctx, req.JobID, 55, "Applying exact target image")
+		if applyErr := a.applyPreparedTargetImage(ctx, h, prepared, expectedTargetImageID, req.JobID); applyErr != nil {
+			failure := fmt.Errorf("restore-runtime deterministic target recreate failed: %w", applyErr)
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "image-verify", failure.Error())
+			finishFailed(nil, failure, true)
+			return
+		}
+		raw, res = updateSummaryWithLocalRecreate(nil, watchtower.UpdateResponse{})
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "image-verify", "restore-derived runtime recreated directly from the immutable transaction target")
+	} else {
+		a.jobProgress(ctx, req.JobID, 55, "Update engine working")
+		var updateErr error
+		res, raw, updateErr = a.WT.Update(ctx, base, h.WorkerToken, req.Container)
+		if logs, e := a.Docker.WorkerLogs(ctx, req.HostID, started); e == nil && logs != "" {
+			_ = a.Store.AddJobLog(ctx, req.JobID, "DEBUG", "watchtower", logs)
+		}
+		if workerLocked {
+			a.workerOpMu.RUnlock()
+			workerLocked = false
+		}
+		if updateErr != nil {
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "watchtower", updateErr.Error())
+			finishFailed(raw, updateErr, true)
+			return
+		}
 	}
 
 	a.jobProgress(ctx, req.JobID, 72, "Update engine completed")
@@ -2740,9 +3154,102 @@ func (a *App) executeUpdate(req updateRequest) {
 		finishFailed(raw, failure, true)
 		return
 	}
-	if err := releaseDeferredWriters(); err != nil {
-		finishFailed(raw, fmt.Errorf("updated container could not be started after data snapshot handoff: %w", err), true)
+	if err := a.txTransition(ctx, &tx, txImageVerify, "running", "target image verification started"); err != nil {
+		finishFailed(raw, fmt.Errorf("persist target image verification stage: %w", err), true)
 		return
+	}
+	a.jobProgress(ctx, req.JobID, 75, "Verifying target image")
+	actualImage, imageErr := a.verifyAppliedTargetImage(ctx, req.HostID, req.Container, beforeContainer.ImageID, expectedTargetImageID, res.Summary.Updated, res.Summary.Skipped)
+	if imageErr != nil {
+		unchanged := strings.TrimSpace(actualImage) != "" && strings.TrimSpace(beforeContainer.ImageID) != "" && digestEqual(actualImage, beforeContainer.ImageID)
+		// The worker is advisory for mutation, while expectedTargetImageID is the
+		// immutable transaction contract. Correct *any* provable mismatch, not only
+		// a no-op: a polluted mutable tag can make Watchtower switch from one old
+		// restore image to another old restore image. Image verification must catch
+		// that and Vibewatch must then apply the exact prepared target itself.
+		if deterministicTargetCorrectionEligible(actualImage, expectedTargetImageID) {
+			if unchanged {
+				_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "image-verify", fmt.Sprintf("update worker left the running image unchanged at %s; correcting to transaction target %s", actualImage, expectedTargetImageID))
+			} else {
+				_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "image-verify", fmt.Sprintf("update worker switched the running image to unexpected image %s; correcting to transaction target %s", actualImage, expectedTargetImageID))
+			}
+			a.jobProgress(ctx, req.JobID, 74, "Preparing exact target image")
+			if localErr := a.ensureExpectedTargetImageLocal(ctx, h, prepared, expectedTargetImageID); localErr != nil {
+				imageErr = fmt.Errorf("%v; deterministic target preparation failed: %w", imageErr, localErr)
+			} else {
+				a.jobProgress(ctx, req.JobID, 76, "Applying exact target image")
+				if applyErr := a.applyPreparedTargetImage(ctx, h, prepared, expectedTargetImageID, req.JobID); applyErr != nil {
+					failure := fmt.Errorf("post-update target recreate failed: %w", applyErr)
+					_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "image-verify", failure.Error())
+					finishFailed(raw, failure, true)
+					return
+				}
+				actualImage, imageErr = a.verifyAppliedTargetImage(ctx, req.HostID, req.Container, beforeContainer.ImageID, expectedTargetImageID, 1, res.Summary.Skipped)
+				if imageErr == nil {
+					raw, res = updateSummaryWithLocalRecreate(raw, res)
+					_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "image-verify", "deterministic target recreate applied the expected image successfully")
+				}
+			}
+		}
+		if imageErr != nil {
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "image-verify", imageErr.Error())
+			unchanged = strings.TrimSpace(actualImage) != "" && strings.TrimSpace(beforeContainer.ImageID) != "" && digestEqual(actualImage, beforeContainer.ImageID)
+			finishFailed(raw, imageErr, !unchanged)
+			if unchanged {
+				_ = a.Store.SetUpdateTransactionRecovery(context.Background(), tx.ID, "failed", "target_not_applied", imageErr.Error())
+			}
+			return
+		}
+	}
+	_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "image-verify", fmt.Sprintf("target image applied: %s", actualImage))
+	if res.Summary.Updated == 0 {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "watchtower", "worker reported updated=0, but the expected target image is already active; continuing with runtime verification")
+	}
+
+	// Verify configuration fidelity before health checks. A container can be on
+	// the correct image yet be unusable because a recreator dropped explicit Env,
+	// Compose labels or host/network settings. Repair exactly once using the
+	// immutable target plus the pre-mutation contract instead of waiting for an
+	// indirect application/health failure.
+	afterMutation, fidelityInspectErr := a.inspectOne(ctx, req.HostID, req.Container)
+	if fidelityInspectErr != nil {
+		failure := fmt.Errorf("post-update runtime fidelity inspect failed: %w", fidelityInspectErr)
+		_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "runtime-fidelity", failure.Error())
+		finishFailed(raw, failure, true)
+		return
+	}
+	if mismatches := preparedRuntimeFidelityMismatches(prepared.TargetInspect, runtimeContract, afterMutation); len(mismatches) > 0 {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "runtime-fidelity", fmt.Sprintf("post-update runtime contract mismatch in %s; correcting by deterministic target recreation", strings.Join(mismatches, ", ")))
+		a.jobProgress(ctx, req.JobID, 78, "Repairing runtime configuration")
+		if applyErr := a.applyPreparedTargetImage(ctx, h, prepared, expectedTargetImageID, req.JobID); applyErr != nil {
+			failure := fmt.Errorf("post-update runtime fidelity repair failed: %w", applyErr)
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "runtime-fidelity", failure.Error())
+			finishFailed(raw, failure, true)
+			return
+		}
+		actualImage, imageErr = a.verifyAppliedTargetImage(ctx, req.HostID, req.Container, beforeContainer.ImageID, expectedTargetImageID, 1, res.Summary.Skipped)
+		if imageErr != nil {
+			failure := fmt.Errorf("post-update runtime fidelity repair applied an unexpected image: %w", imageErr)
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "runtime-fidelity", failure.Error())
+			finishFailed(raw, failure, true)
+			return
+		}
+		afterMutation, fidelityInspectErr = a.inspectOne(ctx, req.HostID, req.Container)
+		if fidelityInspectErr != nil {
+			failure := fmt.Errorf("post-update runtime fidelity repair inspect failed: %w", fidelityInspectErr)
+			finishFailed(raw, failure, true)
+			return
+		}
+		if repaired := preparedRuntimeFidelityMismatches(prepared.TargetInspect, runtimeContract, afterMutation); len(repaired) > 0 {
+			failure := fmt.Errorf("post-update runtime fidelity mismatch remains after deterministic repair in: %s", strings.Join(repaired, ", "))
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "runtime-fidelity", failure.Error())
+			finishFailed(raw, failure, true)
+			return
+		}
+		raw, res = updateSummaryWithLocalRecreate(raw, res)
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "runtime-fidelity", "runtime contract restored successfully on the immutable target image")
+	} else {
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "runtime-fidelity", "post-update runtime contract verified")
 	}
 
 	_ = a.txTransition(ctx, &tx, txDockerHealth, "running", "Docker health verification started")
@@ -2793,6 +3300,28 @@ func (a *App) executeUpdate(req updateRequest) {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "verify", "No custom verification configured; Docker health/running-state result is authoritative")
 	}
 
+	// DNS providers are control-plane infrastructure. HTTP/Docker health alone
+	// can become ready before port 53 is actually usable, so prove controller
+	// name resolution before allowing queued registry checks to continue.
+	if containerProvidesDNS(prepared.TargetInspect) {
+		a.jobProgress(ctx, req.JobID, 92, "Verifying DNS control-plane recovery")
+		if dnsErr := a.verifyDNSControlPlaneRecovery(ctx, prepared.TargetInspect); dnsErr != nil {
+			_ = a.Store.AddJobLog(ctx, req.JobID, "ERROR", "continuity", dnsErr.Error())
+			finishFailed(raw, fmt.Errorf("post-update control-plane continuity verification failed: %w", dnsErr), true)
+			return
+		}
+		_ = a.Store.AddJobLog(ctx, req.JobID, "INFO", "continuity", "DNS-capable target restored controller name resolution; queued network checks may resume")
+	}
+
+	// The disruptive window is over. Re-open parallel discovery before the
+	// non-destructive metadata refresh below. Keep using the bounded atomic
+	// context for settlement: the user's job context may now be cancelled, but a
+	// late safe-cancel request must not strand a successfully mutated runtime in
+	// txVerifying/cancel_requested.
+	releaseContinuity()
+	continuityHeld = false
+	ctx = criticalCtx
+
 	_ = a.txTransition(ctx, &tx, txRefreshing, "running", "refreshing update metadata and config drift baseline")
 	a.jobProgress(ctx, req.JobID, 95, "Refreshing update state")
 	_, _, _ = a.check(ctx, req.HostID, req.Container, "post-update")
@@ -2800,9 +3329,13 @@ func (a *App) executeUpdate(req updateRequest) {
 		_ = a.Store.AddJobLog(ctx, req.JobID, "WARN", "config-drift", "Could not refresh post-update drift baseline: "+err.Error())
 		a.Logger.Warn("post-update config drift baseline refresh failed", "host_id", req.HostID, "container", req.Container, "error", err)
 	}
+	if a.jobCancelRequested(pipelineBaseCtx, req.JobID) {
+		_ = a.Store.AddJobLog(context.Background(), req.JobID, "WARN", "app", "safe cancellation was requested after image mutation started; the atomic update and verification completed successfully instead of interrupting Docker mid-flight")
+		_ = a.Store.Audit(context.Background(), req.Actor, "job.cancel-too-late", req.HostID, req.Container, fmt.Sprintf("job=%d transaction=%d update completed safely", req.JobID, txID))
+	}
 	_ = a.txTransition(ctx, &tx, txSuccess, "success", "update transaction completed")
 	a.jobProgress(ctx, req.JobID, 100, "Update completed")
-	_ = a.Store.FinishJob(ctx, req.JobID, "success", string(raw), "")
+	_ = a.finishJobDurable(req.JobID, "success", string(raw), "")
 	_ = a.Store.Audit(ctx, "system", "update.success", req.HostID, req.Container, fmt.Sprintf("transaction=%d %s", txID, string(raw)))
 	notifyAutomatic("success", nil)
 	if res.Summary.Updated > 0 {
@@ -2842,7 +3375,7 @@ func (a *App) notifyManualUpdateResult(req updateRequest, status string, updateE
 func (a *App) failJob(id int64, err error) {
 	_ = a.Store.AddJobLog(context.Background(), id, "ERROR", "app", err.Error())
 	a.jobProgress(context.Background(), id, 100, "Operation failed")
-	_ = a.Store.FinishJob(context.Background(), id, "failed", "", err.Error())
+	_ = a.finishJobDurable(id, "failed", "", err.Error())
 }
 
 func (a *App) automationLoop() {
@@ -2862,7 +3395,9 @@ func (a *App) policyScanHost(ctx context.Context, hostID int64, trigger string, 
 	if err != nil {
 		return watchtower.CheckResponse{}, err
 	}
+	releaseHostDiscovery := a.acquireContinuityRead(ctx)
 	cs, err := a.Docker.ListContainers(ctx, h.Endpoint)
+	releaseHostDiscovery()
 	if err != nil {
 		return watchtower.CheckResponse{}, err
 	}
@@ -3072,13 +3607,32 @@ func (a *App) runAutomations(now time.Time) {
 		// ordinary policy scan starts. The scan therefore skips those containers
 		// and cannot race or duplicate the explicitly ordered chain transaction.
 		a.startAutomationChains(a.ctx, rule, hostIDs)
+
+		// Host discovery is intentionally parallel and bounded. The continuity
+		// barrier in the registry/update paths prevents a destructive lifecycle
+		// window from racing these scans, so we get faster multi-host discovery
+		// without turning the whole automation into one long serial chain.
+		const maxParallelHostScans = 3
+		sem := make(chan struct{}, maxParallelHostScans)
+		var scanWG sync.WaitGroup
 		for _, hostID := range hostIDs {
 			h, e := a.Store.Host(a.ctx, hostID)
 			if e != nil || !bool(h.Enabled) {
 				continue
 			}
-			_, _ = a.policyScanHost(a.ctx, hostID, fmt.Sprintf("automation:%d", rule.ID), true)
+			scanWG.Add(1)
+			go func(id int64) {
+				defer scanWG.Done()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-a.ctx.Done():
+					return
+				}
+				_, _ = a.policyScanHost(a.ctx, id, fmt.Sprintf("automation:%d", rule.ID), true)
+			}(hostID)
 		}
+		scanWG.Wait()
 	}
 }
 
@@ -3443,28 +3997,77 @@ func (a *App) handleJobCancel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "job access denied")
 		return
 	}
-	if job.Status != "queued" {
-		writeErr(w, http.StatusConflict, "only queued jobs can be cancelled")
-		return
-	}
 	actor := a.actor(r)
-	reason := "cancelled before execution by " + actor
-	ok, err := a.Store.CancelQueuedJob(r.Context(), id, reason)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	switch job.Status {
+	case "queued":
+		reason := "cancelled before execution by " + actor
+		ok, cancelErr := a.Store.CancelQueuedJob(r.Context(), id, reason)
+		if cancelErr != nil {
+			writeErr(w, http.StatusInternalServerError, cancelErr.Error())
+			return
+		}
+		if !ok {
+			writeErr(w, http.StatusConflict, "job already started or is no longer queued")
+			return
+		}
+		_ = a.Store.ReleaseOperationLeaseByJob(context.Background(), id)
+		_ = a.Store.AddJobLog(context.Background(), id, "WARN", "app", reason)
+		a.jobProgress(context.Background(), id, 100, "Cancelled before execution")
+		_ = a.Store.Audit(context.Background(), actor, "job.cancelled", job.HostID, job.ContainerName, fmt.Sprintf("job=%d type=%s trigger=%s", job.ID, job.Type, job.Trigger))
+		job.Status = "cancelled"
+		job.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": "queued", "job": job})
 		return
-	}
-	if !ok {
-		writeErr(w, http.StatusConflict, "job already started or is no longer queued")
+
+	case "cancel_requested":
+		// Idempotent: a second click/retry must never turn a cooperative cancel
+		// into a forceful interruption.
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "mode": "safe_point", "job": job})
 		return
+
+	case "running":
+		if job.Type != "update" && job.Type != "chain" {
+			writeErr(w, http.StatusConflict, "safe cancellation of a running job is supported for container update and update-chain jobs")
+			return
+		}
+		reason := "safe cancellation requested by " + actor
+		ok, cancelErr := a.Store.RequestRunningJobCancel(r.Context(), id, reason)
+		if cancelErr != nil {
+			writeErr(w, http.StatusInternalServerError, cancelErr.Error())
+			return
+		}
+		if !ok {
+			latest, latestErr := a.Store.Job(r.Context(), id)
+			if latestErr == nil && latest.Status == "cancel_requested" {
+				writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "mode": "safe_point", "job": latest})
+				return
+			}
+			writeErr(w, http.StatusConflict, "job is no longer running")
+			return
+		}
+		_ = a.Store.AddJobLog(context.Background(), id, "WARN", "app", reason+"; Vibewatch will stop at the next transaction-safe point and will not kill an atomic Docker mutation")
+		_ = a.Store.Audit(context.Background(), actor, "job.cancel-requested", job.HostID, job.ContainerName, fmt.Sprintf("job=%d type=%s trigger=%s", job.ID, job.Type, job.Trigger))
+		active := a.signalJobCancellation(id)
+		mode := "safe_point"
+		if !active {
+			// A persisted running row with no in-memory owner is an orphan. Reconcile
+			// it immediately instead of requiring a controller restart.
+			if job.Type == "chain" {
+				mode, err = a.reconcileOrphanedChainCancel(job, actor)
+			} else {
+				mode, err = a.reconcileOrphanedUpdateCancel(job, actor)
+			}
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		latest, _ := a.Store.Job(context.Background(), id)
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "mode": mode, "job": latest})
+		return
+	default:
+		writeErr(w, http.StatusConflict, "job is already finished")
 	}
-	_ = a.Store.ReleaseOperationLeaseByJob(context.Background(), id)
-	_ = a.Store.AddJobLog(context.Background(), id, "WARN", "app", reason)
-	a.jobProgress(context.Background(), id, 100, "Cancelled before execution")
-	_ = a.Store.Audit(context.Background(), actor, "job.cancelled", job.HostID, job.ContainerName, fmt.Sprintf("job=%d type=%s trigger=%s", job.ID, job.Type, job.Trigger))
-	job.Status = "cancelled"
-	job.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": job})
 }
 
 func (a *App) handleJobLogs(w http.ResponseWriter, r *http.Request) {
@@ -3698,6 +4301,19 @@ func (a *App) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 	groups, _ := a.Store.HostGroups(r.Context())
 	writeZipJSON(zw, "hosts.json", hosts)
 	writeZipJSON(zw, "jobs.json", jobs)
+	jobLogDiag := map[string]any{}
+	for _, job := range jobs {
+		logs, e := a.Store.JobLogs(r.Context(), job.ID)
+		if e != nil || len(logs) == 0 {
+			continue
+		}
+		// Keep support bundles bounded even for unusually chatty long-running jobs.
+		if len(logs) > 250 {
+			logs = logs[len(logs)-250:]
+		}
+		jobLogDiag[strconv.FormatInt(job.ID, 10)] = logs
+	}
+	writeZipJSON(zw, "job-logs.json", jobLogDiag)
 	writeZipJSON(zw, "audit.json", audits)
 	writeZipJSON(zw, "docker-events.json", events)
 	writeZipJSON(zw, "automations.json", automations)
@@ -4185,7 +4801,10 @@ func (a *App) handleSelfUpdate(w http.ResponseWriter, r *http.Request) {
 		out := a.systemSettings(r.Context())
 		out["available"] = false
 		if strings.TrimSpace(a.Cfg.AppImage) != "" && a.Registry != nil {
-			if rv, e := a.Registry.RemoteVersion(r.Context(), a.Cfg.AppImage); e == nil {
+			releaseContinuityRead := a.acquireContinuityRead(r.Context())
+			rv, e := a.Registry.RemoteVersion(r.Context(), a.Cfg.AppImage)
+			releaseContinuityRead()
+			if e == nil {
 				out["latest_version"] = rv.Version
 				out["latest_source"] = rv.Source
 				out["available"] = rv.Version != "" && strings.TrimPrefix(rv.Version, "v") != strings.TrimPrefix(a.Cfg.Version, "v")

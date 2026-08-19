@@ -22,6 +22,7 @@ const (
 	txRestorePoint     = "restore_point"
 	txPrepared         = "prepared"
 	txUpdating         = "updating"
+	txImageVerify      = "image_verify"
 	txDockerHealth     = "docker_health"
 	txDependencies     = "dependencies"
 	txVerifying        = "verifying"
@@ -32,16 +33,18 @@ const (
 	txFailed           = "failed"
 	txSkipped          = "skipped"
 	txRolledBack       = "rolled_back"
+	txCancelled        = "cancelled"
 	txRecoveryRequired = "recovery_required"
 )
 
 var transactionTransitions = map[string]map[string]bool{
-	txQueued:           {txPreflight: true, txFailed: true, txRecovering: true},
-	txPreflight:        {txSnapshot: true, txPrepared: true, txFailed: true, txSkipped: true, txRecovering: true},
-	txSnapshot:         {txRestorePoint: true, txFailed: true, txSkipped: true, txRecovering: true},
-	txRestorePoint:     {txPrepared: true, txFailed: true, txSkipped: true, txRecovering: true},
-	txPrepared:         {txUpdating: true, txFailed: true, txRecovering: true},
-	txUpdating:         {txDockerHealth: true, txRollback: true, txFailed: true, txRecovering: true},
+	txQueued:           {txPreflight: true, txFailed: true, txCancelled: true, txRecovering: true},
+	txPreflight:        {txSnapshot: true, txPrepared: true, txFailed: true, txSkipped: true, txCancelled: true, txRecovering: true},
+	txSnapshot:         {txRestorePoint: true, txFailed: true, txSkipped: true, txCancelled: true, txRecovering: true},
+	txRestorePoint:     {txPrepared: true, txFailed: true, txSkipped: true, txCancelled: true, txRecovering: true},
+	txPrepared:         {txUpdating: true, txFailed: true, txCancelled: true, txRecovering: true},
+	txUpdating:         {txImageVerify: true, txRollback: true, txFailed: true, txRecovering: true},
+	txImageVerify:      {txDockerHealth: true, txRollback: true, txFailed: true, txRecovering: true},
 	txDockerHealth:     {txDependencies: true, txVerifying: true, txRollback: true, txFailed: true, txRecovering: true},
 	txDependencies:     {txVerifying: true, txRollback: true, txFailed: true, txRecovering: true},
 	txVerifying:        {txRefreshing: true, txRollback: true, txFailed: true, txRecovering: true},
@@ -65,7 +68,7 @@ func validTransactionTransition(from, to string) bool {
 }
 
 func transactionTerminalState(state string) bool {
-	return state == txSuccess || state == txFailed || state == txSkipped || state == txRolledBack
+	return state == txSuccess || state == txFailed || state == txSkipped || state == txRolledBack || state == txCancelled
 }
 
 func (a *App) txTransition(ctx context.Context, tx *db.UpdateTransaction, toState, status, message string) error {
@@ -543,7 +546,7 @@ func (a *App) recoverUpdateTransaction(tx db.UpdateTransaction) {
 	if preMutationTransactionState(tx.State) {
 		msg := "controller restart interrupted update before the image mutation stage"
 		_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "interrupted", "safe_abort", msg)
-		_ = a.Store.FinishJob(ctx, tx.JobID, "failed", "", msg)
+		_ = a.finishJobDurable(tx.JobID, "failed", "", msg)
 		_ = a.Store.ReleaseOperationLeaseByJob(ctx, tx.JobID)
 		_ = a.Store.Audit(ctx, "system", "transaction.recovered-safe-abort", tx.HostID, tx.ContainerName, fmt.Sprintf("transaction=%d state=%s", tx.ID, tx.State))
 		return
@@ -551,6 +554,19 @@ func (a *App) recoverUpdateTransaction(tx db.UpdateTransaction) {
 	tx.Status = "recovering"
 	_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "recovering", "reconcile_runtime", "")
 	_ = a.txTransition(ctx, &tx, txRecovering, "recovering", "controller restart reconciliation")
+	// Recovery is mutation work too. Re-enter the same host/global pipeline gate
+	// used by normal updates, chain lifecycle actions and manual rollbacks so a
+	// controller restart cannot create a second, parallel mutation path.
+	var pipelineErr error
+	ctx, releasePipeline, pipelineErr := a.acquireMutationPipeline(ctx, tx.HostID)
+	if pipelineErr != nil {
+		msg := "transaction recovery could not acquire mutation pipeline: " + pipelineErr.Error()
+		_ = a.txTransition(context.Background(), &tx, txRecoveryRequired, "recovery_required", msg)
+		_ = a.Store.SetUpdateTransactionRecovery(context.Background(), tx.ID, "recovery_required", "pipeline_gate", msg)
+		_ = a.finishJobDurable(tx.JobID, "failed", `{"status":"recovery_required"}`, msg)
+		return
+	}
+	defer releasePipeline()
 	// The previous controller process cannot still own this job after startup.
 	// Reclaim its persisted lease immediately instead of waiting for the normal
 	// two-hour TTL; unrelated job/host leases remain untouched.
@@ -572,14 +588,29 @@ func (a *App) recoverUpdateTransaction(tx db.UpdateTransaction) {
 		if integrity.Status == "expired" || integrity.Status == "degraded" {
 			msg := "interrupted update needs recovery but restore point integrity is " + integrity.Status
 			_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "recovery_required", "manual_intervention", msg)
-			_ = a.Store.FinishJob(ctx, tx.JobID, "failed", "", msg)
+			_ = a.finishJobDurable(tx.JobID, "failed", "", msg)
 			return
 		}
 	}
-	// First try to reconcile the live runtime. If it is healthy and custom
-	// verification passes, preserve the successfully updated service rather than
-	// rolling it back merely because the controller restarted.
-	liveErr := a.verifyUpdatedContainer(ctx, tx.HostID, tx.ContainerName)
+	// First prove that the expected target image actually became the live
+	// container image. Health/application verification alone cannot distinguish
+	// a successfully updated service from the untouched old service.
+	actualImage, imageErr := a.verifyRecoveredTargetImage(ctx, tx.HostID, tx.ContainerName, tx.TargetImageID)
+	if imageErr != nil && rp.ID > 0 && digestEqual(actualImage, rp.OriginalImageID) {
+		msg := "controller restart reconciliation found that the target image was never applied; the original pre-update image is still active: " + imageErr.Error()
+		_ = a.txTransition(ctx, &tx, txFailed, "failed", msg)
+		_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "interrupted", "target_not_applied", msg)
+		_ = a.finishJobDurable(tx.JobID, "failed", "", msg)
+		_ = a.Store.Audit(ctx, "system", "transaction.recovered-target-not-applied", tx.HostID, tx.ContainerName, fmt.Sprintf("transaction=%d", tx.ID))
+		return
+	}
+	// Then reconcile runtime health. If target image, health and custom
+	// verification all pass, preserve the updated service rather than rolling it
+	// back merely because the controller restarted.
+	liveErr := imageErr
+	if liveErr == nil {
+		liveErr = a.verifyUpdatedContainer(ctx, tx.HostID, tx.ContainerName)
+	}
 	if liveErr == nil && rp.ID > 0 {
 		if deps, depErr := a.persistedDependencyRuntimes(rp); depErr == nil && len(deps) > 0 {
 			if parent, pe := a.inspectOne(ctx, tx.HostID, tx.ContainerName); pe == nil {
@@ -610,14 +641,14 @@ func (a *App) recoverUpdateTransaction(tx db.UpdateTransaction) {
 	if liveErr == nil {
 		_ = a.txTransition(ctx, &tx, txSuccess, "success", "runtime reconciled after controller restart")
 		_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "success", "kept_updated_runtime", "")
-		_ = a.Store.FinishJob(ctx, tx.JobID, "success", `{"recovered_after_restart":true}`, "")
+		_ = a.finishJobDurable(tx.JobID, "success", `{"recovered_after_restart":true}`, "")
 		_ = a.Store.Audit(ctx, "system", "transaction.recovered-success", tx.HostID, tx.ContainerName, fmt.Sprintf("transaction=%d", tx.ID))
 		return
 	}
 	if rp.ID == 0 {
 		msg := "runtime reconciliation failed and no full restore point is linked: " + liveErr.Error()
 		_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "recovery_required", "manual_intervention", msg)
-		_ = a.Store.FinishJob(ctx, tx.JobID, "failed", "", msg)
+		_ = a.finishJobDurable(tx.JobID, "failed", "", msg)
 		return
 	}
 	_ = a.txTransition(ctx, &tx, txRollback, "recovering", "runtime reconciliation failed; restoring pre-update state")
@@ -628,17 +659,18 @@ func (a *App) recoverUpdateTransaction(tx db.UpdateTransaction) {
 	_ = a.Store.ReleaseOperationLease(ctx, key, owner)
 	rbJob, err := a.Store.CreateJob(ctx, "rollback", "recovery", rp.HostID, rp.ContainerName, "queued")
 	if err == nil {
-		err = a.executeRestorePointRollback(rbJob, rp, "system", "recovery")
+		err = a.executeRestorePointRollback(ctx, rbJob, rp, "system", "recovery")
 	}
 	if err != nil {
-		_ = a.txTransition(ctx, &tx, txFailed, "failed", "automatic crash-recovery rollback failed: "+err.Error())
+		msg := "automatic crash-recovery rollback failed: " + err.Error()
+		_ = a.txTransition(ctx, &tx, txRecoveryRequired, "recovery_required", msg)
 		_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "recovery_required", "rollback_failed", err.Error())
-		_ = a.Store.FinishJob(ctx, tx.JobID, "failed", "", err.Error())
+		_ = a.finishJobDurable(tx.JobID, "failed", `{"status":"recovery_required"}`, msg)
 		return
 	}
 	_ = a.txTransition(ctx, &tx, txRolledBack, "rolled_back", "pre-update state restored after controller restart")
 	_ = a.Store.SetUpdateTransactionRecovery(ctx, tx.ID, "rolled_back", "automatic_rollback", liveErr.Error())
-	_ = a.Store.FinishJob(ctx, tx.JobID, "failed", `{"recovered_by_rollback":true}`, "update interrupted; pre-update state restored")
+	_ = a.finishJobDurable(tx.JobID, "failed", `{"recovered_by_rollback":true}`, "update interrupted; pre-update state restored")
 	_ = a.Store.Audit(ctx, "system", "transaction.recovered-rollback", tx.HostID, tx.ContainerName, fmt.Sprintf("transaction=%d restore_point=%d", tx.ID, rp.ID))
 }
 

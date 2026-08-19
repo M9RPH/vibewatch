@@ -3,7 +3,7 @@ package app
 import "testing"
 
 func TestV090TransactionStateMachineRejectsUnsafeTransitions(t *testing.T) {
-	good := [][2]string{{txQueued, txPreflight}, {txPreflight, txSnapshot}, {txSnapshot, txRestorePoint}, {txRestorePoint, txPrepared}, {txPrepared, txUpdating}, {txUpdating, txDockerHealth}, {txDockerHealth, txVerifying}, {txVerifying, txRefreshing}, {txRefreshing, txSuccess}}
+	good := [][2]string{{txQueued, txPreflight}, {txPreflight, txSnapshot}, {txSnapshot, txRestorePoint}, {txRestorePoint, txPrepared}, {txPrepared, txUpdating}, {txUpdating, txImageVerify}, {txImageVerify, txDockerHealth}, {txDockerHealth, txVerifying}, {txVerifying, txRefreshing}, {txRefreshing, txSuccess}}
 	for _, x := range good {
 		if !validTransactionTransition(x[0], x[1]) {
 			t.Fatalf("expected transition %s -> %s", x[0], x[1])

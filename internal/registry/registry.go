@@ -332,6 +332,40 @@ func (c *Client) RemoteDigest(ctx context.Context, image string) (string, error)
 // config digest can be compared directly with Docker's local image ID, so an
 // amd64-only manifest-list change does not falsely flag an arm64 host (or vice
 // versa). No image layers or config blobs are downloaded.
+// InvalidateImage removes cached manifest/version metadata for one image
+// repository. It is used after a protected infrastructure service restart
+// when Vibewatch must prove registry reachability again instead of accepting
+// a manifest cached before the service was stopped.
+func (c *Client) InvalidateImage(image string) {
+	ref, err := Parse(image)
+	if err != nil {
+		return
+	}
+	prefix := normalizeRegistryHost(ref.Registry) + "/" + ref.Repository + "@"
+	versionPrefix := ref.Registry + "/" + ref.Repository + ":"
+	c.mu.Lock()
+	for key := range c.manifestCache {
+		if strings.Contains(key, prefix) {
+			delete(c.manifestCache, key)
+		}
+	}
+	for key := range c.cache {
+		if strings.HasPrefix(key, versionPrefix) {
+			delete(c.cache, key)
+		}
+	}
+	c.mu.Unlock()
+}
+
+// RemoteStateForPlatformFresh bypasses manifest metadata cached by an earlier
+// Preflight. This matters when the updated workload itself provides DNS or
+// another dependency used to reach the registry: the service may have been
+// stopped briefly for a cold snapshot and must be proven usable again.
+func (c *Client) RemoteStateForPlatformFresh(ctx context.Context, image string, p Platform) (RemoteImageState, error) {
+	c.InvalidateImage(image)
+	return c.RemoteStateForPlatform(ctx, image, p)
+}
+
 func (c *Client) RemoteStateForPlatform(ctx context.Context, image string, p Platform) (RemoteImageState, error) {
 	ref, err := Parse(image)
 	if err != nil {

@@ -649,6 +649,59 @@ func (a *App) handleUpdateChainSubroutes(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
+	if len(parts) == 2 && parts[1] == "unsnooze" && r.Method == http.MethodPut {
+		chain, err := a.Store.UpdateChain(r.Context(), id)
+		if err != nil {
+			writeErr(w, 404, "update chain not found")
+			return
+		}
+		steps, err := a.Store.UpdateChainSteps(r.Context(), id)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		var in struct {
+			ContainerName string `json:"container_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeErr(w, 400, "invalid json")
+			return
+		}
+		wanted := strings.TrimSpace(in.ContainerName)
+		if wanted != "" {
+			member := false
+			for _, st := range steps {
+				if st.ContainerName == wanted {
+					member = true
+					break
+				}
+			}
+			if !member {
+				writeErr(w, 409, "container is not a member of this update chain")
+				return
+			}
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		cleared := make([]string, 0)
+		for _, st := range steps {
+			if wanted != "" && st.ContainerName != wanted {
+				continue
+			}
+			cache, cacheErr := a.Store.Cache(r.Context(), chain.HostID, st.ContainerName)
+			if cacheErr != nil || strings.TrimSpace(cache.SnoozedDigest) == "" {
+				continue
+			}
+			cache = clearUpdateSnooze(cache, now)
+			if saveErr := a.Store.SaveCache(r.Context(), cache); saveErr != nil {
+				writeErr(w, 500, saveErr.Error())
+				return
+			}
+			cleared = append(cleared, st.ContainerName)
+			_ = a.Store.Audit(r.Context(), a.actor(r), "update.unsnooze", chain.HostID, st.ContainerName, fmt.Sprintf("chain=%d current digest snooze removed", chain.ID))
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "cleared": len(cleared), "containers": cleared})
+		return
+	}
 	if len(parts) == 3 && parts[1] == "preflight" && parts[2] == "progress" && r.Method == http.MethodGet {
 		opID := strings.TrimSpace(r.URL.Query().Get("id"))
 		if !validQuickSetupOperationID(opID) {
@@ -822,7 +875,7 @@ func (a *App) rollbackChainRestorePoint(ctx context.Context, runID, chainJobID i
 		return err
 	}
 	_ = a.Store.StartJob(ctx, rbJob)
-	if err := a.executeRestorePointRollback(rbJob, rp, actor, fmt.Sprintf("chain:%d:%s", runID, reason)); err != nil {
+	if err := a.executeRestorePointRollback(ctx, rbJob, rp, actor, fmt.Sprintf("chain:%d:%s", runID, reason)); err != nil {
 		_ = a.Store.AddJobLog(context.Background(), chainJobID, "ERROR", "chain", fmt.Sprintf("rollback of %s failed: %v", container, err))
 		return err
 	}
@@ -870,16 +923,52 @@ func (a *App) rollbackCompletedChainMembers(ctx context.Context, runID, chainJob
 	return failed
 }
 
-func waitChainStep(ctx context.Context, d int) error {
+func (a *App) waitChainStep(ctx context.Context, jobID int64, d int) error {
 	if d <= 0 {
 		return nil
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(time.Duration(d) * time.Second):
-		return nil
+	timer := time.NewTimer(time.Duration(d) * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			if a.jobCancelRequested(ctx, jobID) {
+				return nil
+			}
+		}
 	}
+}
+
+func chainRunStepCancelableTerminal(status string) bool {
+	return chainRunStepTerminal(status) || strings.TrimSpace(status) == "cancelled"
+}
+
+func (a *App) finishChainSafeCancel(chain db.UpdateChain, chainJobID, runID int64, actor, reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "safe cancellation requested; no further chain steps were started"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	steps, _ := a.Store.UpdateChainRunSteps(ctx, runID)
+	for _, step := range steps {
+		if chainRunStepCancelableTerminal(step.Status) {
+			continue
+		}
+		_ = a.Store.UpdateChainRunStep(ctx, step.ID, "cancelled", step.JobID, reason, true)
+	}
+	_ = a.Store.SetUpdateChainRunRecovery(ctx, runID, "cancelled", "safe_cancel", reason, true)
+	_ = a.Store.TouchUpdateChain(ctx, chain.ID, "cancelled")
+	_ = a.Store.ReleaseOperationLeaseByJob(ctx, chainJobID)
+	_ = a.Store.AddJobLog(ctx, chainJobID, "WARN", "chain", reason)
+	a.jobProgress(ctx, chainJobID, 100, "Update chain cancelled safely")
+	_ = a.finishJobDurable(chainJobID, "cancelled", `{"safe_cancel":true,"atomic_step_settled":true}`, "")
+	_ = a.Store.Audit(ctx, actor, "chain.cancelled-safe", chain.HostID, "", fmt.Sprintf("chain=%d run=%d", chain.ID, runID))
 }
 
 func (a *App) verifyChainLifecycleAction(ctx context.Context, hostID int64, container, trigger, actor string, jobID int64, shouldRun bool) error {
@@ -890,6 +979,13 @@ func (a *App) verifyChainLifecycleAction(ctx context.Context, hostID int64, cont
 		verification := a.runCustomVerification(ctx, hostID, container, trigger, actor, jobID)
 		if verification.Status == verificationStatusFailed {
 			return fmt.Errorf("custom verification failed: %s", verification.Error)
+		}
+		cur, inspectErr := a.inspectOne(ctx, hostID, container)
+		if inspectErr != nil {
+			return fmt.Errorf("post-lifecycle inspect failed: %w", inspectErr)
+		}
+		if dnsErr := a.verifyDNSControlPlaneRecovery(ctx, cur); dnsErr != nil {
+			return fmt.Errorf("control-plane continuity verification failed: %w", dnsErr)
 		}
 		return nil
 	}
@@ -904,6 +1000,11 @@ func (a *App) verifyChainLifecycleAction(ctx context.Context, hostID int64, cont
 }
 
 func (a *App) restartCurrentChainMember(ctx context.Context, runID, chainJobID, hostID int64, container, actor string) (bool, error) {
+	ctx, releasePipeline, pipelineErr := a.acquireMutationPipeline(ctx, hostID)
+	if pipelineErr != nil {
+		return false, fmt.Errorf("chain restart host mutation scheduler: %w", pipelineErr)
+	}
+	defer releasePipeline()
 	leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, chainJobID, hostID, container, "chain-restart")
 	if leaseErr != nil {
 		return false, leaseErr
@@ -923,6 +1024,15 @@ func (a *App) restartCurrentChainMember(ctx context.Context, runID, chainJobID, 
 		_ = a.Store.AddJobLog(ctx, chainJobID, "INFO", "chain", container+" is current but stopped; Restart if current preserves the stopped state")
 		return false, nil
 	}
+	continuityBaseCtx := ctx
+	mutationCtx, releaseContinuity, _ := a.acquireContinuityMutation(ctx, cur)
+	ctx = mutationCtx
+	continuityHeld := true
+	defer func() {
+		if continuityHeld {
+			releaseContinuity()
+		}
+	}()
 	_ = a.Store.Audit(ctx, actor, "chain.step.restart.started", hostID, container, fmt.Sprintf("run=%d", runID))
 	if _, err := a.Docker.Run(ctx, h.Endpoint, "restart", "-t", "10", container); err != nil {
 		_ = a.Store.Audit(context.Background(), actor, "chain.step.restart.failed", hostID, container, fmt.Sprintf("run=%d error=%s", runID, err.Error()))
@@ -933,6 +1043,9 @@ func (a *App) restartCurrentChainMember(ctx context.Context, runID, chainJobID, 
 		_ = a.Store.Audit(context.Background(), actor, "chain.step.restart.failed", hostID, container, fmt.Sprintf("run=%d error=%s", runID, err.Error()))
 		return true, err
 	}
+	releaseContinuity()
+	continuityHeld = false
+	ctx = continuityBaseCtx
 	if err := a.captureCurrentConfigDriftBaseline(ctx, hostID, container, "post-chain-restart"); err != nil {
 		_ = a.Store.AddJobLog(ctx, chainJobID, "WARN", "config-drift", "Could not refresh drift baseline after restart: "+err.Error())
 	}
@@ -941,6 +1054,11 @@ func (a *App) restartCurrentChainMember(ctx context.Context, runID, chainJobID, 
 }
 
 func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID, hostID int64, container, actor string, skipDataCapture bool) (db.RestorePoint, bool, error) {
+	ctx, releasePipeline, pipelineErr := a.acquireMutationPipeline(ctx, hostID)
+	if pipelineErr != nil {
+		return db.RestorePoint{}, false, fmt.Errorf("chain recreate host mutation scheduler: %w", pipelineErr)
+	}
+	defer releasePipeline()
 	leaseKey, leaseOwner, leaseErr := a.acquireOperationLease(ctx, chainJobID, hostID, container, "chain-recreate")
 	if leaseErr != nil {
 		return db.RestorePoint{}, false, leaseErr
@@ -975,8 +1093,17 @@ func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID,
 	if err != nil {
 		return db.RestorePoint{}, false, fmt.Errorf("config snapshot before recreate: %w", err)
 	}
+	continuityBaseCtx := ctx
+	mutationCtx, releaseContinuity, _ := a.acquireContinuityMutation(ctx, target)
+	ctx = mutationCtx
+	continuityHeld := true
+	defer func() {
+		if continuityHeld {
+			releaseContinuity()
+		}
+	}()
 	restoreCtx, restoreCancel := context.WithTimeout(ctx, dockerOperationTimeout(h.Endpoint, 12*time.Minute, 20*time.Minute))
-	capture, err := a.createRestorePointForSnapshotWithOptions(restoreCtx, hostID, container, snap, reason, fmt.Sprintf("chain-recreate:%d", runID), deps, restorePointCaptureOptions{CaptureData: !skipDataCapture, DeferWriterRestart: map[string]bool{container: true}})
+	capture, err := a.createRestorePointForSnapshotWithOptions(restoreCtx, hostID, container, snap, reason, fmt.Sprintf("chain-recreate:%d", runID), deps, restorePointCaptureOptions{CaptureData: !skipDataCapture, DeferWriterRestart: map[string]bool{container: true}, ContinuityGuardHeld: true})
 	restoreCancel()
 	rp := capture.RestorePoint
 	deferredReleased := false
@@ -1009,11 +1136,18 @@ func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID,
 	if imageID == "" && originalRef == "" {
 		return rp, false, fmt.Errorf("current image reference is unavailable")
 	}
-	imageRef := a.prepareRuntimeRestoreRef(ctx, h.Endpoint, imageID, originalRef)
+	imageRef, restoreTag := a.prepareRuntimeRestoreRefPreservingTag(ctx, h.Endpoint, imageID, originalRef)
 	if strings.TrimSpace(imageRef) == "" {
 		imageRef = firstNonEmpty(imageID, originalRef)
 	}
-	if err := a.recreateContainerRuntime(ctx, h.Endpoint, target, imageRef, wasRunning, ""); err != nil {
+	recreateErr := a.recreateContainerRuntime(ctx, h.Endpoint, target, imageRef, wasRunning, "")
+	if tagErr := runRuntimeRefCleanup(ctx, restoreTag); tagErr != nil {
+		if recreateErr == nil {
+			recreateErr = fmt.Errorf("recreated container but mutable image-tag cleanup failed: %w", tagErr)
+		}
+	}
+	if recreateErr != nil {
+		err := recreateErr
 		releaseLease()
 		rbErr := a.rollbackChainRestorePoint(context.Background(), runID, chainJobID, container, rp, actor, "failed-current-recreate")
 		if rbErr != nil {
@@ -1057,6 +1191,9 @@ func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID,
 		}
 		return rp, true, fmt.Errorf("post-recreate verification failed: %v; original container restored", err)
 	}
+	releaseContinuity()
+	continuityHeld = false
+	ctx = continuityBaseCtx
 	if err := a.captureCurrentConfigDriftBaseline(ctx, hostID, container, "post-chain-recreate"); err != nil {
 		_ = a.Store.AddJobLog(ctx, chainJobID, "WARN", "config-drift", "Could not refresh drift baseline after recreate: "+err.Error())
 	}
@@ -1065,6 +1202,8 @@ func (a *App) recreateCurrentChainMember(ctx context.Context, runID, chainJobID,
 }
 
 func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainStep, chainJobID, runID int64, trigger, actor string) {
+	_, unregisterCancel := a.registerJobCancellationSignal(chainJobID)
+	defer unregisterCancel()
 	ctx, cancel := context.WithTimeout(a.ctx, 12*time.Hour)
 	defer cancel()
 	defer a.releaseChainMembers(chain.ID, chain.HostID, steps)
@@ -1074,6 +1213,10 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 			_ = a.Store.TouchUpdateChain(context.Background(), chain.ID, "cancelled")
 			_ = a.Store.Audit(context.Background(), actor, "chain.cancelled", chain.HostID, "", fmt.Sprintf("chain=%d run=%d", chain.ID, runID))
 		}
+		return
+	}
+	if a.jobCancelRequested(ctx, chainJobID) {
+		a.finishChainSafeCancel(chain, chainJobID, runID, actor, "safe cancellation requested before chain discovery started")
 		return
 	}
 	a.jobProgress(ctx, chainJobID, 3, "Starting update chain")
@@ -1088,6 +1231,10 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 	var chainErr error
 	actionableUpdates := 0
 	for i, st := range steps {
+		if a.jobCancelRequested(ctx, chainJobID) {
+			a.finishChainSafeCancel(chain, chainJobID, runID, actor, "safe cancellation requested during chain discovery; no mutation was started")
+			return
+		}
 		pct := 5 + int(float64(i)/float64(maxInt(1, len(steps)))*15)
 		a.jobProgress(ctx, chainJobID, pct, fmt.Sprintf("Checking step %d/%d · %s", i+1, len(steps), st.ContainerName))
 		stepID, _ := a.Store.AddUpdateChainRunStep(ctx, db.UpdateChainRunStep{RunID: runID, Position: st.Position, ContainerName: st.ContainerName, Status: "checking", StartedAt: time.Now().UTC().Format(time.RFC3339)})
@@ -1115,6 +1262,10 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 		blockedContainer := ""
 		blockedReason := ""
 		for _, st := range steps {
+			if a.jobCancelRequested(ctx, chainJobID) {
+				a.finishChainSafeCancel(chain, chainJobID, runID, actor, "safe cancellation requested while validating the chain preflight plan")
+				return
+			}
 			state := states[st.ContainerName]
 			if !state.UpdateAvailable {
 				continue
@@ -1154,6 +1305,11 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 		}
 	}
 
+	if chainErr == nil && a.jobCancelRequested(ctx, chainJobID) {
+		a.finishChainSafeCancel(chain, chainJobID, runID, actor, "safe cancellation requested after chain discovery; no further lifecycle action was started")
+		return
+	}
+
 	if chainErr == nil && actionableUpdates == 0 {
 		for _, st := range steps {
 			stepID := stepIDs[st.ContainerName]
@@ -1186,9 +1342,14 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 	capturedDataScopes := map[string]int64{}
 	forceDataTransactionRollback := false
 	blockedDuringExecution := false
+	chainRecoveryRequired := false
 	for i, st := range steps {
 		if chainErr != nil {
 			break
+		}
+		if a.jobCancelRequested(ctx, chainJobID) {
+			a.finishChainSafeCancel(chain, chainJobID, runID, actor, "safe cancellation requested between chain steps; completed steps were preserved")
+			return
 		}
 		stepID := stepIDs[st.ContainerName]
 		state := states[st.ContainerName]
@@ -1199,7 +1360,7 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 			_ = a.Store.UpdateChainRunStep(ctx, stepID, "skipped_snoozed", 0, "", true)
 			_ = a.Store.AddJobLog(ctx, chainJobID, "INFO", "chain", st.ContainerName+" has a snoozed update; step skipped")
 			_ = a.Store.Audit(ctx, actor, "chain.step.skipped", chain.HostID, st.ContainerName, fmt.Sprintf("chain=%d run=%d reason=snoozed", chain.ID, runID))
-			chainErr = waitChainStep(ctx, st.WaitSeconds)
+			chainErr = a.waitChainStep(ctx, chainJobID, st.WaitSeconds)
 			continue
 		}
 
@@ -1246,7 +1407,7 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 				_ = a.Store.Audit(ctx, actor, "chain.step.skipped", chain.HostID, st.ContainerName, fmt.Sprintf("chain=%d run=%d reason=current", chain.ID, runID))
 			}
 			if chainErr == nil {
-				chainErr = waitChainStep(ctx, st.WaitSeconds)
+				chainErr = a.waitChainStep(ctx, chainJobID, st.WaitSeconds)
 			}
 		} else {
 			stepTrigger := fmt.Sprintf("chain:%d", runID)
@@ -1277,6 +1438,13 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 							}
 						}
 					}
+					// A worker may enter the update stage but skip the target entirely.
+					// Post-update image verification marks this explicitly so shared-data
+					// chain recovery does not roll back earlier successful members for a
+					// target that was never mutated.
+					if strings.EqualFold(strings.TrimSpace(tx.RecoveryAction), "target_not_applied") {
+						transactionWasDestructive = false
+					}
 				}
 				if waitErr != nil {
 					chainErr = fmt.Errorf("%s update wait failed: %w", st.ContainerName, waitErr)
@@ -1297,10 +1465,15 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 					_ = a.Store.Audit(ctx, actor, "chain.step.success", chain.HostID, st.ContainerName, fmt.Sprintf("chain=%d run=%d job=%d", chain.ID, runID, jobID))
 					if st.WaitSeconds > 0 {
 						_ = a.Store.AddJobLog(ctx, chainJobID, "INFO", "chain", fmt.Sprintf("waiting %ds after %s", st.WaitSeconds, st.ContainerName))
-						chainErr = waitChainStep(ctx, st.WaitSeconds)
+						chainErr = a.waitChainStep(ctx, chainJobID, st.WaitSeconds)
 					}
 				}
 			}
+		}
+
+		if chainErr == nil && a.jobCancelRequested(ctx, chainJobID) {
+			a.finishChainSafeCancel(chain, chainJobID, runID, actor, "safe cancellation requested; the active chain step settled successfully and no further step was started")
+			return
 		}
 
 		if chainErr != nil {
@@ -1339,15 +1512,24 @@ func (a *App) executeUpdateChain(chain db.UpdateChain, steps []db.UpdateChainSte
 		a.jobProgress(ctx, chainJobID, 94, "Rolling back completed chain members")
 		failedRollbacks := a.rollbackCompletedChainMembers(ctx, runID, chainJobID, completed, chain.HostID, actor)
 		if len(failedRollbacks) > 0 {
+			chainRecoveryRequired = true
 			chainErr = fmt.Errorf("%v; rollback of completed members incomplete: %s", chainErr, strings.Join(failedRollbacks, "; "))
 		}
 	}
 	if chainErr != nil {
-		_ = a.Store.FinishUpdateChainRun(ctx, runID, "failed", chainErr.Error())
-		_ = a.Store.TouchUpdateChain(ctx, chain.ID, "failed")
-		a.jobProgress(ctx, chainJobID, 100, "Update chain failed")
-		_ = a.Store.FinishJob(ctx, chainJobID, "failed", "", chainErr.Error())
-		_ = a.Store.Audit(ctx, actor, "chain.failed", chain.HostID, "", fmt.Sprintf("chain=%d run=%d error=%s", chain.ID, runID, chainErr.Error()))
+		if chainRecoveryRequired {
+			_ = a.Store.SetUpdateChainRunRecovery(ctx, runID, "recovery_required", "rollback_incomplete", chainErr.Error(), false)
+			_ = a.Store.TouchUpdateChain(ctx, chain.ID, "recovery_required")
+			a.jobProgress(ctx, chainJobID, 100, "Update chain requires recovery")
+			_ = a.Store.FinishJob(ctx, chainJobID, "failed", `{"status":"recovery_required"}`, chainErr.Error())
+			_ = a.Store.Audit(ctx, actor, "chain.recovery-required", chain.HostID, "", fmt.Sprintf("chain=%d run=%d error=%s", chain.ID, runID, chainErr.Error()))
+		} else {
+			_ = a.Store.FinishUpdateChainRun(ctx, runID, "failed", chainErr.Error())
+			_ = a.Store.TouchUpdateChain(ctx, chain.ID, "failed")
+			a.jobProgress(ctx, chainJobID, 100, "Update chain failed")
+			_ = a.Store.FinishJob(ctx, chainJobID, "failed", "", chainErr.Error())
+			_ = a.Store.Audit(ctx, actor, "chain.failed", chain.HostID, "", fmt.Sprintf("chain=%d run=%d error=%s", chain.ID, runID, chainErr.Error()))
+		}
 		event := "manual_update"
 		if trigger == "automatic" {
 			event = "auto"
